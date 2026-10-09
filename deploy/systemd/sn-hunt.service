@@ -1,0 +1,26 @@
+[Unit]
+Description=SN Secure daily PHP web-shell hunt
+Documentation=https://github.com/vnscorpion/sn-security
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/sn hunt --days 1
+# Stay well below the web server: low CPU and idle IO so a scan never
+# starves a busy site.
+Nice=15
+IOSchedulingClass=idle
+CPUQuota=40%
+TimeoutStartSec=30min
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/sn
+ReadOnlyPaths=/etc/sn
+PrivateTmp=yes
+# Hunt only reads files; it needs to traverse all users' webroots.
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

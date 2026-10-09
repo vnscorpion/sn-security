@@ -1,0 +1,21 @@
+[package]
+name = "snsec-common"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Shared schema, signing and parsers for SN Secure"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+sha2.workspace = true
+ed25519-dalek.workspace = true
+memchr.workspace = true
+
+[dev-dependencies]
+rand.workspace = true

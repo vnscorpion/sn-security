@@ -1,0 +1,12 @@
+[Unit]
+Description=SN Secure traffic watch timer
+Documentation=https://github.com/vnscorpion/sn-security
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target

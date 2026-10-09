@@ -1,0 +1,35 @@
+# Reference copy of the fixed traffic patterns compiled into `sn`
+# (crates/sn/src/watch/patterns.rs). In v1.1 the hub can push an updated copy of
+# this file inside the root-signed policy tier; today it documents the built-ins.
+#
+# A "cycle" covers roughly one timer interval of logs (default 5 min).
+
+patterns:
+  - name: bruteforce
+    when: "POST wp-login.php or xmlrpc.php > 10 per cycle"
+    ban: true
+    ttl: 3600
+
+  - name: probe
+    when: "touches .env, .git/, phpmyadmin, wp-config.php.bak, .DS_Store, .aws/, vendor/phpunit"
+    ban: true
+    ttl: 86400
+
+  - name: scanner
+    when: "404 > 30 AND distinct_paths > 20 per cycle"
+    ban: true
+    ttl: 1800
+
+  - name: bad_ua
+    when: "UA matches sqlmap|nikto|masscan|nmap|zgrab|wpscan|nuclei, or empty UA with > 50 requests"
+    ban: true
+    ttl: 86400
+
+  - name: xmlrpc_pingback
+    when: "> 3 POST xmlrpc.php with UA WordPress/"
+    ban: false      # report only
+    ttl: 0
+
+# Strike escalation (per ban-key): 10m -> 1h -> 24h -> 7d. Resets after 7 clean days.
+# IPv6 is aggregated to /64 before counting and banning.
+# whitelist + trusted_proxies (incl. Cloudflare) are always excluded.

@@ -1,0 +1,35 @@
+[package]
+name = "snhub"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "SN Secure master: enrollment, reports, signed desired-state, web UI"
+
+[[bin]]
+name = "snhub"
+path = "src/main.rs"
+
+[dependencies]
+snsec-common.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+hex.workspace = true
+sha2.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true
+time.workspace = true
+tokio.workspace = true
+axum.workspace = true
+rusqlite.workspace = true
+maud.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc.workspace = true

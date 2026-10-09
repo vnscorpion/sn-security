@@ -1,0 +1,33 @@
+[Unit]
+Description=SN Secure hub (master)
+Documentation=https://github.com/vnscorpion/sn-security
+After=network.target
+
+[Service]
+Type=simple
+User=snhub
+Group=snhub
+ExecStart=/usr/local/bin/snhub --config /etc/snhub/snhub.toml serve
+Restart=on-failure
+RestartSec=3s
+Environment=RUST_LOG=info
+
+# Hardening — the hub only needs its data dir and the loopback/public socket.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/snhub
+ReadOnlyPaths=/etc/snhub
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

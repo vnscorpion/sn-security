@@ -1,0 +1,22 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Local build toolchain / scratch
+/.sn-build/
+/smoke/
+
+# Secrets & runtime state — never commit
+*.key
+*.sec
+*.pem
+secrets/
+/data/
+*.sqlite
+*.sqlite-*
+*.db
+
+# Editor
+.vscode/
+.idea/
+*.swp

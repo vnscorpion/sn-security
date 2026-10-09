@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    name: fmt + clippy + test (native linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: test
+        run: cargo test --workspace --all-features --locked
+
+  audit:
+    name: cargo audit + deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: install tools
+        run: |
+          cargo install cargo-audit --locked || true
+          cargo install cargo-deny --locked || true
+      - name: audit
+        run: cargo audit || true
+      - name: deny
+        run: |
+          if [ -f deny.toml ]; then cargo deny check; else echo "no deny.toml"; fi
+
+  build-musl:
+    name: static musl build (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.arch }}-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.13.0
+      - name: install cargo-zigbuild
+        run: cargo install cargo-zigbuild --locked
+      - name: build
+        run: cargo zigbuild --release --target ${{ matrix.arch }}-unknown-linux-musl
+      - name: rename
+        run: |
+          mkdir -p out
+          cp target/${{ matrix.arch }}-unknown-linux-musl/release/sn out/sn-${{ matrix.arch }}
+          cp target/${{ matrix.arch }}-unknown-linux-musl/release/snhub out/snhub-${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.arch }}
+          path: out/*

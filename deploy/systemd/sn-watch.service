@@ -1,0 +1,31 @@
+[Unit]
+Description=SN Secure traffic watch (one cycle)
+Documentation=https://github.com/vnscorpion/sn-security
+After=network.target nftables.service
+Wants=nftables.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/sn watch
+Nice=-5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=4
+TimeoutStartSec=90
+
+# Hardening — watch reads logs, inspects /proc, and edits the inet sn table.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/sn
+ReadOnlyPaths=/etc/sn
+PrivateTmp=yes
+ProtectControlGroups=no
+ProtectKernelTunables=no
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# CAP_NET_ADMIN: nft. CAP_DAC_READ_SEARCH + CAP_SYS_PTRACE: read other users'
+# /proc/PID/exe|cwd|fd. CAP_SYS_NICE: our own priority. CAP_KILL reserved.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_READ_SEARCH CAP_SYS_PTRACE CAP_SYS_NICE CAP_KILL
+MemoryMax=192M
+
+[Install]
+WantedBy=multi-user.target

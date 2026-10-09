@@ -1,0 +1,33 @@
+# Reference copy of the PHP web-shell heuristic weights compiled into `sn`
+# (crates/sn/src/heuristic.rs). Score >= 70 = suspicious, >= 100 = malicious.
+# A single source->sink match alone reaches 100.
+
+rules:
+  - name: source-to-sink        # superglobal within ~300B of a code/cmd sink
+    weight: 100
+  - name: decode-into-eval      # base64_decode/gzinflate/... feeding eval/assert
+    weight: 60                  # 80 when two or more decoders chain
+  - name: preg_replace-e        # the /e modifier
+    weight: 60
+  - name: command-sink          # bare system/shell_exec/passthru/proc_open
+    weight: 20
+  - name: backtick-exec
+    weight: 15
+  - name: dropper               # move_uploaded_file/file_put_contents from request or http
+    weight: 40
+  - name: variable-function     # $_GET[...](  or  ${'_PO'.'ST'}
+    weight: 20
+  - name: long-base64           # > 512-char blob (30 in a small file, 15 otherwise)
+    weight: 30
+  - name: high-entropy-literal  # > 256B literal, Shannon entropy > 5.2 bits/byte
+    weight: 25
+  - name: php-in-image-ext      # .jpg/.png that is actually PHP
+    weight: 50
+  - name: php-in-uploads        # code where only media should be
+    weight: 40
+
+# Commercial encoders (ionCube/SourceGuardian/Zend) are classified
+# 'encoded-commercial' and are NOT scored on entropy/base64.
+#
+# v1.1: token-based lexer (strip comments/strings), plugin/theme checksums from
+# wordpress.org, and .user.ini auto_prepend_file / mu-plugins / .htaccess checks.

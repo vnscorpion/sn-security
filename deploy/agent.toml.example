@@ -1,0 +1,41 @@
+# /etc/sn/agent.toml — SN Secure agent config. Mode 0600 (contains agent_key).
+# The installer fills [hub] via `sn enroll`; you edit [watch]/[fw] locally.
+
+[hub]
+# Leave empty to run standalone (no hub). `sn enroll` fills these in.
+url         = ""
+agent_id    = ""
+agent_key   = ""                 # ed25519 secret seed (hex); never leaves this box
+hub_pubkeys = []                 # ["ed25519:..."] — several allowed for rotation
+root_pubkeys = []                # offline root key(s) that sign policy changes
+
+[watch]
+# Either simple globs + one format:
+logs   = ["/var/log/nginx/*access.log", "/var/log/apache2/*access.log"]
+format = "combined"              # combined | sn | nginx_json
+# ...or per-source definitions (installer prefers these):
+# [[watch.sources]]
+# glob   = "/var/log/nginx/*access.log"
+# format = "sn"
+
+mode         = "observe"         # observe (report only) | enforce (ban). Start in observe.
+k            = 5.0               # threshold multiplier over the baseline
+min_requests = 120              # never ban below this many requests/cycle
+trusted_proxies = ["cloudflare"] # "cloudflare" expands to CF ranges; or list CIDRs
+load_alert   = 4.0
+cpu_alert_pct = 85.0
+auto_contain = false             # keep OFF in observe; enable only after tuning
+
+[fw]
+whitelist = []                   # admin/office CIDRs — only editable here, never remotely
+max_bans_per_cycle = 200
+web_ports = [80, 443]            # HTTP-derived bans only touch these ports
+
+[hunt]
+allowed_roots = ["/home", "/var/www"]
+days = 7
+max_file_mb = 5
+
+[remote]
+allow_mode_observe = false       # let the hub switch this box back to observe
+allow_undo = false               # let the hub trigger undo (jail release + sn bans)

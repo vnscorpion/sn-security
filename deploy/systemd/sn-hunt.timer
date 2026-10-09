@@ -1,0 +1,11 @@
+[Unit]
+Description=SN Secure daily hunt timer
+Documentation=https://github.com/vnscorpion/sn-security
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

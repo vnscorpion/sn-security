@@ -1,0 +1,37 @@
+[package]
+name = "sn"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "SN Secure agent: triage, contain, hunt, clean, watch, report"
+
+[[bin]]
+name = "sn"
+path = "src/main.rs"
+
+[dependencies]
+snsec-common.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+hex.workspace = true
+sha2.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true
+time.workspace = true
+nix.workspace = true
+walkdir.workspace = true
+memchr.workspace = true
+ureq.workspace = true
+glob = "0.3"
+
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

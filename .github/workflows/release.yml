@@ -1,0 +1,63 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.13.0
+      - name: install cargo-zigbuild
+        run: cargo install cargo-zigbuild --locked
+
+      - name: build both arches
+        run: |
+          cargo zigbuild --release --target x86_64-unknown-linux-musl
+          cargo zigbuild --release --target aarch64-unknown-linux-musl
+
+      - name: stage artifacts
+        run: |
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-musl/release/sn     dist/sn-x86_64
+          cp target/x86_64-unknown-linux-musl/release/snhub  dist/snhub-x86_64
+          cp target/aarch64-unknown-linux-musl/release/sn    dist/sn-aarch64
+          cp target/aarch64-unknown-linux-musl/release/snhub dist/snhub-aarch64
+          cp deploy/install.sh dist/install.sh
+          cd dist && sha256sum sn-* snhub-* install.sh > SHA256SUMS
+
+      # Optional: sign SHA256SUMS with minisign if a key is configured.
+      - name: sign (optional)
+        if: ${{ env.MINISIGN_SECRET != '' }}
+        env:
+          MINISIGN_SECRET: ${{ secrets.MINISIGN_SECRET }}
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y minisign
+          printf '%s' "$MINISIGN_SECRET" > /tmp/minisign.key
+          minisign -S -s /tmp/minisign.key -m dist/SHA256SUMS
+          rm -f /tmp/minisign.key
+
+      - name: create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/sn-x86_64
+            dist/sn-aarch64
+            dist/snhub-x86_64
+            dist/snhub-aarch64
+            dist/install.sh
+            dist/SHA256SUMS
+            dist/SHA256SUMS.minisig
+          fail_on_unmatched_files: false
+          generate_release_notes: true

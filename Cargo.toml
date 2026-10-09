@@ -1,0 +1,50 @@
+[workspace]
+resolver = "3"
+members = ["crates/common", "crates/sn", "crates/snhub"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/vnscorpion/sn-security"
+authors = ["Siêu Nhím <legiang@sieunhim.com>"]
+
+[workspace.dependencies]
+snsec-common = { path = "crates/common" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+thiserror = "2"
+anyhow = "1"
+hex = "0.4"
+sha2 = "0.10"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+time = { version = "0.3", features = ["formatting"] }
+
+# agent
+clap = { version = "4", features = ["derive"] }
+nix = { version = "0.29", features = ["fs", "process", "signal", "user", "net", "hostname"] }
+walkdir = "2"
+memchr = "2"
+ureq = { version = "2", default-features = false, features = ["tls", "json", "gzip"] }
+
+# hub
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal", "time", "sync", "fs"] }
+axum = "0.8"
+rusqlite = { version = "0.32", features = ["bundled"] }
+maud = "0.26"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+mimalloc = "0.1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+# Keep unwind (not abort): the hub uses a catch-panic layer so one bad request
+# cannot take the whole service down. Agent stays well under 5 MB regardless.

@@ -1,0 +1,241 @@
+#!/bin/sh
+# SN Secure agent installer. Generated install command comes from the hub UI:
+#
+#   curl -fsSL https://HUB/install.sh | sudo sh -s -- --hub https://HUB --name web-01 --token TOKEN
+#
+# Downloads the sn binary from the hub (sha256-verified), detects the web server
+# and logs, writes /etc/sn/agent.toml in OBSERVE mode, enrolls, and installs the
+# watch + hunt timers. It never enables enforce — you do that from the hub once
+# the baseline is tuned.
+set -eu
+
+HUB=""
+NAME=""
+TOKEN=""
+ARCH=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --hub) HUB="$2"; shift 2;;
+    --name) NAME="$2"; shift 2;;
+    --token) TOKEN="$2"; shift 2;;
+    --arch) ARCH="$2"; shift 2;;
+    *) echo "unknown arg: $1" >&2; exit 2;;
+  esac
+done
+
+[ "$(id -u)" -eq 0 ] || { echo "run as root (sudo)"; exit 1; }
+[ -n "$HUB" ] || { echo "--hub is required"; exit 1; }
+[ -n "$NAME" ] || { echo "--name is required"; exit 1; }
+[ -n "$TOKEN" ] || { echo "--token is required"; exit 1; }
+HUB="${HUB%/}"
+
+if [ -z "$ARCH" ]; then
+  m="$(uname -m)"
+  case "$m" in
+    x86_64|amd64) ARCH=x86_64;;
+    aarch64|arm64) ARCH=aarch64;;
+    *) echo "unsupported arch: $m"; exit 1;;
+  esac
+fi
+
+echo ">> SN Secure agent (arch=$ARCH, hub=$HUB)"
+
+# nftables is required for enforce; warn (don't fail) if missing.
+if ! command -v nft >/dev/null 2>&1; then
+  echo ">> nft not found; attempting install"
+  if command -v apt-get >/dev/null 2>&1; then apt-get update -qq && apt-get install -y -qq nftables || true
+  elif command -v dnf >/dev/null 2>&1; then dnf install -y -q nftables || true
+  elif command -v yum >/dev/null 2>&1; then yum install -y -q nftables || true
+  fi
+fi
+command -v nft >/dev/null 2>&1 || echo "!! nft still missing — watch will run report-only until installed"
+
+# cgroup check (informational).
+cg="$(stat -fc %T /sys/fs/cgroup 2>/dev/null || echo unknown)"
+case "$cg" in
+  cgroup2fs) echo ">> cgroup v2 detected";;
+  tmpfs) echo ">> cgroup v1/hybrid detected (contain uses the v1 backend)";;
+  *) echo "!! could not detect cgroup layout; contain may be limited";;
+esac
+
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+echo ">> downloading agent binary"
+curl -fsSL "$HUB/sn/SHA256SUMS" -o "$TMP/SHA256SUMS"
+curl -fsSL "$HUB/sn/sn-$ARCH" -o "$TMP/sn"
+HASH="$(awk -v f="sn-$ARCH" '{n=$2; sub(/^\*/,"",n); if(n==f) print $1}' "$TMP/SHA256SUMS")"
+[ -n "$HASH" ] || { echo "no checksum for sn-$ARCH"; exit 1; }
+( cd "$TMP" && echo "$HASH  sn" | sha256sum -c - >/dev/null ) \
+  || { echo "checksum verification FAILED"; exit 1; }
+install -m 0755 "$TMP/sn" /usr/local/bin/sn
+echo ">> installed $(/usr/local/bin/sn --version)"
+
+# --- detect web server + logs ------------------------------------------------
+mkdir -p /etc/sn
+SOURCES=""
+add_source() {  # $1 = glob
+  # Only add when the glob currently matches at least one file.
+  for _f in $1; do
+    if [ -e "$_f" ]; then
+      SOURCES="$SOURCES
+[[watch.sources]]
+glob   = \"$1\"
+format = \"combined\""
+      break
+    fi
+  done
+}
+
+add_source "/var/log/nginx/*access*.log"
+add_source "/var/log/apache2/*access*.log"
+add_source "/var/log/httpd/*access_log"
+add_source "/var/log/httpd/domains/*.log"      # DirectAdmin
+add_source "/usr/local/apache/domlogs/*"       # cPanel
+add_source "/www/wwwlogs/*.log"                # aaPanel
+add_source "/home/*/logs/*access*log"          # generic panels
+
+ROOTS='["/home", "/var/www"]'
+[ -d /www/wwwroot ] && ROOTS='["/home", "/var/www", "/www/wwwroot"]'
+
+if [ -z "$SOURCES" ]; then
+  echo "!! no access logs found; set [watch] logs in /etc/sn/agent.toml manually"
+  SOURCES='logs   = ["/var/log/nginx/*access.log", "/var/log/apache2/*access.log"]
+format = "combined"'
+fi
+
+echo ">> writing /etc/sn/agent.toml (observe mode)"
+umask 077
+cat > /etc/sn/agent.toml <<EOF
+# Written by install.sh. Mode starts at observe — switch to enforce from the hub
+# after a few days, once would_ban looks clean.
+[hub]
+url         = "$HUB"
+agent_id    = ""
+agent_key   = ""
+hub_pubkeys = []
+root_pubkeys = []
+
+[watch]
+$SOURCES
+mode         = "observe"
+k            = 5.0
+min_requests = 120
+trusted_proxies = ["cloudflare"]
+load_alert   = 4.0
+cpu_alert_pct = 85.0
+auto_contain = false
+
+[fw]
+whitelist = []
+max_bans_per_cycle = 200
+web_ports = [80, 443]
+
+[hunt]
+allowed_roots = $ROOTS
+days = 7
+max_file_mb = 5
+
+[remote]
+allow_mode_observe = false
+allow_undo = false
+EOF
+chmod 0600 /etc/sn/agent.toml
+
+echo ">> enrolling with hub"
+/usr/local/bin/sn --config /etc/sn/agent.toml enroll --url "$HUB" --name "$NAME" --token "$TOKEN"
+
+# --- systemd units -----------------------------------------------------------
+echo ">> installing systemd timers"
+cat > /etc/systemd/system/sn-watch.service <<'EOF'
+[Unit]
+Description=SN Secure traffic watch (one cycle)
+After=network.target nftables.service
+Wants=nftables.service
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/sn watch
+Nice=-5
+IOSchedulingClass=best-effort
+TimeoutStartSec=90
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/sn
+ReadOnlyPaths=/etc/sn
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_READ_SEARCH CAP_SYS_PTRACE CAP_SYS_NICE CAP_KILL
+MemoryMax=192M
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat > /etc/systemd/system/sn-watch.timer <<'EOF'
+[Unit]
+Description=SN Secure traffic watch timer
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30
+AccuracySec=15s
+[Install]
+WantedBy=timers.target
+EOF
+
+cat > /etc/systemd/system/sn-hunt.service <<'EOF'
+[Unit]
+Description=SN Secure daily PHP web-shell hunt
+After=network.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/sn hunt --days 1
+Nice=15
+IOSchedulingClass=idle
+CPUQuota=40%
+TimeoutStartSec=30min
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/sn
+ReadOnlyPaths=/etc/sn
+PrivateTmp=yes
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+MemoryMax=256M
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat > /etc/systemd/system/sn-hunt.timer <<'EOF'
+[Unit]
+Description=SN Secure daily hunt timer
+[Timer]
+OnCalendar=*-*-* 03:00:00
+RandomizedDelaySec=1h
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now sn-watch.timer sn-hunt.timer
+
+echo ">> running a first triage + watch cycle"
+/usr/local/bin/sn triage || true
+/usr/local/bin/sn watch || true
+
+cat <<EOF
+
+================= SN Secure agent installed =================
+Binary : /usr/local/bin/sn
+Config : /etc/sn/agent.toml   (mode=observe)
+Timers : sn-watch (5m), sn-hunt (03:00)
+
+The VPS now appears on the hub and reports every cycle. It is in OBSERVE mode:
+it bans nothing yet, only records would_ban. After a few days of clean
+would_ban, switch it to enforce from the hub.
+
+Emergency rescue (any time):   sn triage ; sn contain ; sn hunt
+Undo everything:               sn undo
+============================================================
+EOF

@@ -1,0 +1,276 @@
+// SN Secure hub (master). Runs on the central Ubuntu server.
+#![forbid(unsafe_code)]
+
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+mod api;
+mod auth;
+mod config;
+mod db;
+mod desired;
+mod keys;
+mod web;
+
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use anyhow::{Context, Result};
+use axum::extract::{Path as AxPath, State};
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Router, body::Body};
+use clap::{Parser, Subcommand};
+
+use config::HubConfig;
+use db::Db;
+use keys::HubKey;
+
+const DEFAULT_CONFIG: &str = "/etc/snhub/snhub.toml";
+
+pub struct AppState {
+    pub db: Mutex<Db>,
+    pub hubkey: HubKey,
+    pub cfg: HubConfig,
+    pub sessions: auth::Sessions,
+}
+
+#[derive(Parser)]
+#[command(
+    name = "snhub",
+    version,
+    about = "SN Secure hub: enrollment, reports, desired-state, UI"
+)]
+struct Cli {
+    #[arg(long, global = true, default_value = DEFAULT_CONFIG)]
+    config: PathBuf,
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Create config, hub key and DB; print the offline root key once.
+    Init {
+        /// Public base URL shown in install commands (e.g. https://a.example.net).
+        #[arg(long, default_value = "")]
+        public_url: String,
+        /// Bind address.
+        #[arg(long, default_value = "127.0.0.1:8099")]
+        bind: String,
+        #[arg(long, default_value = "/var/lib/snhub")]
+        data_dir: String,
+    },
+    /// Run the server.
+    Serve,
+    /// Create a one-time enrollment token and print the install command.
+    AddVps {
+        #[arg(long)]
+        name: String,
+    },
+    /// Set the admin UI password (from --password or $SNHUB_ADMIN_PASSWORD).
+    SetAdminPassword {
+        #[arg(long)]
+        password: Option<String>,
+    },
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn main() -> std::process::ExitCode {
+    match real_main() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn real_main() -> Result<()> {
+    let cli = Cli::parse();
+    match cli.cmd {
+        Cmd::Init {
+            public_url,
+            bind,
+            data_dir,
+        } => cmd_init(&cli.config, public_url, bind, data_dir),
+        Cmd::Serve => cmd_serve(&cli.config),
+        Cmd::AddVps { name } => cmd_add_vps(&cli.config, &name),
+        Cmd::SetAdminPassword { password } => cmd_set_password(&cli.config, password),
+    }
+}
+
+fn cmd_init(config_path: &Path, public_url: String, bind: String, data_dir: String) -> Result<()> {
+    let mut cfg = HubConfig::load(config_path).unwrap_or_default();
+    cfg.bind = bind;
+    cfg.data_dir = data_dir;
+    if !public_url.is_empty() {
+        cfg.public_url = public_url;
+    }
+    std::fs::create_dir_all(cfg.data_path()).context("creating data dir")?;
+    std::fs::create_dir_all(cfg.data_path().join("public")).ok();
+
+    // Hub key (online) + DB.
+    let hubkey = HubKey::load_or_create(&cfg.data_path())?;
+    let _db = Db::open(&cfg.data_path().join("snhub.sqlite"))?;
+
+    // Root key (offline) — generate only if not already configured.
+    if cfg.root_pubkey.is_empty() {
+        let (root_secret, root_pub) = keys::generate_root();
+        cfg.root_pubkey = root_pub.clone();
+        println!("================= SN Secure hub initialised =================");
+        println!("Hub public key : {}", hubkey.pubkey_str());
+        println!("Root public key: {root_pub}");
+        println!();
+        println!("OFFLINE ROOT SECRET (store it off this server, then forget it):");
+        println!("  {root_secret}");
+        println!();
+        println!("This secret authorizes policy/epoch changes. It is NOT needed to");
+        println!("run the hub. Keep it on a YubiKey or an air-gapped machine.");
+        println!("============================================================");
+    } else {
+        println!("Hub public key : {}", hubkey.pubkey_str());
+        println!("Root public key: {} (unchanged)", cfg.root_pubkey);
+    }
+
+    cfg.save(config_path)?;
+    println!("Config written to {}", config_path.display());
+    println!("Next: snhub set-admin-password --password '<pw>' ; then snhub serve");
+    Ok(())
+}
+
+fn cmd_set_password(config_path: &Path, password: Option<String>) -> Result<()> {
+    let mut cfg = HubConfig::load(config_path)?;
+    let pw = password
+        .or_else(|| std::env::var("SNHUB_ADMIN_PASSWORD").ok())
+        .context("provide --password or set SNHUB_ADMIN_PASSWORD")?;
+    if pw.len() < 8 {
+        anyhow::bail!("password must be at least 8 characters");
+    }
+    use rand::RngCore;
+    let mut salt = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut salt);
+    let salt_hex = hex::encode(salt);
+    cfg.admin_password_sha256 = auth::hash_password(&salt_hex, &pw);
+    cfg.admin_salt = salt_hex;
+    cfg.save(config_path)?;
+    println!("admin password set.");
+    Ok(())
+}
+
+fn cmd_add_vps(config_path: &Path, name: &str) -> Result<()> {
+    let cfg = HubConfig::load(config_path)?;
+    let db = Db::open(&cfg.data_path().join("snhub.sqlite"))?;
+    let token = db.create_enroll_token(name, now(), 900)?;
+    let base = if cfg.public_url.is_empty() {
+        format!("http://{}", cfg.bind)
+    } else {
+        cfg.public_url.trim_end_matches('/').to_string()
+    };
+    println!("Install command (token valid 15 minutes):\n");
+    println!(
+        "curl -fsSL {base}/install.sh | sudo sh -s -- --hub {base} --name {name} --token {token}"
+    );
+    Ok(())
+}
+
+fn cmd_serve(config_path: &Path) -> Result<()> {
+    let cfg = HubConfig::load(config_path)?;
+    std::fs::create_dir_all(cfg.data_path()).ok();
+    let hubkey = HubKey::load_or_create(&cfg.data_path())?;
+    let db = Db::open(&cfg.data_path().join("snhub.sqlite"))?;
+
+    let state = Arc::new(AppState {
+        db: Mutex::new(db),
+        hubkey,
+        cfg: cfg.clone(),
+        sessions: auth::Sessions::default(),
+    });
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("building tokio runtime")?;
+    rt.block_on(async move { serve(cfg, state).await })
+}
+
+async fn serve(cfg: HubConfig, state: Arc<AppState>) -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()))
+        .init();
+
+    let app = Router::new()
+        // agent API
+        .route("/v1/report", post(api::post_report))
+        .route("/v1/desired", get(api::get_desired))
+        .route("/v1/enroll", post(api::post_enroll))
+        // admin UI
+        .route("/", get(web::overview))
+        .route("/login", get(web::login_page).post(web::login_post))
+        .route("/logout", get(web::logout))
+        .route("/agent/{id}", get(web::agent_detail))
+        .route("/agent/{id}/ban", post(web::ban_post))
+        .route("/agent/{id}/unban", post(web::unban_post))
+        .route("/agent/{id}/mode", post(web::mode_post))
+        .route("/add-vps", get(web::add_vps_page).post(web::add_vps_post))
+        .route("/log", get(web::log_page))
+        // static distribution of the installer + agent binary
+        .route("/install.sh", get(serve_install))
+        .route("/sn/{file}", get(serve_sn))
+        .route("/healthz", get(|| async { "ok" }))
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind(&cfg.bind)
+        .await
+        .with_context(|| format!("binding {}", cfg.bind))?;
+    tracing::info!("snhub listening on {}", cfg.bind);
+
+    let shutdown = async {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("shutting down");
+    };
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await
+        .context("server error")?;
+    Ok(())
+}
+
+async fn serve_install(State(st): State<Arc<AppState>>) -> Response {
+    serve_file(
+        &st.cfg.data_path().join("public").join("install.sh"),
+        "text/x-shellscript",
+    )
+    .await
+}
+
+async fn serve_sn(State(st): State<Arc<AppState>>, AxPath(file): AxPath<String>) -> Response {
+    // Reject any path traversal; only a bare filename is allowed.
+    if file.contains('/') || file.contains('\\') || file.contains("..") {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    serve_file(
+        &st.cfg.data_path().join("public").join(&file),
+        "application/octet-stream",
+    )
+    .await
+}
+
+async fn serve_file(path: &Path, content_type: &str) -> Response {
+    match tokio::fs::read(path).await {
+        Ok(bytes) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, content_type)
+            .body(Body::from(bytes))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        Err(_) => (StatusCode::NOT_FOUND, "not found").into_response(),
+    }
+}

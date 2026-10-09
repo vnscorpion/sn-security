@@ -1,0 +1,23 @@
+# /etc/snhub/snhub.toml — SN Secure hub config. `snhub init` creates this.
+
+# Bind to localhost and put the UI behind a VPN, SSH tunnel or an IP-allowlisted
+# TLS reverse proxy. Do not expose the admin UI directly to the internet.
+bind = "127.0.0.1:8099"
+
+data_dir = "/var/lib/snhub"
+
+# Public base URL agents reach (the reverse proxy in front of the hub).
+public_url = "https://a.example.net"
+
+# Offline root public key handed to agents at enrollment. The matching secret
+# is printed once by `snhub init` and must be stored off this server.
+root_pubkey = "ed25519:..."
+
+# Admin login — set via `snhub set-admin-password`.
+admin_salt = ""
+admin_password_sha256 = ""
+
+# Optional Telegram alerting.
+# [telegram]
+# bot_token = "123456:ABC..."
+# chat_id   = "-1001234567890"
