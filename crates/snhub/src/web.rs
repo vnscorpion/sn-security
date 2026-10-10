@@ -295,6 +295,18 @@ pub async fn agent_detail(
                 "Gỡ ban: " input type="text" name="ip" placeholder="1.2.3.4" required;
                 button class="ghost" type="submit" { "Unban" }
             }
+            hr style="border-color:var(--line)";
+            form class="inline" method="post" action={"/agent/" (agent.id) "/job"} {
+                input type="hidden" name="kind" value="hunt";
+                "Chạy hunt — số ngày: " input type="number" name="days" value="1" style="width:80px";
+                button type="submit" { "Chạy hunt ngay" }
+            }
+            "  "
+            form class="inline" method="post" action={"/agent/" (agent.id) "/job"} {
+                input type="hidden" name="kind" value="undo";
+                button class="ghost" type="submit" { "Undo (gỡ contain/ban)" }
+            }
+            p class="mut" { "Lệnh áp dụng ở chu kỳ kế tiếp (≤ 15 phút). Undo chỉ chạy nếu VPS bật [remote] allow_undo." }
         }
 
         @if let Some(r) = &report {
@@ -460,6 +472,37 @@ pub async fn mode_post(
     let _ = db.update_desired(&id, now(), "admin", "mode", mode.as_str(), |d| {
         d.mode = mode;
     });
+    drop(db);
+    Redirect::to(&format!("/agent/{id}")).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct JobForm {
+    kind: String,
+    #[serde(default)]
+    days: Option<u32>,
+}
+
+pub async fn job_post(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(f): Form<JobForm>,
+) -> Response {
+    use snsec_common::schema::Job;
+    if let Some(r) = guard(&st, &headers) {
+        return r;
+    }
+    let (job, detail) = match f.kind.as_str() {
+        "hunt" => {
+            let days = f.days.unwrap_or(1).clamp(1, 30);
+            (Job::Hunt { days }, format!("hunt --days {days}"))
+        }
+        "undo" => (Job::Undo, "undo".to_string()),
+        _ => return (StatusCode::BAD_REQUEST, "unknown job").into_response(),
+    };
+    let db = st.db.lock().expect("db");
+    let _ = db.queue_job(&id, now(), "admin", job, &detail);
     drop(db);
     Redirect::to(&format!("/agent/{id}")).into_response()
 }

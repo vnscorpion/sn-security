@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use snsec_common::schema::DesiredRef;
+use snsec_common::schema::{DesiredRef, Mode};
 
 /// Max bytes of queued reports to keep before dropping the oldest.
 const QUEUE_CAP_BYTES: u64 = 50 * 1024 * 1024;
@@ -31,6 +31,13 @@ pub struct Meta {
     pub applied_desired: DesiredRef,
     /// Highest desired seq *seen* (even if not applied), for monotonicity.
     pub last_desired: DesiredRef,
+    /// Mode pushed from the hub, overriding the local config when set. `None`
+    /// means "use `[watch] mode` from agent.toml".
+    #[serde(default)]
+    pub mode_override: Option<Mode>,
+    /// Highest `jobs_seq` the agent has already executed.
+    #[serde(default)]
+    pub last_jobs_seq: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

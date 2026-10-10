@@ -287,13 +287,89 @@ fn apply_desired(cfg: &Config, state: &State, d: &DesiredBody) -> Result<()> {
         }
     }
 
-    // Mode escalation observe->enforce is always allowed; de-escalation needs
-    // a root policy or local opt-in. For v1 the mode lives in agent.toml and is
-    // not flipped from here except to escalate.
-    if d.mode == Mode::Enforce && cfg.watch.mode == Mode::Observe {
-        eprintln!("hub: desired requests enforce; set [watch] mode=enforce locally to honour");
+    // Mode: escalation (observe -> enforce) is always honoured; de-escalation
+    // (enforce -> observe) is gated behind `[remote] allow_mode_observe` so a
+    // compromised hub cannot silently disable protection fleet-wide (SEC-2).
+    // The effective mode is stored as an override that `watch` reads.
+    {
+        let mut meta = state.meta();
+        let current = meta.mode_override.unwrap_or(cfg.watch.mode);
+        match d.mode {
+            Mode::Enforce => {
+                if current != Mode::Enforce {
+                    meta.mode_override = Some(Mode::Enforce);
+                    state.save_meta(&meta)?;
+                    eprintln!("hub: mode -> enforce (from hub)");
+                }
+            }
+            Mode::Observe => {
+                if current == Mode::Enforce {
+                    if cfg.remote.allow_mode_observe {
+                        meta.mode_override = Some(Mode::Observe);
+                        state.save_meta(&meta)?;
+                        eprintln!("hub: mode -> observe (allow_mode_observe)");
+                    } else {
+                        eprintln!(
+                            "hub: ignoring observe request (set [remote] allow_mode_observe=true, or run `sn disable` locally)"
+                        );
+                    }
+                } else {
+                    meta.mode_override = Some(Mode::Observe);
+                    state.save_meta(&meta)?;
+                }
+            }
+        }
+    }
+
+    // One-shot jobs: run only when jobs_seq advanced beyond what we last ran.
+    if d.jobs_seq > 0 {
+        let mut meta = state.meta();
+        if d.jobs_seq > meta.last_jobs_seq {
+            for job in &d.jobs {
+                run_job(cfg, state, job);
+            }
+            meta.last_jobs_seq = d.jobs_seq;
+            state.save_meta(&meta)?;
+        }
     }
     Ok(())
+}
+
+/// Execute one hub-issued job, honouring the local allow-list.
+fn run_job(cfg: &Config, state: &State, job: &snsec_common::schema::Job) {
+    use snsec_common::schema::Job;
+    match job {
+        Job::Hunt { days } => {
+            // Spawn a detached hunt so the watch cycle returns promptly; findings
+            // land in the next report.
+            let days = (*days).clamp(1, 30);
+            match std::process::Command::new("/usr/local/bin/sn")
+                .arg("hunt")
+                .arg("--days")
+                .arg(days.to_string())
+                .spawn()
+            {
+                Ok(_) => eprintln!("hub: started `sn hunt --days {days}`"),
+                Err(e) => eprintln!("hub: could not start hunt: {e}"),
+            }
+        }
+        Job::Undo => {
+            if cfg.remote.allow_undo {
+                match crate::undo::run_all(&state.dir) {
+                    Ok(n) => eprintln!("hub: undo reversed {n} action(s)"),
+                    Err(e) => eprintln!("hub: undo failed: {e:#}"),
+                }
+            } else {
+                eprintln!("hub: ignoring undo job (set [remote] allow_undo=true to permit)");
+            }
+        }
+        Job::Contain { .. } => {
+            eprintln!("hub: remote contain is not supported in v1 (use SSH + `sn contain`)");
+        }
+        Job::Fetch { .. } => {
+            eprintln!("hub: remote fetch is not supported in v1");
+        }
+    }
 }
 
 fn normalize_ban_key(ip: &str) -> String {

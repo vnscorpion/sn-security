@@ -279,6 +279,33 @@ impl Db {
         Ok(())
     }
 
+    /// Queue a single one-shot job for the agent. Replaces any pending job and
+    /// stamps `jobs_seq` with the new version so the agent runs it exactly once.
+    pub fn queue_job(
+        &self,
+        agent_id: &str,
+        now: i64,
+        who: &str,
+        job: snsec_common::schema::Job,
+        detail: &str,
+    ) -> Result<()> {
+        let (epoch, version, mut body) =
+            self.get_desired(agent_id)?
+                .unwrap_or((1, 0, DesiredBody::default()));
+        let new_version = version + 1;
+        body.jobs = vec![job];
+        body.jobs_seq = new_version;
+        let json = serde_json::to_string(&body)?;
+        self.conn.execute(
+            "INSERT INTO desired (agent_id, epoch, version, body_json, updated, updated_by) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT(agent_id) DO UPDATE SET epoch=?2, version=?3, body_json=?4, updated=?5, updated_by=?6",
+            params![agent_id, epoch as i64, new_version as i64, json, now, who],
+        )?;
+        self.record_decision(agent_id, who, "job", detail, now)?;
+        Ok(())
+    }
+
     pub fn record_decision(
         &self,
         agent_id: &str,

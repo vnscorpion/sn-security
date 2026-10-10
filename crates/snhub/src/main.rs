@@ -220,6 +220,7 @@ async fn serve(cfg: HubConfig, state: Arc<AppState>) -> Result<()> {
         .route("/agent/{id}/ban", post(web::ban_post))
         .route("/agent/{id}/unban", post(web::unban_post))
         .route("/agent/{id}/mode", post(web::mode_post))
+        .route("/agent/{id}/job", post(web::job_post))
         .route("/add-vps", get(web::add_vps_page).post(web::add_vps_post))
         .route("/log", get(web::log_page))
         // static distribution of the installer + agent binary

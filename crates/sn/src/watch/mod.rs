@@ -82,7 +82,9 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<()> {
     // Decide bans.
     let mut strikes = state.strikes();
     let mut active = state.bans();
-    let enforce = cfg.watch.mode == snsec_common::schema::Mode::Enforce;
+    // Effective mode: the hub-pushed override (if any) wins over local config.
+    let effective_mode = state.meta().mode_override.unwrap_or(cfg.watch.mode);
+    let enforce = effective_mode == snsec_common::schema::Mode::Enforce;
     let mut applied: Vec<BanEvent> = Vec::new();
     let mut would: Vec<BanEvent> = Vec::new();
     let mut to_add: Vec<(String, u64)> = Vec::new();

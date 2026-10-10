@@ -7,6 +7,30 @@ Một binary Rust tĩnh (`sn`, ~3 MB) cấp cứu VPS Linux đang bị mã độ
 
 > **Trạng thái: v1 (nền tảng).** Phần lõi đã chạy và biên dịch tĩnh (musl) cho amd64 + arm64: cấp cứu (`triage`/`contain`/`hunt`/`clean`/`undo`), theo dõi (`watch` observe/enforce), và hub (enroll, nhận báo cáo, desired-state ký ed25519, giao diện web). Một số phần là **v1.1/v2** (xem [docs/ROADMAP.md](docs/ROADMAP.md)): AI judgment, MCP, ban qua Cloudflare API, self-update do hub điều khiển, baseline dạng histogram, CloudLinux/OLS đầy đủ. **Bắt buộc test trên VPS thật và chạy `observe` vài ngày trước khi bật `enforce`** — xem [docs/RUNBOOK.md](docs/RUNBOOK.md).
 
+## Tính năng
+
+**Cấp cứu (chạy tay, không cần hub)**
+- `triage` — ảnh chụp chỉ-đọc: top process theo CPU (đo delta 2 mẫu), exe thật/`(deleted)`, cwd, kết nối ra, persistence (cron/`ld.so.preload`/rc.local), disk/inode; gắn nhãn `miner`/`php-bot`/`ddos-l7`/`bruteforce`/`disk-full`/`mixed`/`unknown`.
+- `contain` — nhốt process nghi ngờ vào cgroup 5% CPU (**cả cgroup v2 lẫn v1**), tuỳ chọn `--freeze`; **không bao giờ kill**; loại trừ dịch vụ hệ thống theo exe thật (miner đội tên `nginx` ở `/tmp` không thoát).
+- `hunt` — quét webshell PHP bằng heuristic (source→sink, decode→eval, dropper, `preg_replace /e`, entropy, file PHP trong uploads/đuôi ảnh); nhận diện encoder thương mại (ionCube...) để tránh báo nhầm.
+- `clean`/`quarantine`/`restore` — cách ly file giữ nguyên owner/mode/mtime, phục hồi được.
+- `undo` — đảo ngược mọi contain/ban đã làm (log có cấu trúc `undo.jsonl`, không chạy shell).
+
+**Theo dõi dài hạn (`watch`, systemd timer)**
+- Đọc log tăng dần theo `(dev,inode,offset)`, nhận biết rotation; lấy IP thật sau Cloudflare/proxy.
+- Mẫu cố định: bruteforce, probe, scanner, bad_ua, xmlrpc_pingback.
+- Baseline tự học theo 96 khung 15 phút + ngưỡng `k×baseline` (có cold-start guard).
+- Ban nftables **chỉ cổng web**, TTL + leo thang strike (10m→1h→24h→7d); IPv6 gộp /64.
+- Hai chế độ **observe** (chỉ `would_ban`) / **enforce**; báo cáo ký số lên hub mỗi chu kỳ.
+
+**Hub trung tâm (`snhub`)**
+- Enroll token dùng một lần; nhận báo cáo (kiểm chữ ký); giữ & ký desired-state.
+- Giao diện web: tổng quan fleet, chi tiết từng VPS (traffic, top IP, ban, triage, findings), nhật ký.
+- **Điều khiển từ xa**: ban/unban, đổi observe↔enforce, **chạy hunt**, **undo** — áp ở chu kỳ kế (xem [Điều khiển từ hub](#điều-khiển-từ-hub)).
+- Phân phối bộ cài + binary agent (kiểm sha256) cho các VPS.
+
+**An toàn** — chống tự khoá admin, ban chỉ cổng web, pull model + ký ed25519 chống replay, tier chính sách cần root key offline (xem [An toàn](#an-toàn-những-bất-biến-đã-cài-trong-code)).
+
 ## Kiến trúc
 
 ```
@@ -21,6 +45,19 @@ VPS **chủ động gọi lên hub** mỗi chu kỳ (5–15 phút): gửi báo c
 
 - **Hub (master):** Ubuntu 24.04 / Debian 12 (hay bản mới hơn) có systemd. Mặc định bind `127.0.0.1` — đặt sau VPN hoặc reverse proxy TLS.
 - **Agent (VPS):** Linux với cgroup v2 hoặc v1 và `nftables` (installer tự cài nếu thiếu). Đã nhắm Ubuntu/Debian và AlmaLinux/Rocky; Nginx/Apache.
+
+## Quy trình làm việc
+
+Từ lúc dựng tới lúc vận hành ổn định:
+
+1. **Dựng hub** một lần trên server trung tâm → [Cài hub](#cài-hub-server-trung-tâm--ubuntu-2404--debian-12). Đặt mật khẩu admin, giấu root secret offline, đưa hub ra sau VPN/TLS.
+2. **Thêm từng VPS** từ giao diện hub → [Thêm một VPS](#thêm-một-vps). Agent vào **observe** ngay, chưa ban gì.
+3. **Theo dõi 3–7 ngày (observe)**: xem `would_ban` của mỗi VPS trên hub. Thấy IP hợp lệ (bot, CDN, nhà mạng, cổng thanh toán) thì thêm vào `[fw] whitelist` hoặc `trusted_proxies` trong `/etc/sn/agent.toml` (sửa trên VPS).
+4. **Bật enforce** cho VPS đã sạch `would_ban` — ngay trên hub, không cần SSH ([Điều khiển từ hub](#điều-khiển-từ-hub)). Nên bật theo đợt: vài VPS nội bộ trước, rồi mở rộng.
+5. **Vận hành hằng ngày từ hub**: ban/unban IP, đổi mode, bấm **Chạy hunt** để quét theo yêu cầu, **Undo** khi cần. Mọi thao tác vào nhật ký. `sn-hunt` cũng tự chạy mỗi 3h sáng.
+6. **Khi một VPS gặp sự cố full CPU**: dùng ngay [cấp cứu chạy tay](#cấp-cứu-một-vps-đang-bị-chạy-tay) qua SSH (triage → contain → hunt → clean), rồi `undo` nếu cần. Không phụ thuộc hub.
+
+Chi tiết từng tình huống (kill switch, VPS mất liên lạc, khôi phục hub, nâng cấp agent): [docs/RUNBOOK.md](docs/RUNBOOK.md).
 
 ## Cài hub (server trung tâm — Ubuntu 24.04 / Debian 12)
 
@@ -50,6 +87,19 @@ curl -fsSL https://HUB/install.sh | sudo sh -s -- --hub https://HUB --name web-0
 ```
 
 Agent tự nhận diện web server/log, ghi `/etc/sn/agent.toml` ở **chế độ observe** (chỉ báo `would_ban`, chưa ban gì), enroll với hub, và cài 2 timer (`sn-watch` mỗi 5 phút, `sn-hunt` lúc 3h sáng). Sau vài ngày `would_ban` sạch, bật **enforce** từ hub.
+
+## Điều khiển từ hub
+
+Có — từ giao diện snhub bạn **đặt lệnh cho VPS mà không cần SSH**. Hub không gọi vào VPS; mọi lệnh chỉ ghi vào desired-state (ký số), VPS tự lấy và áp ở **chu kỳ kế tiếp (≤ 15 phút)** — đây là cái giá của việc không mở cổng trên VPS.
+
+| Thao tác trên hub | Hiệu lực | Kiểm soát an toàn |
+| --- | --- | --- |
+| **Ban / Unban IP** (nhập tay hoặc nút cạnh top IP) | Agent áp vào nftables chu kỳ kế, TTL ≤ 24h | Chỉ cổng web; whitelist/trusted_proxies vẫn được loại trừ |
+| **Đổi observe ↔ enforce** | Agent đổi chế độ chu kỳ kế | observe→enforce luôn được; enforce→observe cần `[remote] allow_mode_observe=true` (mặc định tắt) hoặc chữ ký root |
+| **Chạy hunt ngay** (chọn số ngày) | Agent spawn `sn hunt`, findings vào báo cáo sau | Chạy đúng một lần cho mỗi lần bấm |
+| **Undo** (gỡ contain + ban của sn) | Agent chạy `sn undo` chu kỳ kế | Chỉ khi VPS bật `[remote] allow_undo=true` |
+
+Tier chính sách (đổi `patterns`, `trusted_proxies`, ép observe hàng loạt) cần **chữ ký root key offline** — hub bị chiếm cũng không hạ được bảo vệ. `contain`/`fetch` từ xa là **v1.1** (hiện làm qua SSH). Cần tức thì tại chỗ thì dùng `sn disable` (kill switch) hoặc chạy lệnh qua SSH.
 
 ## Cấp cứu một VPS đang bị (chạy tay)
 

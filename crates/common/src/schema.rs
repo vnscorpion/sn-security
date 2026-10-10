@@ -204,6 +204,11 @@ pub struct DesiredBody {
     pub allow_temp: Vec<TempAllow>,
     #[serde(default)]
     pub jobs: Vec<Job>,
+    /// Monotonic marker: the agent runs `jobs` only when this exceeds the last
+    /// job-seq it ran, so a job fires exactly once even though the body persists
+    /// across unrelated desired edits (bans, mode).
+    #[serde(default)]
+    pub jobs_seq: u64,
     /// Cycle cadence hint; the systemd timer stays fixed, the agent only
     /// decides whether to skip a cycle. Clamped to [300, 900] on the agent.
     #[serde(default)]
