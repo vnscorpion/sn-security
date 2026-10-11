@@ -64,15 +64,13 @@ fn host_info() -> HostInfo {
 
 /// Build the report, enqueue it, then (if a hub is configured) flush the spool
 /// and apply desired state.
-#[allow(clippy::too_many_arguments)]
 pub fn sync(
     cfg: &Config,
     state: &State,
     cycle: CycleStats,
     bans: Vec<BanEvent>,
     would_ban: Vec<BanEvent>,
-    over_cap: bool,
-    watch_blind: bool,
+    mut alerts: Vec<snsec_common::schema::Alert>,
 ) -> Result<()> {
     let hub_configured = !cfg.hub.url.is_empty() && !cfg.hub.agent_key.is_empty();
 
@@ -87,21 +85,6 @@ pub fn sync(
     let seq = meta.next_report_seq;
     meta.next_report_seq += 1;
 
-    let mut alerts = Vec::new();
-    if over_cap {
-        alerts.push(snsec_common::schema::Alert {
-            kind: "ban_cap".into(),
-            message: "ban cap reached this cycle; possible distributed attack".into(),
-            severity: "urgent".into(),
-        });
-    }
-    if watch_blind {
-        alerts.push(snsec_common::schema::Alert {
-            kind: "watch_blind".into(),
-            message: "web traffic present but no log lines parsed; check log paths/format".into(),
-            severity: "warn".into(),
-        });
-    }
     if cycle.mem_total_mb > 0 && cycle.mem_used_pct >= MEM_ALERT_PCT {
         alerts.push(snsec_common::schema::Alert {
             kind: "mem_high".into(),

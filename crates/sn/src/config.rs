@@ -252,3 +252,67 @@ pub const CLOUDFLARE_V6: &[&str] = &[
     "2a06:98c0::/29",
     "2c0f:f248::/32",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `[watch]` exactly as `deploy/install.sh` writes it: the keys first, the
+    /// `[[watch.sources]]` tables last.
+    const INSTALLER_CONFIG: &str = r#"
+[hub]
+url = "https://hub.example"
+
+[watch]
+mode         = "observe"
+k            = 5.0
+min_requests = 120
+trusted_proxies = ["cloudflare"]
+auto_contain = false
+
+[[watch.sources]]
+glob   = "/var/log/nginx/domains/*.log"
+format = "combined"
+
+[[watch.sources]]
+glob   = "/var/log/httpd/domains/*.log"
+format = "combined"
+
+[fw]
+whitelist = []
+"#;
+
+    #[test]
+    fn installer_config_keeps_every_watch_setting() {
+        let cfg: Config = toml::from_str(INSTALLER_CONFIG).unwrap();
+        assert_eq!(cfg.watch.sources.len(), 2);
+        assert_eq!(cfg.watch.sources[0].glob, "/var/log/nginx/domains/*.log");
+        assert_eq!(cfg.watch.trusted_proxies, vec!["cloudflare".to_string()]);
+        assert_eq!(cfg.watch.min_requests, 120);
+        // "cloudflare" expands to the published ranges, so a Cloudflare IP is
+        // recognised as a proxy rather than counted as a visitor.
+        let cidrs = cfg.trusted_cidrs();
+        assert!(snsec_common::net::in_any(
+            &cidrs,
+            "173.245.48.1".parse().unwrap()
+        ));
+    }
+
+    #[test]
+    fn keys_placed_after_a_sources_table_are_silently_lost() {
+        // The old installer wrote the sources first. TOML then attaches every
+        // later key to the last `[[watch.sources]]` entry, and the agent has no
+        // error to show for it: `trusted_proxies` just comes back empty.
+        let broken = r#"
+[watch]
+[[watch.sources]]
+glob   = "/var/log/nginx/domains/*.log"
+format = "combined"
+mode = "observe"
+trusted_proxies = ["cloudflare"]
+"#;
+        let cfg: Config = toml::from_str(broken).unwrap();
+        assert_eq!(cfg.watch.sources.len(), 1);
+        assert!(cfg.watch.trusted_proxies.is_empty());
+    }
+}

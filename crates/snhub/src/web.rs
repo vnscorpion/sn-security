@@ -241,7 +241,10 @@ fn reason_vi(r: &str) -> &'static str {
 fn alert_kind_vi(k: &str) -> &str {
     match k {
         "ban_cap" => "Chặn quá nhiều trong một lần quét (nghi tấn công diện rộng)",
-        "watch_blind" => "Có truy cập web nhưng không đọc được log",
+        "watch_blind" => "Có truy cập web nhưng nhiều lần quét liền không có dòng log mới",
+        "log_not_found" => "Không tìm thấy file log nào khớp cấu hình",
+        "log_unreadable" => "Có file log nhưng agent không đọc được",
+        "log_format" => "Đọc được log nhưng sai định dạng",
         "mem_high" => "RAM gần đầy",
         _ => k,
     }
@@ -810,17 +813,31 @@ pub async fn agent_detail(
                         div class="l" { "RAM: chưa có số liệu — agent trên VPS này cần cập nhật" }
                     }
                 }
+                // Older agents do not send this, so 0 would be a false alarm for them.
+                @if !agent_outdated(&agent.version) {
+                    div class="stat" {
+                        div class="n" style=(if r.cycle.log_files == 0 {"color:var(--bad)"} else {""}) { (r.cycle.log_files) }
+                        div class="l" { "File log đang theo dõi" }
+                    }
+                }
             }
 
             @if r.cycle.watch_blind {
-                div class="note" style="border-left-color:var(--warn)" { "Có truy cập web nhưng không đọc được log — kiểm tra đường dẫn/định dạng log trong " code { "/etc/sn/agent.toml" } "." }
+                div class="note" style="border-left-color:var(--warn)" {
+                    "Agent đang gặp vấn đề khi đọc log của web server (chi tiết ở mục Cảnh báo bên dưới). "
+                    "Trên VPS, chạy " code { "sn env" } " để xem agent đang theo dõi những file log nào, và sửa " code { "[[watch.sources]]" } " trong " code { "/etc/sn/agent.toml" } " nếu cần."
+                }
             }
 
             @if !r.alerts.is_empty() {
                 div class="card" {
                     h2 { "Cảnh báo" }
                     @for al in &r.alerts {
-                        p { span class={"badge " (severity_cls(&al.severity))} { (severity_vi(&al.severity)) } " " (alert_kind_vi(&al.kind)) }
+                        p {
+                            span class={"badge " (severity_cls(&al.severity))} { (severity_vi(&al.severity)) } " " (alert_kind_vi(&al.kind))
+                            // The agent's own wording carries the specifics (which glob, which file).
+                            br; span class="mut" style="font-size:13px" { (al.message) }
+                        }
                     }
                 }
             }

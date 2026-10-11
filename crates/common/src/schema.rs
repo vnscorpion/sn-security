@@ -141,6 +141,10 @@ pub struct CycleStats {
     pub mem_used_pct: f64,
     #[serde(default)]
     pub swap_used_pct: f64,
+    /// Access-log files the agent matched and is following. 0 means the
+    /// configured globs match nothing, so the agent is blind.
+    #[serde(default)]
+    pub log_files: u32,
     pub top_ips: Vec<IpCount>,
     /// True once the sliding baseline has enough data to be trusted.
     pub baseline_ready: bool,

@@ -107,10 +107,28 @@ format = \"combined\""
   done
 }
 
-add_source "/var/log/nginx/*access*.log"
-add_source "/var/log/apache2/*access*.log"
-add_source "/var/log/httpd/*access_log"
-add_source "/var/log/httpd/domains/*.log"      # DirectAdmin
+# Which web server answers on :80/:443? When nginx sits in front of Apache, both
+# write a line per request, so reading both counts every visitor twice. Read only
+# the outermost server's logs. If we cannot tell, read whatever exists.
+LISTENER=""
+if command -v ss >/dev/null 2>&1; then
+  _l="$(ss -ltnp 2>/dev/null | grep -E '[:.](80|443) ' | head -n 1 || true)"
+  case "$_l" in
+    *nginx*) LISTENER=nginx;;
+    *httpd*|*apache2*) LISTENER=apache;;
+  esac
+fi
+echo ">> web server on :80/:443: ${LISTENER:-unknown}"
+
+if [ "$LISTENER" != "apache" ]; then
+  add_source "/var/log/nginx/domains/*.log"    # DirectAdmin (nginx)
+  add_source "/var/log/nginx/*access*.log"
+fi
+if [ "$LISTENER" != "nginx" ]; then
+  add_source "/var/log/apache2/*access*.log"
+  add_source "/var/log/httpd/*access_log"
+  add_source "/var/log/httpd/domains/*.log"    # DirectAdmin (Apache)
+fi
 add_source "/usr/local/apache/domlogs/*"       # cPanel
 add_source "/www/wwwlogs/*.log"                # aaPanel
 add_source "/home/*/logs/*access*log"          # generic panels
@@ -137,7 +155,6 @@ hub_pubkeys = []
 root_pubkeys = []
 
 [watch]
-$SOURCES
 mode         = "observe"
 k            = 5.0
 min_requests = 120
@@ -145,6 +162,9 @@ trusted_proxies = ["cloudflare"]
 load_alert   = 4.0
 cpu_alert_pct = 85.0
 auto_contain = false
+# The log sources go LAST in this table: after a [[watch.sources]] header every
+# following key belongs to that entry, so keys placed below it would be lost.
+$SOURCES
 
 [fw]
 whitelist = []

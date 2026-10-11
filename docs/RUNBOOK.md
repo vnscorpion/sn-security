@@ -37,6 +37,37 @@ sudo systemctl enable --now chronyd && sudo chronyc makestep
 ```
 Sau đó tạo **token mới** trên hub (token dùng một lần, hết hạn sau 15 phút) rồi cài lại. Không dùng `curl -k`: nó tắt kiểm tra chứng chỉ trong khi script cài một binary chạy bằng root.
 
+## Cảnh báo về log của web server (DirectAdmin, cPanel...)
+
+Trên VPS chạy `sn env` để xem agent đang theo dõi file log nào:
+```
+log sources:
+  /var/log/nginx/domains/*.log [combined] -> 12 file(s)
+    - /var/log/nginx/domains/example.com.log (48213 bytes, readable)
+```
+
+| Cảnh báo trên hub | Nghĩa là | Cách xử lý |
+| --- | --- | --- |
+| Không tìm thấy file log nào khớp cấu hình | `glob` không khớp file nào | Sửa `[[watch.sources]]` cho đúng đường dẫn log |
+| Có file log nhưng agent không đọc được | Không mở được file (quyền, SELinux) | Xem lỗi trong chi tiết cảnh báo; thử `sudo ls -lZ <file>` |
+| Đọc được log nhưng sai định dạng | Hơn nửa số dòng không parse được | Đổi `format` (`combined` / `sn` / `nginx_json`) |
+| Nhiều lần quét liền không có dòng log mới | Có kết nối web nhưng log đứng im ≥ 3 chu kỳ liền | Kiểm tra web server có ghi log vào đúng file không |
+
+Lần quét đầu tiên sau khi cài **không** bị coi là lỗi: agent bắt đầu từ cuối file log (cố ý, để không đọc lại lịch sử rồi chặn hàng loạt), nên lần đó luôn đọc được 0 dòng.
+
+**DirectAdmin.** Mỗi domain có `domain.log`, `domain.error.log` và `domain.bytes`; agent chỉ đọc file access log (bỏ error/bytes/nén). Khi nginx đứng trước Apache, hãy đọc log nginx (`/var/log/nginx/domains/*.log`): log Apache chỉ ghi `127.0.0.1` hoặc ghi trùng mỗi request. Bộ cài tự nhận diện web server đang nghe cổng 80/443 và chọn đúng.
+
+Cấu hình mẫu cho DirectAdmin + nginx (các `[[watch.sources]]` phải nằm **cuối** mục `[watch]`):
+```toml
+[watch]
+mode = "observe"
+trusted_proxies = ["cloudflare"]
+
+[[watch.sources]]
+glob   = "/var/log/nginx/domains/*.log"
+format = "combined"
+```
+
 ## Kill switch (ban nhầm hàng loạt / nghi hub bị chiếm)
 
 - Trên VPS: `sn disable` — gỡ table `inet sn`, thả jail ngay. (Hoặc đổi mode→observe từ hub, nhưng đó là chu kỳ sau; `sn disable` là tức thì, tại chỗ.)

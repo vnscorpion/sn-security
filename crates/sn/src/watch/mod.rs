@@ -9,7 +9,7 @@ pub mod tail;
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use snsec_common::logfmt::{self, LogFormat};
@@ -33,6 +33,15 @@ struct CycleData {
     lines_read: u64,
     parse_errors: u64,
     requests: u64,
+    /// Log files the configured globs matched this cycle.
+    files_matched: u32,
+    /// Of those, files we had already seen in an earlier cycle (so a quiet one
+    /// really means "no new lines", not "first look, started at the end").
+    files_known: u32,
+    /// Matched files that could not be opened or read.
+    unreadable: u32,
+    /// First read error, for the alert text.
+    first_error: Option<String>,
 }
 
 const MAX_TRACKED_IPS: usize = 100_000;
@@ -182,7 +191,35 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<()> {
 
     // Build cycle stats + top IPs.
     let top_ips = top_ips(&data);
-    let watch_blind = data.lines_read == 0 && has_web_traffic(&conns);
+
+    // Can we actually see the web server's traffic?
+    let mut meta = state.meta();
+    let globs: Vec<String> = resolve_sources(cfg).into_iter().map(|s| s.glob).collect();
+    let (mut alerts, streak) = assess_logs(
+        &LogHealth {
+            files_matched: data.files_matched,
+            files_known: data.files_known,
+            unreadable: data.unreadable,
+            lines_read: data.lines_read,
+            parse_errors: data.parse_errors,
+            web_traffic: has_web_traffic(&conns),
+            prev_streak: meta.blind_streak,
+        },
+        &globs,
+        data.first_error.as_deref(),
+    );
+    let log_problem = !alerts.is_empty();
+    if meta.blind_streak != streak {
+        meta.blind_streak = streak;
+        state.save_meta(&meta)?;
+    }
+    if over_cap {
+        alerts.push(snsec_common::schema::Alert {
+            kind: "ban_cap".into(),
+            message: "ban cap reached this cycle; possible distributed attack".into(),
+            severity: "urgent".into(),
+        });
+    }
     let (cpu_busy, _load1) = quick_cpu_busy();
     let mem = crate::sys::proc::meminfo().unwrap_or_default();
 
@@ -197,14 +234,15 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<()> {
         mem_total_mb: mem.total_mb(),
         mem_used_pct: (mem.used_pct() * 10.0).round() / 10.0,
         swap_used_pct: (mem.swap_used_pct() * 10.0).round() / 10.0,
+        log_files: data.files_matched,
         top_ips,
         baseline_ready,
-        watch_blind,
+        watch_blind: log_problem,
         overload: data.per_ip.len() >= MAX_TRACKED_IPS,
     };
 
     // Report + hub sync.
-    crate::hub::sync(cfg, state, cycle, applied, would, over_cap, watch_blind)?;
+    crate::hub::sync(cfg, state, cycle, applied, would, alerts)?;
     Ok(())
 }
 
@@ -250,10 +288,13 @@ fn collect(cfg: &Config, state: &State, trusted: &[Cidr]) -> Result<CycleData> {
         lines_read: 0,
         parse_errors: 0,
         requests: 0,
+        files_matched: 0,
+        files_known: 0,
+        unreadable: 0,
+        first_error: None,
     };
 
     let sources = resolve_sources(cfg);
-    let first_run = offsets.is_empty();
     let mut total_bytes: u64 = 0;
 
     'outer: for src in sources {
@@ -262,11 +303,24 @@ fn collect(cfg: &Config, state: &State, trusted: &[Cidr]) -> Result<CycleData> {
             if total_bytes >= CYCLE_BYTE_BUDGET {
                 break 'outer; // offsets already saved advance next cycle
             }
+            data.files_matched += 1;
             let key = path.to_string_lossy().to_string();
             let prev = offsets.get(&key).copied();
-            let read = match tail::read_new(&path, prev, first_run, MAX_BYTES_PER_FILE) {
+            if prev.is_some() {
+                data.files_known += 1;
+            }
+            // A file seen for the first time starts at its end — never its whole
+            // history. This holds for a file that appears later too (a new site,
+            // a changed glob), not just for the first cycle after install; reading
+            // old lines would turn yesterday's traffic into a burst of bans.
+            let read = match tail::read_new(&path, prev, true, MAX_BYTES_PER_FILE) {
                 Ok(r) => r,
-                Err(_) => continue,
+                Err(e) => {
+                    data.unreadable += 1;
+                    data.first_error
+                        .get_or_insert_with(|| format!("{}: {e}", path.display()));
+                    continue;
+                }
             };
             total_bytes += read.bytes;
             offsets.insert(key, read.new_offset);
@@ -315,9 +369,118 @@ fn resolve_sources(cfg: &Config) -> Vec<LogSource> {
 
 fn expand_glob(pattern: &str) -> Vec<PathBuf> {
     match glob::glob(pattern) {
-        Ok(paths) => paths.flatten().filter(|p| p.is_file()).collect(),
+        Ok(paths) => paths
+            .flatten()
+            .filter(|p| p.is_file() && is_access_log_candidate(p))
+            .collect(),
         Err(_) => Vec::new(),
     }
+}
+
+/// Panels put error logs and archives next to the access logs (DirectAdmin:
+/// `site.com.log`, `site.com.error.log`, `site.com.bytes`). Parsing those as
+/// access logs only produces parse errors, so skip them.
+fn is_access_log_candidate(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    const SKIP_SUFFIX: &[&str] = &[".gz", ".bz2", ".xz", ".zst", ".zip", ".bytes", ".tmp"];
+    if SKIP_SUFFIX.iter().any(|s| name.ends_with(s)) {
+        return false;
+    }
+    // `error` as a whole word of the file name: error.log, error_log,
+    // site.com.error.log, site-error.log — but not "errorlog.com.log".
+    !name
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|token| token == "error")
+}
+
+/// What the configured log globs currently match, for `sn env`.
+pub fn describe_sources(cfg: &Config) -> Vec<(LogSource, Vec<PathBuf>)> {
+    resolve_sources(cfg)
+        .into_iter()
+        .map(|s| {
+            let files = expand_glob(&s.glob);
+            (s, files)
+        })
+        .collect()
+}
+
+/// Inputs to [`assess_logs`], kept separate from the I/O so it can be tested.
+struct LogHealth {
+    files_matched: u32,
+    files_known: u32,
+    unreadable: u32,
+    lines_read: u64,
+    parse_errors: u64,
+    web_traffic: bool,
+    /// Quiet-with-traffic cycles in a row before this one.
+    prev_streak: u32,
+}
+
+/// Consecutive quiet cycles (with web connections open) before it is reported.
+/// One is ordinary — idle keep-alive connections hold a port open with no new
+/// requests — so a single cycle must not raise an alarm.
+const BLIND_STREAK_ALERT: u32 = 3;
+
+/// Decide whether the agent can actually see the web server's traffic. Returns
+/// the alerts to raise and the updated quiet-cycle streak.
+fn assess_logs(
+    h: &LogHealth,
+    globs: &[String],
+    first_error: Option<&str>,
+) -> (Vec<snsec_common::schema::Alert>, u32) {
+    use snsec_common::schema::Alert;
+    let warn = |kind: &str, message: String| Alert {
+        kind: kind.into(),
+        message,
+        severity: "warn".into(),
+    };
+    let mut alerts = Vec::new();
+
+    if h.files_matched == 0 {
+        let what = if globs.is_empty() {
+            "no log source is configured".to_string()
+        } else {
+            format!("no access log file matches: {}", globs.join(", "))
+        };
+        alerts.push(warn("log_not_found", what));
+        return (alerts, 0);
+    }
+    if h.unreadable >= h.files_matched {
+        alerts.push(warn(
+            "log_unreadable",
+            format!(
+                "{} log file(s) found but none could be read ({})",
+                h.files_matched,
+                first_error.unwrap_or("unknown error")
+            ),
+        ));
+        return (alerts, 0);
+    }
+    if h.lines_read >= 20 && h.parse_errors * 2 > h.lines_read {
+        alerts.push(warn(
+            "log_format",
+            format!(
+                "{} of {} log lines could not be parsed; check `format` in agent.toml",
+                h.parse_errors, h.lines_read
+            ),
+        ));
+    }
+
+    // Quiet cycle with traffic. Needs a file we already knew: a file first seen
+    // this cycle starts at its end and so reads nothing by design.
+    let quiet = h.lines_read == 0 && h.files_known > 0 && h.web_traffic;
+    let streak = if quiet { h.prev_streak + 1 } else { 0 };
+    if streak >= BLIND_STREAK_ALERT {
+        alerts.push(warn(
+            "watch_blind",
+            format!("web connections are open but no new log lines for {streak} cycles in a row"),
+        ));
+    }
+    (alerts, streak)
 }
 
 fn top_ips(data: &CycleData) -> Vec<IpCount> {
@@ -413,4 +576,167 @@ fn replay(cfg: &Config, path: &PathBuf) -> Result<()> {
     }
     println!("total would_ban: {bans}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn health() -> LogHealth {
+        LogHealth {
+            files_matched: 3,
+            files_known: 3,
+            unreadable: 0,
+            lines_read: 100,
+            parse_errors: 0,
+            web_traffic: true,
+            prev_streak: 0,
+        }
+    }
+
+    fn kinds(alerts: &[snsec_common::schema::Alert]) -> Vec<&str> {
+        alerts.iter().map(|a| a.kind.as_str()).collect()
+    }
+
+    #[test]
+    fn healthy_cycle_raises_nothing() {
+        let (alerts, streak) = assess_logs(&health(), &["/x/*.log".into()], None);
+        assert!(alerts.is_empty());
+        assert_eq!(streak, 0);
+    }
+
+    #[test]
+    fn first_cycle_after_install_is_not_blind() {
+        // Files are first seen this cycle, so they start at the end and read
+        // nothing by design. This used to raise a false "cannot read logs".
+        let h = LogHealth {
+            files_known: 0,
+            lines_read: 0,
+            ..health()
+        };
+        let (alerts, streak) = assess_logs(&h, &["/x/*.log".into()], None);
+        assert!(alerts.is_empty());
+        assert_eq!(streak, 0);
+    }
+
+    #[test]
+    fn blind_needs_a_streak_not_a_single_quiet_cycle() {
+        let quiet = |prev| LogHealth {
+            lines_read: 0,
+            prev_streak: prev,
+            ..health()
+        };
+        let g = ["/x/*.log".to_string()];
+        let (a1, s1) = assess_logs(&quiet(0), &g, None);
+        assert!(a1.is_empty());
+        assert_eq!(s1, 1);
+        let (a2, s2) = assess_logs(&quiet(s1), &g, None);
+        assert!(a2.is_empty());
+        assert_eq!(s2, 2);
+        let (a3, s3) = assess_logs(&quiet(s2), &g, None);
+        assert_eq!(kinds(&a3), ["watch_blind"]);
+        assert_eq!(s3, 3);
+        // Lines arrive again: the streak resets and the alert clears.
+        let (a4, s4) = assess_logs(
+            &LogHealth {
+                prev_streak: s3,
+                ..health()
+            },
+            &g,
+            None,
+        );
+        assert!(a4.is_empty());
+        assert_eq!(s4, 0);
+    }
+
+    #[test]
+    fn quiet_without_web_connections_is_just_a_quiet_server() {
+        let h = LogHealth {
+            lines_read: 0,
+            web_traffic: false,
+            prev_streak: 5,
+            ..health()
+        };
+        let (alerts, streak) = assess_logs(&h, &["/x/*.log".into()], None);
+        assert!(alerts.is_empty());
+        assert_eq!(streak, 0);
+    }
+
+    #[test]
+    fn nothing_matched_names_the_globs() {
+        let h = LogHealth {
+            files_matched: 0,
+            files_known: 0,
+            lines_read: 0,
+            ..health()
+        };
+        let globs = vec!["/var/log/httpd/domains/*.log".to_string()];
+        let (alerts, _) = assess_logs(&h, &globs, None);
+        assert_eq!(kinds(&alerts), ["log_not_found"]);
+        assert!(alerts[0].message.contains("/var/log/httpd/domains/*.log"));
+
+        let (alerts, _) = assess_logs(&h, &[], None);
+        assert_eq!(kinds(&alerts), ["log_not_found"]);
+        assert!(alerts[0].message.contains("no log source"));
+    }
+
+    #[test]
+    fn unreadable_files_report_the_error() {
+        let h = LogHealth {
+            unreadable: 3,
+            lines_read: 0,
+            ..health()
+        };
+        let (alerts, _) = assess_logs(&h, &["/x/*.log".into()], Some("/x/a.log: denied"));
+        assert_eq!(kinds(&alerts), ["log_unreadable"]);
+        assert!(alerts[0].message.contains("denied"));
+        // Some readable files: not an alert.
+        let h = LogHealth {
+            unreadable: 1,
+            ..health()
+        };
+        assert!(assess_logs(&h, &[], Some("e")).0.is_empty());
+    }
+
+    #[test]
+    fn wrong_log_format_is_called_out() {
+        let g = ["/x/*.log".to_string()];
+        let bad = LogHealth {
+            lines_read: 100,
+            parse_errors: 80,
+            ..health()
+        };
+        assert_eq!(kinds(&assess_logs(&bad, &g, None).0), ["log_format"]);
+        // A few bad lines are normal.
+        let few = LogHealth {
+            lines_read: 100,
+            parse_errors: 30,
+            ..health()
+        };
+        assert!(assess_logs(&few, &g, None).0.is_empty());
+        // Too few lines to judge.
+        let tiny = LogHealth {
+            lines_read: 10,
+            parse_errors: 10,
+            ..health()
+        };
+        assert!(assess_logs(&tiny, &g, None).0.is_empty());
+    }
+
+    #[test]
+    fn directadmin_error_logs_and_archives_are_skipped() {
+        let ok = |p: &str| is_access_log_candidate(Path::new(p));
+        // The files DirectAdmin writes per domain.
+        assert!(ok("/var/log/httpd/domains/example.com.log"));
+        assert!(!ok("/var/log/httpd/domains/example.com.error.log"));
+        assert!(!ok("/var/log/httpd/domains/example.com.bytes"));
+        assert!(!ok("/var/log/httpd/domains/example.com.log.gz"));
+        // Other servers.
+        assert!(ok("/var/log/nginx/access.log"));
+        assert!(!ok("/var/log/nginx/error.log"));
+        assert!(!ok("/usr/local/apache/domlogs/error_log"));
+        assert!(ok("/usr/local/apache/domlogs/example.com-ssl_log"));
+        // "error" must be a whole word: this is a real access log.
+        assert!(ok("/var/log/httpd/domains/errorlog.com.log"));
+    }
 }

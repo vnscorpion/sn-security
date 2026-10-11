@@ -219,6 +219,27 @@ fn run() -> Result<()> {
             let wl = whitelist::build(&cfg, &conns);
             println!("whitelist entries: {}", wl.keys().len());
             println!("mode: {}", cfg.watch.mode.as_str());
+            println!("trusted proxies: {}", cfg.watch.trusted_proxies.join(", "));
+            println!("log sources:");
+            let sources = watch::describe_sources(&cfg);
+            if sources.is_empty() {
+                println!("  (none configured: set [[watch.sources]] in agent.toml)");
+            }
+            for (src, files) in &sources {
+                println!("  {} [{}] -> {} file(s)", src.glob, src.format, files.len());
+                for f in files.iter().take(5) {
+                    let size = std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
+                    let readable = std::fs::File::open(f).is_ok();
+                    println!(
+                        "    - {} ({size} bytes, {})",
+                        f.display(),
+                        if readable { "readable" } else { "NOT readable" }
+                    );
+                }
+                if files.len() > 5 {
+                    println!("    ... and {} more", files.len() - 5);
+                }
+            }
         }
     }
     Ok(())
