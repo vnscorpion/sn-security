@@ -66,6 +66,14 @@ curl -fsSL https://raw.githubusercontent.com/vnscorpion/sn-security/main/deploy/
   | sudo bash -s -- --public-url https://hub.ten-mien-cua-ban.net
 ```
 
+> **Repo đang private?** `raw.githubusercontent.com` trả 404 với repo private, nên lệnh một dòng ở trên **không chạy**. Hoặc để repo public, hoặc clone rồi cài từ file local (không cần raw):
+> ```sh
+> git clone https://github.com/vnscorpion/sn-security
+> cd sn-security
+> sudo bash deploy/install-hub.sh --local --public-url https://hub.ten-mien-cua-ban.net
+> ```
+> (Agent thì không bị ảnh hưởng: bộ cài agent do **hub** phục vụ qua `public_url`, không lấy từ GitHub.)
+
 Script tải binary (kiểm sha256), tạo user `snhub`, sinh key (in **root secret offline** một lần — lưu ra ngoài server), cài `snhub.service`, và seed bộ cài agent để hub phục vụ cho các VPS. Sau đó:
 
 ```sh
