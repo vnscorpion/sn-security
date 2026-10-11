@@ -16,7 +16,8 @@ use snsec_common::logfmt::{self, LogFormat};
 use snsec_common::net::{self, Cidr};
 use snsec_common::schema::{BanEvent, CycleStats, IpCount};
 
-use crate::config::{Config, LogSource};
+use crate::config::{Config, LogSource, SourcesMode};
+use crate::discover;
 use crate::state::{ActiveBan, State, Strike};
 use crate::sys::{fw, netstat};
 use crate::util;
@@ -69,8 +70,9 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<()> {
     let conns = netstat::all();
     let wl = crate::whitelist::build(cfg, &conns);
 
-    // Gather and parse new log lines.
-    let data = collect(cfg, state, &trusted)?;
+    // Work out which logs to follow (detected each cycle), then read them.
+    let resolved = resolve_sources(cfg, &conns);
+    let data = collect(state, &trusted, &resolved.sources)?;
 
     // Busiest-IP count for the baseline (whitelisted IPs excluded).
     let busiest = data
@@ -194,7 +196,6 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<()> {
 
     // Can we actually see the web server's traffic?
     let mut meta = state.meta();
-    let globs: Vec<String> = resolve_sources(cfg).into_iter().map(|s| s.glob).collect();
     let (mut alerts, streak) = assess_logs(
         &LogHealth {
             files_matched: data.files_matched,
@@ -205,7 +206,7 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<()> {
             web_traffic: has_web_traffic(&conns),
             prev_streak: meta.blind_streak,
         },
-        &globs,
+        &resolved.tried,
         data.first_error.as_deref(),
     );
     let log_problem = !alerts.is_empty();
@@ -280,7 +281,7 @@ fn key_protected(
     }
 }
 
-fn collect(cfg: &Config, state: &State, trusted: &[Cidr]) -> Result<CycleData> {
+fn collect(state: &State, trusted: &[Cidr], sources: &[LogSource]) -> Result<CycleData> {
     let mut offsets = state.offsets();
     let mut data = CycleData {
         per_ip: HashMap::new(),
@@ -294,7 +295,6 @@ fn collect(cfg: &Config, state: &State, trusted: &[Cidr]) -> Result<CycleData> {
         first_error: None,
     };
 
-    let sources = resolve_sources(cfg);
     let mut total_bytes: u64 = 0;
 
     'outer: for src in sources {
@@ -353,7 +353,17 @@ fn collect(cfg: &Config, state: &State, trusted: &[Cidr]) -> Result<CycleData> {
     Ok(data)
 }
 
-fn resolve_sources(cfg: &Config) -> Vec<LogSource> {
+/// The log sources in effect for this cycle, and how they were chosen.
+pub struct Resolved {
+    pub sources: Vec<LogSource>,
+    /// Every pattern considered, so "found nothing" can say where it looked.
+    pub tried: Vec<String>,
+    /// The web server detected on :80/:443 (`None` in manual mode).
+    pub listener: Option<discover::Listener>,
+}
+
+/// What the config file lists explicitly (`sources`, or the older `logs`).
+fn configured_sources(cfg: &Config) -> Vec<LogSource> {
     if !cfg.watch.sources.is_empty() {
         return cfg.watch.sources.clone();
     }
@@ -367,7 +377,42 @@ fn resolve_sources(cfg: &Config) -> Vec<LogSource> {
         .collect()
 }
 
-fn expand_glob(pattern: &str) -> Vec<PathBuf> {
+/// Choose the logs to follow. In `auto` mode (the default) the agent detects the
+/// web server and reads its logs, which is what makes one agent build work on
+/// every panel and keeps working after a web-server switch. The explicit sources
+/// in the config are only a fallback there. `manual` uses them and nothing else.
+fn resolve_sources(cfg: &Config, conns: &[netstat::Conn]) -> Resolved {
+    let configured = configured_sources(cfg);
+    match cfg.watch.sources_mode {
+        SourcesMode::Manual => Resolved {
+            tried: configured.iter().map(|s| s.glob.clone()).collect(),
+            sources: configured,
+            listener: None,
+        },
+        SourcesMode::Auto => {
+            let listener = discover::detect_listener(conns);
+            let found = discover::discover(listener, "");
+            let mut tried = found.tried;
+            if found.found.is_empty() {
+                // Nothing at the usual places: fall back to whatever is configured.
+                tried.extend(configured.iter().map(|s| s.glob.clone()));
+                Resolved {
+                    sources: configured,
+                    tried,
+                    listener: Some(listener),
+                }
+            } else {
+                Resolved {
+                    sources: found.found,
+                    tried,
+                    listener: Some(listener),
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn expand_glob(pattern: &str) -> Vec<PathBuf> {
     match glob::glob(pattern) {
         Ok(paths) => paths
             .flatten()
@@ -390,22 +435,24 @@ fn is_access_log_candidate(path: &Path) -> bool {
     if SKIP_SUFFIX.iter().any(|s| name.ends_with(s)) {
         return false;
     }
-    // `error` as a whole word of the file name: error.log, error_log,
-    // site.com.error.log, site-error.log — but not "errorlog.com.log".
+    // `error` / `bytes` as a whole word of the file name: error.log, error_log,
+    // site.com.error.log, cPanel's site.com-bytes_log — but not
+    // "errorlog.com.log", which is a real access log for a site of that name.
     !name
         .split(|c: char| !c.is_ascii_alphanumeric())
-        .any(|token| token == "error")
+        .any(|token| token == "error" || token == "bytes")
 }
 
-/// What the configured log globs currently match, for `sn env`.
-pub fn describe_sources(cfg: &Config) -> Vec<(LogSource, Vec<PathBuf>)> {
-    resolve_sources(cfg)
-        .into_iter()
-        .map(|s| {
-            let files = expand_glob(&s.glob);
-            (s, files)
-        })
-        .collect()
+/// What is being followed right now, for `sn env`: how it was chosen, and the
+/// files each source matches.
+pub fn describe_sources(cfg: &Config) -> (Resolved, Vec<(LogSource, Vec<PathBuf>)>) {
+    let resolved = resolve_sources(cfg, &netstat::all());
+    let files = resolved
+        .sources
+        .iter()
+        .map(|s| (s.clone(), expand_glob(&s.glob)))
+        .collect();
+    (resolved, files)
 }
 
 /// Inputs to [`assess_logs`], kept separate from the I/O so it can be tested.
@@ -444,7 +491,7 @@ fn assess_logs(
         let what = if globs.is_empty() {
             "no log source is configured".to_string()
         } else {
-            format!("no access log file matches: {}", globs.join(", "))
+            format!("no access log file found; looked for: {}", globs.join(", "))
         };
         alerts.push(warn("log_not_found", what));
         return (alerts, 0);
@@ -736,6 +783,8 @@ mod tests {
         assert!(!ok("/var/log/nginx/error.log"));
         assert!(!ok("/usr/local/apache/domlogs/error_log"));
         assert!(ok("/usr/local/apache/domlogs/example.com-ssl_log"));
+        // cPanel's per-site byte counter is not an access log either.
+        assert!(!ok("/usr/local/apache/domlogs/example.com-bytes_log"));
         // "error" must be a whole word: this is a real access log.
         assert!(ok("/var/log/httpd/domains/errorlog.com.log"));
     }

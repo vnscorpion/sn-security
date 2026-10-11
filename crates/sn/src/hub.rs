@@ -59,6 +59,9 @@ fn host_info() -> HostInfo {
         } else {
             "none".into()
         },
+        web_server: crate::discover::detect_listener(&crate::sys::netstat::all())
+            .name()
+            .to_string(),
     }
 }
 

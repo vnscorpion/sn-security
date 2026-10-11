@@ -676,7 +676,14 @@ pub async fn agent_detail(
     let body = html! {
         p { a href="/" { "← Tổng quan" } }
         h1 { (agent.name) " " (status_badge(agent.last_seen)) " " (mode_badge(mode.as_str())) }
-        p class="sub" { code { (agent.id) } " · bản sn " (agent.version) " · cập nhật " (rel_time(agent.last_seen)) }
+        p class="sub" {
+            code { (agent.id) } " · bản sn " (agent.version) " · cập nhật " (rel_time(agent.last_seen))
+            @if let Some(r) = &report {
+                @if !r.host.os.is_empty() { " · " (r.host.os) }
+                // Empty from agents older than this field.
+                @if !r.host.web_server.is_empty() && r.host.web_server != "unknown" { " · web server: " b { (r.host.web_server) } }
+            }
+        }
 
         @if agent_outdated(&agent.version) {
             div class="note" style="border-left-color:var(--warn)" {

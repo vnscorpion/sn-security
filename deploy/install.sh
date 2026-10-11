@@ -97,56 +97,16 @@ esac
 
 install_binary
 
-# --- detect web server + logs ------------------------------------------------
+# --- config --------------------------------------------------------------------
+# Access logs are NOT configured here. The agent works out, every cycle, which web
+# server answers on :80/:443 and reads that server's logs (nginx, Apache,
+# LiteSpeed; DirectAdmin, cPanel, aaPanel...). That is why the same agent works on
+# every panel and keeps working after a web-server switch. `sn env` shows what it
+# found; set `sources_mode = "manual"` plus [[watch.sources]] only for custom paths.
 mkdir -p /etc/sn
-SOURCES=""
-add_source() {  # $1 = glob
-  # Only add when the glob currently matches at least one file.
-  for _f in $1; do
-    if [ -e "$_f" ]; then
-      SOURCES="$SOURCES
-[[watch.sources]]
-glob   = \"$1\"
-format = \"combined\""
-      break
-    fi
-  done
-}
-
-# Which web server answers on :80/:443? When nginx sits in front of Apache, both
-# write a line per request, so reading both counts every visitor twice. Read only
-# the outermost server's logs. If we cannot tell, read whatever exists.
-LISTENER=""
-if command -v ss >/dev/null 2>&1; then
-  _l="$(ss -ltnp 2>/dev/null | grep -E '[:.](80|443) ' | head -n 1 || true)"
-  case "$_l" in
-    *nginx*) LISTENER=nginx;;
-    *httpd*|*apache2*) LISTENER=apache;;
-  esac
-fi
-echo ">> web server on :80/:443: ${LISTENER:-unknown}"
-
-if [ "$LISTENER" != "apache" ]; then
-  add_source "/var/log/nginx/domains/*.log"    # DirectAdmin (nginx)
-  add_source "/var/log/nginx/*access*.log"
-fi
-if [ "$LISTENER" != "nginx" ]; then
-  add_source "/var/log/apache2/*access*.log"
-  add_source "/var/log/httpd/*access_log"
-  add_source "/var/log/httpd/domains/*.log"    # DirectAdmin (Apache)
-fi
-add_source "/usr/local/apache/domlogs/*"       # cPanel
-add_source "/www/wwwlogs/*.log"                # aaPanel
-add_source "/home/*/logs/*access*log"          # generic panels
 
 ROOTS='["/home", "/var/www"]'
 [ -d /www/wwwroot ] && ROOTS='["/home", "/var/www", "/www/wwwroot"]'
-
-if [ -z "$SOURCES" ]; then
-  echo "!! no access logs found; set [watch] logs in /etc/sn/agent.toml manually"
-  SOURCES='logs   = ["/var/log/nginx/*access.log", "/var/log/apache2/*access.log"]
-format = "combined"'
-fi
 
 echo ">> writing /etc/sn/agent.toml (observe mode)"
 umask 077
@@ -168,9 +128,10 @@ trusted_proxies = ["cloudflare"]
 load_alert   = 4.0
 cpu_alert_pct = 85.0
 auto_contain = false
-# The log sources go LAST in this table: after a [[watch.sources]] header every
-# following key belongs to that entry, so keys placed below it would be lost.
-$SOURCES
+# auto = detect the web server's logs each cycle (recommended); manual = only the
+# [[watch.sources]] listed in this file. A [[watch.sources]] table must come after
+# every plain key of [watch]: keys placed below it belong to that entry.
+sources_mode = "auto"
 
 [fw]
 whitelist = []
@@ -268,6 +229,9 @@ systemctl enable --now sn-watch.timer sn-hunt.timer
 echo ">> running a first triage + watch cycle"
 /usr/local/bin/sn triage || true
 /usr/local/bin/sn watch || true
+
+echo ">> access logs the agent detected (it re-detects every cycle):"
+/usr/local/bin/sn --config /etc/sn/agent.toml env 2>/dev/null | sed -n '/^log sources/,$p' || true
 
 cat <<EOF
 

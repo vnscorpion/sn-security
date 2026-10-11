@@ -40,6 +40,22 @@ pub struct HubCfg {
     pub root_pubkeys: Vec<String>,
 }
 
+/// How the access logs to follow are chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SourcesMode {
+    /// The agent finds them itself, every cycle: it looks at which web server
+    /// answers on :80/:443 and reads that server's logs. Survives a web-server
+    /// switch and needs no per-host setup. A config written before this option
+    /// existed has no value for it and so gets this, which replaces the guess an
+    /// older installer made. The explicit `sources` below are used only as a
+    /// fallback when nothing is found.
+    #[default]
+    Auto,
+    /// Follow exactly `sources` / `logs` from this file (custom log locations).
+    Manual,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WatchCfg {
     /// Simple global globs (legacy). Prefer `sources`.
@@ -47,7 +63,11 @@ pub struct WatchCfg {
     pub logs: Vec<String>,
     #[serde(default = "default_format")]
     pub format: String,
-    /// Per-source log definitions (installer fills these per web server/panel).
+    /// `auto` (default) detects the web server's logs; `manual` uses `sources`.
+    #[serde(default)]
+    pub sources_mode: SourcesMode,
+    /// Explicit log definitions: what `manual` mode follows, and the fallback
+    /// for `auto` when detection finds nothing.
     #[serde(default)]
     pub sources: Vec<LogSource>,
     #[serde(default)]
@@ -73,6 +93,7 @@ impl Default for WatchCfg {
         WatchCfg {
             logs: Vec::new(),
             format: default_format(),
+            sources_mode: SourcesMode::Auto,
             sources: Vec::new(),
             mode: Mode::Observe,
             k: default_k(),
@@ -314,5 +335,32 @@ trusted_proxies = ["cloudflare"]
         let cfg: Config = toml::from_str(broken).unwrap();
         assert_eq!(cfg.watch.sources.len(), 1);
         assert!(cfg.watch.trusted_proxies.is_empty());
+    }
+
+    #[test]
+    fn a_config_written_before_sources_mode_existed_is_auto() {
+        // Every install made so far has explicit sources and no `sources_mode`.
+        // Defaulting to auto is what lets a plain agent upgrade replace a wrong
+        // installer guess (e.g. Apache paths on an nginx server) with detection.
+        let cfg: Config = toml::from_str(INSTALLER_CONFIG).unwrap();
+        assert_eq!(cfg.watch.sources_mode, SourcesMode::Auto);
+        assert_eq!(
+            Config::standalone_default().watch.sources_mode,
+            SourcesMode::Auto
+        );
+        // The explicit sources are kept: they are the fallback when nothing is found.
+        assert_eq!(cfg.watch.sources.len(), 2);
+    }
+
+    #[test]
+    fn manual_mode_is_opt_in_and_survives_a_save() {
+        let text = "[watch]\nsources_mode = \"manual\"\n";
+        let cfg: Config = toml::from_str(text).unwrap();
+        assert_eq!(cfg.watch.sources_mode, SourcesMode::Manual);
+        // `sn enroll` rewrites the file through serde: the choice must round-trip.
+        let saved = toml::to_string_pretty(&cfg).unwrap();
+        let again: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(again.watch.sources_mode, SourcesMode::Manual);
+        assert!(saved.contains("sources_mode = \"manual\""));
     }
 }

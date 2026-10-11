@@ -121,6 +121,10 @@ pub struct HostInfo {
     pub kernel: String,
     pub cgroup: String,
     pub firewall: String,
+    /// Web server answering on :80/:443 (`nginx`, `apache`, `litespeed`, or
+    /// `unknown`). Empty from agents that predate this field.
+    #[serde(default)]
+    pub web_server: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

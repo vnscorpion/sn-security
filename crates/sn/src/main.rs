@@ -8,6 +8,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod clean;
 mod config;
 mod contain;
+mod discover;
 mod hub;
 mod hunt;
 mod state;
@@ -220,10 +221,16 @@ fn run() -> Result<()> {
             println!("whitelist entries: {}", wl.keys().len());
             println!("mode: {}", cfg.watch.mode.as_str());
             println!("trusted proxies: {}", cfg.watch.trusted_proxies.join(", "));
-            println!("log sources:");
-            let sources = watch::describe_sources(&cfg);
+            let (resolved, sources) = watch::describe_sources(&cfg);
+            match resolved.listener {
+                Some(l) => println!("log sources (auto-detected; web server: {}):", l.name()),
+                None => println!("log sources (manual, from agent.toml):"),
+            }
             if sources.is_empty() {
-                println!("  (none configured: set [[watch.sources]] in agent.toml)");
+                println!("  (none found; looked for:)");
+                for g in &resolved.tried {
+                    println!("    {g}");
+                }
             }
             for (src, files) in &sources {
                 println!("  {} [{}] -> {} file(s)", src.glob, src.format, files.len());

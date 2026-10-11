@@ -55,18 +55,32 @@ log sources:
 
 Lần quét đầu tiên sau khi cài **không** bị coi là lỗi: agent bắt đầu từ cuối file log (cố ý, để không đọc lại lịch sử rồi chặn hàng loạt), nên lần đó luôn đọc được 0 dòng.
 
-**DirectAdmin.** Mỗi domain có `domain.log`, `domain.error.log` và `domain.bytes`; agent chỉ đọc file access log (bỏ error/bytes/nén). Khi nginx đứng trước Apache, hãy đọc log nginx (`/var/log/nginx/domains/*.log`): log Apache chỉ ghi `127.0.0.1` hoặc ghi trùng mỗi request. Bộ cài tự nhận diện web server đang nghe cổng 80/443 và chọn đúng.
+### Log được chọn tự động (từ bản 0.3.0)
 
-Cấu hình mẫu cho DirectAdmin + nginx (các `[[watch.sources]]` phải nằm **cuối** mục `[watch]`):
+Agent **tự tìm log mỗi chu kỳ**, không cần cấu hình theo từng VPS: nó xem web server nào đang nghe cổng 80/443, rồi đọc log ở các vị trí quen thuộc của server đó.
+
+| Web server | Nơi agent tìm log |
+| --- | --- |
+| nginx | `/var/log/nginx/domains/*.log` (DirectAdmin, Hestia), `/var/log/nginx/*access*.log`, `/www/wwwlogs/*.log` (aaPanel) |
+| Apache | `/var/log/httpd/domains/*.log` (DirectAdmin), `/var/log/httpd/*access_log`, `/var/log/apache2/*access*.log`, `/usr/local/apache/domlogs/*` (cPanel), `/home/*/logs/*access*log` |
+| LiteSpeed | `/usr/local/lsws/logs/*access*.log`, `/usr/local/apache/domlogs/*`, `/home/*/logs/*access*log` |
+
+- Chỉ đọc log của server **ngoài cùng**. Khi nginx đứng trước Apache (DirectAdmin `nginx_apache`), hai bên đều ghi mỗi request, đọc cả hai sẽ đếm đôi mỗi lượt truy cập.
+- Chuyển web server sau khi đã cài agent (ví dụ Apache → nginx bằng custombuild) cũng tự đúng, không phải sửa gì.
+- Bỏ qua file lỗi và file phụ: `*.error.log`, `*.bytes`, `*-bytes_log`, `*.gz`...
+- `sn env` cho biết agent đã dò ra gì.
+- Cấu hình cũ có `[[watch.sources]]` vẫn được giữ làm **phương án dự phòng** khi không dò ra gì.
+
+Chỉ khi log nằm ở chỗ khác thường, đặt `sources_mode = "manual"` và liệt kê đường dẫn (các `[[watch.sources]]` phải nằm **cuối** mục `[watch]`):
 ```toml
 [watch]
-mode = "observe"
-trusted_proxies = ["cloudflare"]
+sources_mode = "manual"
 
 [[watch.sources]]
-glob   = "/var/log/nginx/domains/*.log"
+glob   = "/duong/dan/rieng/*.log"
 format = "combined"
 ```
+OpenLiteSpeed chạy trong panel (CyberPanel...) mới chỉ được dò theo `/home/*/logs/*access*log`.
 
 ## Kill switch (ban nhầm hàng loạt / nghi hub bị chiếm)
 
