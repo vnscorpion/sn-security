@@ -124,6 +124,7 @@ pub fn run(state: &State, print: bool) -> Result<TriageSummary> {
         load1: proc::loadavg1(),
         disk_pct,
         inode_pct,
+        mem_used_pct: (proc::meminfo().unwrap_or_default().used_pct() * 10.0).round() / 10.0,
     };
 
     // Persist JSON for the hub / later commands.
@@ -320,8 +321,8 @@ fn disk_usage(path: &str) -> (u8, u8) {
 fn print_summary(s: &TriageSummary, cpu_busy_pct: f64) {
     println!("== sn triage ==");
     println!(
-        "label: {}   load1: {:.2}   cpu_busy: {:.0}%   disk: {}%   inode: {}%",
-        s.label, s.load1, cpu_busy_pct, s.disk_pct, s.inode_pct
+        "label: {}   load1: {:.2}   cpu_busy: {:.0}%   ram: {:.0}%   disk: {}%   inode: {}%",
+        s.label, s.load1, cpu_busy_pct, s.mem_used_pct, s.disk_pct, s.inode_pct
     );
     println!();
     println!(

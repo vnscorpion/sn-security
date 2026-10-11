@@ -166,6 +166,85 @@ pub fn cpu_total_idle() -> Option<(u64, u64)> {
     Some((total, idle))
 }
 
+/// Memory figures from `/proc/meminfo`, in kB.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct MemInfo {
+    pub total_kb: u64,
+    /// `MemAvailable`: free + reclaimable cache, i.e. what apps can still get.
+    pub available_kb: u64,
+    pub swap_total_kb: u64,
+    pub swap_free_kb: u64,
+}
+
+impl MemInfo {
+    /// Percent of RAM in use, not counting reclaimable cache.
+    pub fn used_pct(&self) -> f64 {
+        if self.total_kb == 0 {
+            return 0.0;
+        }
+        let used = self.total_kb.saturating_sub(self.available_kb);
+        100.0 * used as f64 / self.total_kb as f64
+    }
+
+    pub fn swap_used_pct(&self) -> f64 {
+        if self.swap_total_kb == 0 {
+            return 0.0;
+        }
+        let used = self.swap_total_kb.saturating_sub(self.swap_free_kb);
+        100.0 * used as f64 / self.swap_total_kb as f64
+    }
+
+    pub fn total_mb(&self) -> u64 {
+        self.total_kb / 1024
+    }
+}
+
+/// Parse the text of `/proc/meminfo`. Returns `None` if `MemTotal` is missing.
+pub fn parse_meminfo(text: &str) -> Option<MemInfo> {
+    let mut m = MemInfo::default();
+    let mut have_total = false;
+    let mut have_avail = false;
+    let mut mem_free = 0u64;
+    for line in text.lines() {
+        let Some((key, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let Some(kb) = rest
+            .split_whitespace()
+            .next()
+            .and_then(|v| v.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        match key {
+            "MemTotal" => {
+                m.total_kb = kb;
+                have_total = true;
+            }
+            "MemAvailable" => {
+                m.available_kb = kb;
+                have_avail = true;
+            }
+            "MemFree" => mem_free = kb,
+            "SwapTotal" => m.swap_total_kb = kb,
+            "SwapFree" => m.swap_free_kb = kb,
+            _ => {}
+        }
+    }
+    if !have_total {
+        return None;
+    }
+    if !have_avail {
+        // Very old kernels lack MemAvailable; fall back to MemFree.
+        m.available_kb = mem_free;
+    }
+    Some(m)
+}
+
+pub fn meminfo() -> Option<MemInfo> {
+    parse_meminfo(&fs::read_to_string("/proc/meminfo").ok()?)
+}
+
 /// Number of online CPUs.
 pub fn num_cpus() -> usize {
     match nix::unistd::sysconf(nix::unistd::SysconfVar::_NPROCESSORS_ONLN) {
@@ -233,4 +312,53 @@ pub fn persistence_files() -> Vec<PathBuf> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE: &str = "MemTotal:        8000000 kB\n\
+        MemFree:          500000 kB\n\
+        MemAvailable:    2000000 kB\n\
+        Buffers:          100000 kB\n\
+        SwapTotal:       1000000 kB\n\
+        SwapFree:         750000 kB\n";
+
+    #[test]
+    fn parses_meminfo() {
+        let m = parse_meminfo(SAMPLE).unwrap();
+        assert_eq!(m.total_kb, 8_000_000);
+        assert_eq!(m.available_kb, 2_000_000);
+        assert!((m.used_pct() - 75.0).abs() < 0.01);
+        assert!((m.swap_used_pct() - 25.0).abs() < 0.01);
+        assert_eq!(m.total_mb(), 7812);
+    }
+
+    #[test]
+    fn no_swap_is_zero_not_nan() {
+        let m = parse_meminfo("MemTotal: 1000 kB\nMemAvailable: 1000 kB\n").unwrap();
+        assert_eq!(m.swap_used_pct(), 0.0);
+        assert_eq!(m.used_pct(), 0.0);
+    }
+
+    #[test]
+    fn missing_total_is_none() {
+        assert!(parse_meminfo("MemFree: 5 kB\n").is_none());
+        assert!(parse_meminfo("").is_none());
+    }
+
+    #[test]
+    fn falls_back_to_memfree_without_available() {
+        let m = parse_meminfo("MemTotal: 1000 kB\nMemFree: 400 kB\n").unwrap();
+        assert_eq!(m.available_kb, 400);
+    }
+
+    #[test]
+    fn skips_non_numeric_lines() {
+        let m =
+            parse_meminfo("garbage\nMemTotal: 2000 kB\nFoo: bar\nMemAvailable: 500 kB\n").unwrap();
+        assert_eq!(m.total_kb, 2000);
+        assert_eq!(m.available_kb, 500);
+    }
 }

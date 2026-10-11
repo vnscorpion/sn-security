@@ -90,6 +90,23 @@ pub struct ReportBody {
     /// Features this agent supports; the hub only sends jobs within this set.
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// Every ban currently in force on the VPS, whoever set it (automatic
+    /// detection, an admin from the hub, or `sn contain`). Older agents omit
+    /// this, so the hub must tolerate it being empty.
+    #[serde(default)]
+    pub active_bans: Vec<ActiveBanInfo>,
+}
+
+/// One ban currently in force on a VPS.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveBanInfo {
+    pub ip: String,
+    /// `hub` for admin-ordered bans, otherwise the detection reason.
+    pub reason: String,
+    /// Unix time the ban lapses.
+    pub expires_at: i64,
+    pub strike: u32,
+    pub layer: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -110,6 +127,15 @@ pub struct CycleStats {
     pub requests: u64,
     pub load1: f64,
     pub cpu_busy_pct: f64,
+    /// Memory figures (new in schema 1.1; `default` keeps reports from older
+    /// agents deserializable on the hub).
+    #[serde(default)]
+    pub mem_total_mb: u64,
+    /// Percent of RAM in use, excluding reclaimable cache (`MemAvailable`).
+    #[serde(default)]
+    pub mem_used_pct: f64,
+    #[serde(default)]
+    pub swap_used_pct: f64,
     pub top_ips: Vec<IpCount>,
     /// True once the sliding baseline has enough data to be trusted.
     pub baseline_ready: bool,
@@ -153,6 +179,8 @@ pub struct TriageSummary {
     pub load1: f64,
     pub disk_pct: u8,
     pub inode_pct: u8,
+    #[serde(default)]
+    pub mem_used_pct: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -228,6 +256,12 @@ pub struct DesiredBan {
     pub ip: String,
     pub ttl_secs: u64,
     pub reason: String,
+    /// Unix time the admin ordered the ban. Lets the agent apply only the
+    /// *remaining* time (a later, unrelated desired change must not re-arm an
+    /// old ban with a fresh TTL) and lets the hub show when it lapses.
+    /// `0` for entries written before this field existed.
+    #[serde(default)]
+    pub created_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

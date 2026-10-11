@@ -9,8 +9,8 @@ use anyhow::{Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use snsec_common::crypto;
 use snsec_common::schema::{
-    BanEvent, CycleStats, DesiredBody, DesiredRef, Envelope, HostInfo, Mode, ReportBody, Signed,
-    TriageSummary,
+    ActiveBanInfo, BanEvent, CycleStats, DesiredBody, DesiredRef, Envelope, HostInfo, Mode,
+    ReportBody, Signed, TriageSummary,
 };
 use snsec_common::{AGENT_VERSION, SCHEMA_VERSION};
 
@@ -19,6 +19,8 @@ use crate::state::State;
 use crate::util;
 
 const MAX_FLUSH_PER_CYCLE: usize = 50;
+/// RAM-in-use percentage (excluding reclaimable cache) that raises an alert.
+const MEM_ALERT_PCT: f64 = 90.0;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -72,6 +74,15 @@ pub fn sync(
     over_cap: bool,
     watch_blind: bool,
 ) -> Result<()> {
+    let hub_configured = !cfg.hub.url.is_empty() && !cfg.hub.agent_key.is_empty();
+
+    // Take the hub's orders *before* building the report, so a ban the admin
+    // just ordered is already in force (and visible in `active_bans`) in this
+    // very report instead of one cycle later.
+    if hub_configured && let Err(e) = fetch_and_apply_desired(cfg, state) {
+        eprintln!("hub: desired fetch/apply failed: {e:#}");
+    }
+
     let mut meta = state.meta();
     let seq = meta.next_report_seq;
     meta.next_report_seq += 1;
@@ -91,6 +102,21 @@ pub fn sync(
             severity: "warn".into(),
         });
     }
+    if cycle.mem_total_mb > 0 && cycle.mem_used_pct >= MEM_ALERT_PCT {
+        alerts.push(snsec_common::schema::Alert {
+            kind: "mem_high".into(),
+            message: format!(
+                "RAM {:.0}% in use of {} MB (swap {:.0}%)",
+                cycle.mem_used_pct, cycle.mem_total_mb, cycle.swap_used_pct
+            ),
+            severity: if cycle.mem_used_pct >= 95.0 {
+                "urgent"
+            } else {
+                "warn"
+            }
+            .into(),
+        });
+    }
 
     let triage: Option<TriageSummary> = std::fs::read(state.dir.join("triage-latest.json"))
         .ok()
@@ -107,6 +133,7 @@ pub fn sync(
         findings: Vec::new(),
         applied_desired: meta.applied_desired,
         capabilities: capabilities(),
+        active_bans: active_bans(state),
     };
 
     let body_json = serde_json::to_vec(&body)?;
@@ -116,7 +143,7 @@ pub fn sync(
     // Always keep a readable latest report for the operator.
     let _ = std::fs::write(state.dir.join("last-report.json"), &body_json);
 
-    if cfg.hub.url.is_empty() || cfg.hub.agent_key.is_empty() {
+    if !hub_configured {
         return Ok(()); // standalone
     }
 
@@ -126,10 +153,27 @@ pub fn sync(
     if let Err(e) = flush_reports(cfg, state, &signing_key, meta.epoch) {
         eprintln!("hub: report flush failed (queued for retry): {e:#}");
     }
-    if let Err(e) = fetch_and_apply_desired(cfg, state) {
-        eprintln!("hub: desired fetch/apply failed: {e:#}");
-    }
     Ok(())
+}
+
+/// Every ban still in force, whoever set it. Expired entries are dropped.
+fn active_bans(state: &State) -> Vec<ActiveBanInfo> {
+    let now = util::now_secs();
+    let mut v: Vec<ActiveBanInfo> = state
+        .bans()
+        .into_iter()
+        .filter(|(_, b)| b.expires_ts > now)
+        .map(|(ip, b)| ActiveBanInfo {
+            ip,
+            reason: b.reason,
+            expires_at: b.expires_ts,
+            strike: b.strike,
+            layer: b.layer,
+        })
+        .collect();
+    v.sort_by(|a, b| a.ip.cmp(&b.ip));
+    v.truncate(500);
+    v
 }
 
 fn http_agent() -> ureq::Agent {
@@ -240,9 +284,22 @@ fn apply_desired(cfg: &Config, state: &State, d: &DesiredBody) -> Result<()> {
     let _timer = d.timer_interval_secs.clamp(300, 900);
 
     // Operator bans / unbans (web-port only, like every other ban).
+    let now = util::now_secs();
     let mut adds: Vec<(String, u64)> = Vec::new();
     for b in &d.bans {
         let ttl = b.ttl_secs.min(24 * 3600);
+        let ttl = if b.created_at > 0 {
+            // Apply only what is left of the ban. This body is re-sent on every
+            // unrelated desired change (mode, another ban...); without this an
+            // old ban would be re-armed with a full fresh TTL each time.
+            let remaining = b.created_at + ttl as i64 - now;
+            if remaining <= 0 {
+                continue; // already lapsed
+            }
+            remaining as u64
+        } else {
+            ttl
+        };
         adds.push((normalize_ban_key(&b.ip), ttl));
     }
     let dels: Vec<String> = d.unbans.iter().map(|ip| normalize_ban_key(ip)).collect();
@@ -252,7 +309,6 @@ fn apply_desired(cfg: &Config, state: &State, d: &DesiredBody) -> Result<()> {
         crate::sys::fw::apply_bans(&adds, &dels)?;
         // Record operator bans in state so reports stay consistent.
         let mut active = state.bans();
-        let now = util::now_secs();
         for (key, ttl) in &adds {
             active.insert(
                 key.clone(),

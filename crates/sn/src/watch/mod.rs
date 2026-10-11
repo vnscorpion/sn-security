@@ -184,6 +184,7 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<()> {
     let top_ips = top_ips(&data);
     let watch_blind = data.lines_read == 0 && has_web_traffic(&conns);
     let (cpu_busy, _load1) = quick_cpu_busy();
+    let mem = crate::sys::proc::meminfo().unwrap_or_default();
 
     let cycle = CycleStats {
         started_at: started,
@@ -193,6 +194,9 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<()> {
         requests: data.requests,
         load1: crate::sys::proc::loadavg1(),
         cpu_busy_pct: (cpu_busy * 10.0).round() / 10.0,
+        mem_total_mb: mem.total_mb(),
+        mem_used_pct: (mem.used_pct() * 10.0).round() / 10.0,
+        swap_used_pct: (mem.swap_used_pct() * 10.0).round() / 10.0,
         top_ips,
         baseline_ready,
         watch_blind,

@@ -3,15 +3,16 @@
 //! cannot inject markup. Wording is plain Vietnamese with short explanations of
 //! the few technical terms; routes and form field names are unchanged.
 
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use axum::Form;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use maud::{DOCTYPE, Markup, html};
 use serde::Deserialize;
-use snsec_common::schema::{DesiredBan, Mode};
+use snsec_common::schema::{DesiredBan, DesiredBody, Mode, ReportBody};
 
 use crate::AppState;
 use crate::auth;
@@ -40,6 +41,8 @@ header{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:18px;
 header .brand{font-weight:800;letter-spacing:.2px;margin-right:4px}
 header nav{display:flex;gap:16px;flex-wrap:wrap}
 header .sp{flex:1}
+header form.ipcheck{margin:0}
+header form.ipcheck input{width:190px;padding:6px 12px;border-radius:999px}
 main{max-width:1120px;margin:0 auto;padding:22px 16px 60px}
 h1{font-size:22px;margin:0 0 4px}
 h2{font-size:14px;margin:0 0 12px;color:var(--mut);text-transform:uppercase;letter-spacing:.05em}
@@ -102,6 +105,9 @@ fn shell(title: &str, body: Markup) -> Markup {
                         a href="/log" { "Nhật ký" }
                     }
                     span class="sp" {}
+                    form class="ipcheck" method="get" action="/check-ip" {
+                        input type="text" name="ip" placeholder="Tra cứu IP..." autocomplete="off" aria-label="Tra cứu IP";
+                    }
                     a href="/logout" { "Đăng xuất" }
                 }
                 main { (body) }
@@ -198,7 +204,117 @@ fn alert_kind_vi(k: &str) -> &str {
     match k {
         "ban_cap" => "Chặn quá nhiều trong một lần quét (nghi tấn công diện rộng)",
         "watch_blind" => "Có truy cập web nhưng không đọc được log",
+        "mem_high" => "RAM gần đầy",
         _ => k,
+    }
+}
+
+/// A ban as the hub presents it: merged from what the VPS reports as in force
+/// and what an admin has ordered from the hub.
+struct BanView {
+    key: String,
+    /// The address as stored, used by the "gỡ chặn" form.
+    ip: String,
+    by_admin: bool,
+    reason: String,
+    expires_at: i64,
+    /// `false` while the ban is only ordered from the hub and the VPS has not
+    /// yet confirmed it in a report.
+    applied: bool,
+}
+
+/// Every ban currently in force or on its way to the VPS. `at` is "now".
+fn ban_views(report: Option<&ReportBody>, desired: Option<&DesiredBody>, at: i64) -> Vec<BanView> {
+    let mut out: Vec<BanView> = Vec::new();
+    if let Some(r) = report {
+        for b in r.active_bans.iter().filter(|b| b.expires_at > at) {
+            out.push(BanView {
+                key: key_of(&b.ip),
+                ip: b.ip.clone(),
+                by_admin: b.reason == "hub",
+                reason: b.reason.clone(),
+                expires_at: b.expires_at,
+                applied: true,
+            });
+        }
+        // Agents older than `active_bans` only report the latest cycle's bans.
+        for b in &r.bans {
+            let expires_at = r.cycle.started_at + b.ttl_secs as i64;
+            let key = key_of(&b.ip);
+            if expires_at > at && !out.iter().any(|v| v.key == key) {
+                out.push(BanView {
+                    key,
+                    ip: b.ip.clone(),
+                    by_admin: false,
+                    reason: b.reason.clone(),
+                    expires_at,
+                    applied: true,
+                });
+            }
+        }
+    }
+    if let Some(d) = desired {
+        for b in &d.bans {
+            if b.created_at == 0 {
+                continue; // written before ban times were recorded; age unknown
+            }
+            let expires_at = b.created_at + b.ttl_secs.min(24 * 3600) as i64;
+            let key = key_of(&b.ip);
+            if expires_at > at && !out.iter().any(|v| v.key == key) {
+                out.push(BanView {
+                    key,
+                    ip: b.ip.clone(),
+                    by_admin: true,
+                    reason: b.reason.clone(),
+                    expires_at,
+                    applied: false,
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| a.key.cmp(&b.key));
+    out
+}
+
+/// "còn 12 phút" / "còn 3 giờ" until `ts`.
+fn expires_in(ts: i64) -> String {
+    let d = (ts - now()).max(0);
+    if d < 90 {
+        format!("còn {d} giây")
+    } else if d < 5400 {
+        format!("còn {} phút", d / 60)
+    } else if d < 172_800 {
+        format!("còn {} giờ", d / 3600)
+    } else {
+        format!("còn {} ngày", d / 86_400)
+    }
+}
+
+/// One VPS line on the overview page.
+struct OverviewRow {
+    agent: crate::db::AgentRow,
+    req: u64,
+    bans: usize,
+    alerts: usize,
+    load: f64,
+    /// RAM in use (%), or `None` when the agent has not reported it.
+    mem: Option<f64>,
+}
+
+/// Colour-coded RAM percentage: green below 75%, amber to 90%, red above.
+fn mem_badge(mem: Option<f64>) -> Markup {
+    match mem {
+        None => html! { span class="mut" { "—" } },
+        Some(p) => {
+            let cls = if p >= 90.0 {
+                "b-bad"
+            } else if p >= 75.0 {
+                "b-warn"
+            } else {
+                "b-ok"
+            };
+            html! { span class={"badge " (cls)} { (format!("{p:.0}%")) } }
+        }
     }
 }
 
@@ -325,31 +441,40 @@ pub async fn overview(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Re
     }
     let db = st.db.lock().expect("db");
     let agents = db.list_agents().unwrap_or_default();
-    let rows: Vec<_> = agents
+    let rows: Vec<OverviewRow> = agents
         .iter()
         .map(|a| {
             let rep = db.latest_report(&a.id).ok().flatten();
-            let (req, bans, alerts, load) = rep
-                .as_ref()
-                .map(|r| {
-                    (
-                        r.cycle.requests,
-                        r.bans.len(),
-                        r.alerts.len(),
-                        r.cycle.load1,
-                    )
-                })
-                .unwrap_or((0, 0, 0, 0.0));
-            (a.clone(), req, bans, alerts, load)
+            let desired = db.get_desired(&a.id).ok().flatten();
+            let bans = ban_views(rep.as_ref(), desired.as_ref().map(|(_, _, d)| d), now()).len();
+            match rep {
+                Some(r) => OverviewRow {
+                    agent: a.clone(),
+                    req: r.cycle.requests,
+                    bans,
+                    alerts: r.alerts.len(),
+                    load: r.cycle.load1,
+                    // Reports from agents older than the RAM feature carry 0.
+                    mem: (r.cycle.mem_total_mb > 0).then_some(r.cycle.mem_used_pct),
+                },
+                None => OverviewRow {
+                    agent: a.clone(),
+                    req: 0,
+                    bans,
+                    alerts: 0,
+                    load: 0.0,
+                    mem: None,
+                },
+            }
         })
         .collect();
     drop(db);
 
     let total = rows.len();
-    let online = rows.iter().filter(|(a, ..)| is_online(a.last_seen)).count();
-    let enforcing = rows.iter().filter(|(a, ..)| a.mode == "enforce").count();
-    let banned: usize = rows.iter().map(|(_, _, b, ..)| *b).sum();
-    let alerts: usize = rows.iter().map(|(_, _, _, al, _)| *al).sum();
+    let online = rows.iter().filter(|r| is_online(r.agent.last_seen)).count();
+    let enforcing = rows.iter().filter(|r| r.agent.mode == "enforce").count();
+    let banned: usize = rows.iter().map(|r| r.bans).sum();
+    let alerts: usize = rows.iter().map(|r| r.alerts).sum();
 
     let body = html! {
         h1 { "Tổng quan" }
@@ -359,7 +484,7 @@ pub async fn overview(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Re
             div class="stat" { div class="n" { (total) } div class="l" { "VPS" } }
             div class="stat" { div class="n" style="color:var(--ok)" { (online) } div class="l" { "Đang hoạt động" } }
             div class="stat" { div class="n" { (enforcing) } div class="l" { "Đang chặn tự động" } }
-            div class="stat" { div class="n" { (banned) } div class="l" { "IP chặn (lần quét cuối)" } }
+            div class="stat" { div class="n" { (banned) } div class="l" { "IP đang bị chặn" } }
             div class="stat" { div class="n" style=(if alerts>0 {"color:var(--warn)"} else {""}) { (alerts) } div class="l" { "Cảnh báo" } }
         }
 
@@ -372,22 +497,24 @@ pub async fn overview(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Re
             div class="wrap" {
                 table {
                     thead { tr {
-                        th { "VPS" } th { "Trạng thái" } th { "Chế độ" } th { "Tải CPU" }
+                        th { "VPS" } th { "Trạng thái" } th { "Chế độ" } th { "Tải CPU" } th { "RAM" }
                         th { "Lượt truy cập" } th { "IP chặn" } th { "Cảnh báo" } th { "Bản sn" } th { "Cập nhật" }
                     }}
                     tbody {
                         @if rows.is_empty() {
-                            tr { td colspan="9" { div class="empty" { "Chưa có VPS nào. " a href="/add-vps" { "Thêm VPS đầu tiên →" } } } }
+                            tr { td colspan="10" { div class="empty" { "Chưa có VPS nào. " a href="/add-vps" { "Thêm VPS đầu tiên →" } } } }
                         }
-                        @for (a, req, bans, alerts, load) in &rows {
+                        @for row in &rows {
+                            @let a = &row.agent;
                             tr {
                                 td { a href={"/agent/" (a.id)} { b { (a.name) } } br; span class="mut" style="font-size:12px" { (a.id) } }
                                 td { (status_badge(a.last_seen)) }
                                 td { (mode_badge(&a.mode)) }
-                                td { (format!("{:.2}", load)) }
-                                td { (req) }
-                                td { @if *bans > 0 { span class="badge b-bad" { (bans) } } @else { "0" } }
-                                td { @if *alerts > 0 { span class="badge b-warn" { (alerts) } } @else { "0" } }
+                                td { (format!("{:.2}", row.load)) }
+                                td { (mem_badge(row.mem)) }
+                                td { (row.req) }
+                                td { @if row.bans > 0 { span class="badge b-bad" { (row.bans) } } @else { "0" } }
+                                td { @if row.alerts > 0 { span class="badge b-warn" { (row.alerts) } } @else { "0" } }
                                 td class="mut" { (a.version) }
                                 td class="mut" { (rel_time(a.last_seen)) }
                             }
@@ -422,6 +549,7 @@ pub async fn agent_detail(
         .as_ref()
         .map(|(_, _, b)| b.mode)
         .unwrap_or(Mode::Observe);
+    let bans = ban_views(report.as_ref(), desired.as_ref().map(|(_, _, d)| d), now());
 
     let body = html! {
         p { a href="/" { "← Tổng quan" } }
@@ -470,12 +598,55 @@ pub async fn agent_detail(
             p class="help" { "“Hoàn tác” chỉ chạy nếu VPS bật tuỳ chọn cho phép (" code { "[remote] allow_undo" } ")." }
         }
 
+        div class="card" {
+            h2 { "IP đang bị chặn (" (bans.len()) ")" }
+            div class="wrap" {
+                table {
+                    thead { tr { th { "IP" } th { "Do ai chặn" } th { "Lý do" } th { "Hết hạn" } th { "Trạng thái" } th {} } }
+                    tbody {
+                        @if bans.is_empty() { tr { td colspan="6" { div class="empty" { "Hiện không có IP nào bị chặn." } } } }
+                        @for b in &bans {
+                            tr {
+                                td { code { (b.ip) } }
+                                td { @if b.by_admin { span class="badge b-mut" { "Admin" } } @else { span class="badge b-mut" { "Tự động" } } }
+                                td { (if b.by_admin { "Admin đặt" } else { reason_vi(&b.reason) }) }
+                                td class="mut" { (expires_in(b.expires_at)) }
+                                td {
+                                    @if b.applied { span class="badge b-ok" { "Đang hiệu lực" } }
+                                    @else { span class="badge b-warn" { "Chờ VPS áp dụng" } }
+                                }
+                                td {
+                                    form method="post" action={"/agent/" (agent.id) "/unban"} style="margin:0" {
+                                        input type="hidden" name="ip" value=(b.ip);
+                                        button class="ghost" type="submit" { "Gỡ chặn" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            p class="help" { "“Chờ VPS áp dụng” = lệnh chặn đã gửi, VPS sẽ nhận ở lần quét kế tiếp (tối đa ~15 phút) rồi tự chuyển sang “Đang hiệu lực”." }
+        }
+
         @if let Some(r) = &report {
             div class="stats" {
                 div class="stat" { div class="n" { (r.cycle.requests) } div class="l" { "Lượt truy cập / lần quét" } }
                 div class="stat" { div class="n" { (format!("{:.2}", r.cycle.load1)) } div class="l" { "Tải CPU (load 1 phút)" } }
                 div class="stat" { div class="n" { (format!("{:.0}%", r.cycle.cpu_busy_pct)) } div class="l" { "CPU đang dùng" } }
-                div class="stat" { div class="n" style=(if r.bans.is_empty() {""} else {"color:var(--bad)"}) { (r.bans.len()) } div class="l" { "IP vừa bị chặn" } }
+                @if r.cycle.mem_total_mb > 0 {
+                    div class="stat" {
+                        div class="n" style=(if r.cycle.mem_used_pct >= 90.0 {"color:var(--bad)"} else if r.cycle.mem_used_pct >= 75.0 {"color:var(--warn)"} else {""}) {
+                            (format!("{:.0}%", r.cycle.mem_used_pct))
+                        }
+                        div class="l" { "RAM đang dùng (tổng " (r.cycle.mem_total_mb) " MB)" }
+                    }
+                    div class="stat" {
+                        div class="n" { (format!("{:.0}%", r.cycle.swap_used_pct)) }
+                        div class="l" { "Swap đang dùng" }
+                    }
+                }
+                div class="stat" { div class="n" style=(if bans.is_empty() {""} else {"color:var(--bad)"}) { (bans.len()) } div class="l" { "IP đang bị chặn" } }
             }
 
             @if r.cycle.watch_blind {
@@ -517,26 +688,6 @@ pub async fn agent_detail(
                     }
                 }
                 p class="help" { "“Đăng nhập thử” = số lần POST vào wp-login.php/xmlrpc.php (dấu hiệu dò mật khẩu)." }
-            }
-
-            @if !r.bans.is_empty() {
-                div class="card" {
-                    h2 { "IP vừa bị chặn" }
-                    div class="wrap" {
-                        table {
-                            thead { tr { th { "IP" } th { "Lý do" } th { "Thời hạn" } th { "Số lần vi phạm" } th { "Tầng chặn" } } }
-                            tbody { @for b in &r.bans {
-                                tr {
-                                    td { code { (b.ip) } }
-                                    td { (reason_vi(&b.reason)) }
-                                    td { (b.ttl_secs / 60) " phút" }
-                                    td { (b.strike) }
-                                    td { span class="badge b-mut" { @if b.layer == "l7" { "Web (L7)" } @else { "Mạng (L3)" } } }
-                                }
-                            }}
-                        }
-                    }
-                }
             }
 
             @if let Some(t) = &r.triage {
@@ -603,13 +754,21 @@ pub async fn ban_post(
     if ip.is_empty() {
         return Redirect::to(&format!("/agent/{id}")).into_response();
     }
+    let ts = now();
+    let key = key_of(&ip);
     let db = st.db.lock().expect("db");
-    let _ = db.update_desired(&id, now(), "admin", "ban", &ip, |d| {
-        d.unbans.retain(|x| x != &ip);
+    let _ = db.update_desired(&id, ts, "admin", "ban", &ip, |d| {
+        d.unbans.retain(|x| key_of(x) != key);
+        // Forget lapsed bans (the agent's firewall expires its own entries) and
+        // any older order for this same address, then record the new one.
+        d.bans.retain(|b| {
+            b.created_at > 0 && b.created_at + b.ttl_secs as i64 > ts && key_of(&b.ip) != key
+        });
         d.bans.push(DesiredBan {
             ip: ip.clone(),
             ttl_secs: ttl,
             reason: "admin".into(),
+            created_at: ts,
         });
     });
     drop(db);
@@ -629,10 +788,11 @@ pub async fn unban_post(
     if ip.is_empty() {
         return Redirect::to(&format!("/agent/{id}")).into_response();
     }
+    let key = key_of(&ip);
     let db = st.db.lock().expect("db");
     let _ = db.update_desired(&id, now(), "admin", "unban", &ip, |d| {
-        d.bans.retain(|b| b.ip != ip);
-        if !d.unbans.contains(&ip) {
+        d.bans.retain(|b| key_of(&b.ip) != key);
+        if !d.unbans.iter().any(|u| key_of(u) == key) {
             d.unbans.push(ip.clone());
         }
     });
@@ -775,6 +935,264 @@ pub async fn add_vps_post(
     .into_response()
 }
 
+// ---- ip check --------------------------------------------------------------
+
+/// Canonical key an IP is tracked under: plain IPv4, or the /64 for IPv6.
+/// Anything that is not an address is compared verbatim.
+fn key_of(s: &str) -> String {
+    match s.trim().parse::<IpAddr>() {
+        Ok(ip) => snsec_common::net::ban_key(ip),
+        Err(_) => s.trim().to_string(),
+    }
+}
+
+/// A short description of special-purpose addresses that should rarely be
+/// banned, or `None` for an ordinary public address.
+fn special_ip_note(ip: IpAddr) -> Option<&'static str> {
+    match snsec_common::net::normalize(ip) {
+        IpAddr::V4(v4) => {
+            if v4.is_loopback() {
+                Some("IP nội bộ của chính máy (loopback)")
+            } else if v4.is_private() || v4.is_link_local() {
+                Some("IP mạng nội bộ — thường không phải kẻ tấn công từ internet")
+            } else if v4.is_unspecified() || v4.is_broadcast() || v4.is_multicast() {
+                Some("Địa chỉ đặc biệt, không phải IP của một máy cụ thể")
+            } else {
+                None
+            }
+        }
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() {
+                Some("IP nội bộ của chính máy (loopback)")
+            } else if v6.is_unique_local() || v6.is_unicast_link_local() {
+                Some("IP mạng nội bộ — thường không phải kẻ tấn công từ internet")
+            } else if v6.is_unspecified() || v6.is_multicast() {
+                Some("Địa chỉ đặc biệt, không phải IP của một máy cụ thể")
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// What the hub knows about one IP on one VPS.
+struct IpOnAgent {
+    id: String,
+    name: String,
+    last_seen: i64,
+    /// `(requests, 4xx, sensitive posts)` if the IP is in the latest top list.
+    traffic: Option<(u64, u64, u64)>,
+    /// The ban on this address, in force or on its way to the VPS.
+    ban: Option<BanView>,
+    would_ban: Option<String>,
+    hub_unban: bool,
+}
+
+#[derive(Deserialize)]
+pub struct CheckIpQuery {
+    #[serde(default)]
+    ip: String,
+}
+
+pub async fn check_ip(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<CheckIpQuery>,
+) -> Response {
+    if let Some(r) = guard(&st, &headers) {
+        return r;
+    }
+    let input = q.ip.trim().to_string();
+
+    let search_form = html! {
+        form method="get" action="/check-ip" style="display:flex;gap:10px;flex-wrap:wrap" {
+            input type="text" name="ip" value=(input) placeholder="vd: 203.0.113.7 hoặc 2001:db8::1" style="flex:1;min-width:240px" autofocus;
+            button type="submit" { "Tra cứu" }
+        }
+    };
+
+    if input.is_empty() {
+        return Html(
+            shell(
+                "Tra cứu IP",
+                html! {
+                    h1 { "Tra cứu IP" }
+                    p class="sub" { "Nhập một địa chỉ IP để xem nó có đang bị chặn hoặc truy cập nhiều ở VPS nào." }
+                    div class="card" { (search_form) }
+                },
+            )
+            .into_string(),
+        )
+        .into_response();
+    }
+
+    let Ok(ip) = input.parse::<IpAddr>() else {
+        return Html(
+            shell(
+                "Tra cứu IP",
+                html! {
+                    h1 { "Tra cứu IP" }
+                    div class="card" { (search_form) }
+                    div class="note" style="border-left-color:var(--bad)" {
+                        "“" (input) "” không phải địa chỉ IP hợp lệ. Hãy nhập IPv4 (vd 203.0.113.7) hoặc IPv6 (vd 2001:db8::1)."
+                    }
+                },
+            )
+            .into_string(),
+        )
+        .into_response();
+    };
+
+    let key = snsec_common::net::ban_key(ip);
+
+    let db = st.db.lock().expect("db");
+    let agents = db.list_agents().unwrap_or_default();
+    let mut hits: Vec<IpOnAgent> = Vec::new();
+    for a in &agents {
+        let rep = db.latest_report(&a.id).ok().flatten();
+        let desired = db.get_desired(&a.id).ok().flatten();
+        let mut hit = IpOnAgent {
+            id: a.id.clone(),
+            name: a.name.clone(),
+            last_seen: a.last_seen,
+            traffic: None,
+            ban: None,
+            would_ban: None,
+            hub_unban: false,
+        };
+        if let Some(r) = &rep {
+            hit.traffic = r
+                .cycle
+                .top_ips
+                .iter()
+                .find(|t| key_of(&t.ip) == key)
+                .map(|t| (t.requests, t.err4xx, t.sensitive_posts));
+            hit.would_ban = r
+                .would_ban
+                .iter()
+                .find(|b| key_of(&b.ip) == key)
+                .map(|b| b.reason.clone());
+        }
+        hit.ban = ban_views(rep.as_ref(), desired.as_ref().map(|(_, _, d)| d), now())
+            .into_iter()
+            .find(|b| b.key == key);
+        if let Some((_, _, d)) = &desired {
+            hit.hub_unban = d.unbans.iter().any(|u| key_of(u) == key);
+        }
+        hits.push(hit);
+    }
+    let history: Vec<_> = db
+        .recent_decisions(500)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, _, _, detail, _)| key_of(detail) == key)
+        .take(20)
+        .collect();
+    drop(db);
+
+    let seen_anywhere = hits
+        .iter()
+        .any(|h| h.traffic.is_some() || h.ban.is_some() || h.would_ban.is_some());
+
+    let body = html! {
+        h1 { "Tra cứu IP" }
+        div class="card" { (search_form) }
+
+        h2 { "Kết quả cho " code { (input) } }
+        @if key != input {
+            p class="help" { "Hub theo dõi IPv6 theo cả dải " code { (key) } " (một máy thường dùng cả dải /64)." }
+        }
+        @if let Some(note) = special_ip_note(ip) {
+            div class="note" style="border-left-color:var(--warn)" { (note) }
+        }
+
+        @if !seen_anywhere && history.is_empty() {
+            div class="note" {
+                "Chưa thấy IP này trong báo cáo gần nhất của VPS nào, và chưa có thao tác nào của admin với nó. "
+                "Hub chỉ nhìn thấy 20 IP truy cập nhiều nhất trong lần quét gần nhất của mỗi VPS, nên “không thấy” không có nghĩa IP chưa từng truy cập."
+            }
+        }
+
+        div class="card" {
+            h2 { "Theo từng VPS" }
+            div class="wrap" {
+                table {
+                    thead { tr {
+                        th { "VPS" } th { "Truy cập (lần quét cuối)" } th { "Tình trạng chặn" } th {}
+                    }}
+                    tbody {
+                        @if hits.is_empty() {
+                            tr { td colspan="4" { div class="empty" { "Chưa có VPS nào." } } }
+                        }
+                        @for h in &hits {
+                            tr {
+                                td {
+                                    a href={"/agent/" (h.id)} { b { (h.name) } } br;
+                                    span class="mut" style="font-size:12px" { "cập nhật " (rel_time(h.last_seen)) }
+                                }
+                                td {
+                                    @if let Some((req, e4, posts)) = h.traffic {
+                                        (req) " lượt · " (e4) " lỗi 4xx · " (posts) " đăng nhập thử"
+                                    } @else { span class="mut" { "không thấy" } }
+                                }
+                                td {
+                                    @if let Some(b) = &h.ban {
+                                        @if b.applied {
+                                            span class="badge b-bad" { "Đang bị chặn" }
+                                        } @else {
+                                            span class="badge b-warn" { "Đã đặt chặn, chờ VPS áp dụng" }
+                                        }
+                                        " " span class="mut" {
+                                            (if b.by_admin { "Admin đặt" } else { reason_vi(&b.reason) }) " · " (expires_in(b.expires_at))
+                                        }
+                                    }
+                                    @if let Some(reason) = &h.would_ban {
+                                        span class="badge b-warn" { "Sẽ bị chặn (chưa bật)" } " " span class="mut" { (reason_vi(reason)) }
+                                    }
+                                    @if h.hub_unban && h.ban.is_none() {
+                                        span class="badge b-ok" { "Admin đã gỡ chặn" }
+                                    }
+                                    @if h.ban.is_none() && h.would_ban.is_none() && !h.hub_unban {
+                                        span class="mut" { "—" }
+                                    }
+                                }
+                                td style="white-space:nowrap" {
+                                    form method="post" action={"/agent/" (h.id) "/ban"} style="display:inline;margin:0" {
+                                        input type="hidden" name="ip" value=(input);
+                                        input type="hidden" name="ttl" value="3600";
+                                        button class="bad" type="submit" { "Chặn" }
+                                    }
+                                    " "
+                                    form method="post" action={"/agent/" (h.id) "/unban"} style="display:inline;margin:0" {
+                                        input type="hidden" name="ip" value=(input);
+                                        button class="ghost" type="submit" { "Gỡ chặn" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            p class="help" { "“Chặn” có hiệu lực 1 giờ, áp dụng ở lần quét kế tiếp của VPS (tối đa ~15 phút)." }
+        }
+
+        @if !history.is_empty() {
+            div class="card" {
+                h2 { "Lịch sử thao tác của admin với IP này" }
+                div class="wrap" {
+                    table {
+                        thead { tr { th { "Thời gian" } th { "VPS" } th { "Người" } th { "Thao tác" } } }
+                        tbody { @for (agent, who, action, _, ts) in &history {
+                            tr { td class="mut" { (rel_time(*ts)) } td { (agent) } td { (who) } td { (action_vi(action)) } }
+                        }}
+                    }
+                }
+            }
+        }
+    };
+    Html(shell("Tra cứu IP", body).into_string()).into_response()
+}
+
 // ---- log -------------------------------------------------------------------
 
 pub async fn log_page(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -802,4 +1220,136 @@ pub async fn log_page(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Re
         }
     };
     Html(shell("Nhật ký", body).into_string()).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_of_normalizes_ipv4_and_ipv6() {
+        assert_eq!(key_of(" 203.0.113.7 "), "203.0.113.7");
+        // IPv6 is tracked per /64.
+        assert_eq!(key_of("2001:db8:1:2:3:4:5:6"), "2001:db8:1:2::/64");
+        // An already-aggregated key is kept as written.
+        assert_eq!(key_of("2001:db8:1:2::/64"), "2001:db8:1:2::/64");
+        // IPv4-mapped IPv6 collapses to the IPv4 address.
+        assert_eq!(key_of("::ffff:203.0.113.7"), "203.0.113.7");
+        // Non-addresses are compared verbatim (e.g. decision details).
+        assert_eq!(key_of("hunt 1 ngày"), "hunt 1 ngày");
+    }
+
+    #[test]
+    fn special_addresses_are_flagged() {
+        let note = |s: &str| special_ip_note(s.parse().unwrap());
+        assert!(note("127.0.0.1").is_some());
+        assert!(note("10.1.2.3").is_some());
+        assert!(note("192.168.0.9").is_some());
+        assert!(note("::1").is_some());
+        assert!(note("fd00::1").is_some());
+        assert!(note("203.0.113.7").is_none());
+        assert!(note("2001:db8::1").is_none());
+    }
+
+    fn report_with(active: Vec<snsec_common::schema::ActiveBanInfo>) -> ReportBody {
+        use snsec_common::schema::{CycleStats, HostInfo};
+        ReportBody {
+            agent_version: "t".into(),
+            host: HostInfo::default(),
+            cycle: CycleStats::default(),
+            bans: vec![],
+            would_ban: vec![],
+            alerts: vec![],
+            triage: None,
+            findings: vec![],
+            applied_desired: Default::default(),
+            capabilities: vec![],
+            active_bans: active,
+        }
+    }
+
+    fn admin_ban(ip: &str, created_at: i64, ttl: u64) -> DesiredBan {
+        DesiredBan {
+            ip: ip.into(),
+            ttl_secs: ttl,
+            reason: "admin".into(),
+            created_at,
+        }
+    }
+
+    #[test]
+    fn admin_ban_shows_up_before_the_vps_confirms_it() {
+        // The reported bug: a ban ordered from the hub counted as 0 because
+        // only the agent's own automatic bans were shown.
+        let desired = DesiredBody {
+            bans: vec![admin_ban("203.0.113.7", 1_000, 3600)],
+            ..Default::default()
+        };
+        let v = ban_views(Some(&report_with(vec![])), Some(&desired), 1_500);
+        assert_eq!(v.len(), 1);
+        assert!(!v[0].applied, "not yet confirmed by the VPS");
+        assert!(v[0].by_admin);
+        assert_eq!(v[0].expires_at, 4_600);
+    }
+
+    #[test]
+    fn confirmed_ban_is_not_counted_twice() {
+        let desired = DesiredBody {
+            bans: vec![admin_ban("203.0.113.7", 1_000, 3600)],
+            ..Default::default()
+        };
+        let active = vec![snsec_common::schema::ActiveBanInfo {
+            ip: "203.0.113.7".into(),
+            reason: "hub".into(),
+            expires_at: 4_600,
+            strike: 0,
+            layer: "l3".into(),
+        }];
+        let v = ban_views(Some(&report_with(active)), Some(&desired), 1_500);
+        assert_eq!(v.len(), 1);
+        assert!(v[0].applied);
+        assert!(v[0].by_admin, "reason \"hub\" means ordered from the hub");
+    }
+
+    #[test]
+    fn lapsed_and_legacy_bans_are_ignored() {
+        let desired = DesiredBody {
+            bans: vec![
+                admin_ban("198.51.100.1", 1_000, 60), // lapsed by t=2000
+                admin_ban("198.51.100.2", 0, 3600),   // no timestamp: age unknown
+            ],
+            ..Default::default()
+        };
+        assert!(ban_views(None, Some(&desired), 2_000).is_empty());
+    }
+
+    #[test]
+    fn ipv6_bans_match_on_the_slash_64() {
+        let desired = DesiredBody {
+            bans: vec![admin_ban("2001:db8:1:2:3:4:5:6", 1_000, 3600)],
+            ..Default::default()
+        };
+        let active = vec![snsec_common::schema::ActiveBanInfo {
+            ip: "2001:db8:1:2::/64".into(),
+            reason: "probe".into(),
+            expires_at: 9_000,
+            strike: 1,
+            layer: "l3".into(),
+        }];
+        // The agent reports the /64; the admin typed a single address. Same ban.
+        let v = ban_views(Some(&report_with(active)), Some(&desired), 1_500);
+        assert_eq!(v.len(), 1);
+        assert!(v[0].applied);
+        assert!(!v[0].by_admin);
+    }
+
+    #[test]
+    fn mem_badge_thresholds() {
+        let cls = |p| mem_badge(Some(p)).into_string();
+        assert!(cls(10.0).contains("b-ok"));
+        assert!(cls(75.0).contains("b-warn"));
+        assert!(cls(89.9).contains("b-warn"));
+        assert!(cls(90.0).contains("b-bad"));
+        assert!(mem_badge(None).into_string().contains("—"));
+    }
 }

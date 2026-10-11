@@ -13,6 +13,7 @@ HUB=""
 NAME=""
 TOKEN=""
 ARCH=""
+UPGRADE=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -20,14 +21,17 @@ while [ $# -gt 0 ]; do
     --name) NAME="$2"; shift 2;;
     --token) TOKEN="$2"; shift 2;;
     --arch) ARCH="$2"; shift 2;;
+    --upgrade) UPGRADE=1; shift;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done
 
 [ "$(id -u)" -eq 0 ] || { echo "run as root (sudo)"; exit 1; }
 [ -n "$HUB" ] || { echo "--hub is required"; exit 1; }
-[ -n "$NAME" ] || { echo "--name is required"; exit 1; }
-[ -n "$TOKEN" ] || { echo "--token is required"; exit 1; }
+if [ "$UPGRADE" -ne 1 ]; then
+  [ -n "$NAME" ] || { echo "--name is required"; exit 1; }
+  [ -n "$TOKEN" ] || { echo "--token is required"; exit 1; }
+fi
 HUB="${HUB%/}"
 
 if [ -z "$ARCH" ]; then
@@ -40,6 +44,32 @@ if [ -z "$ARCH" ]; then
 fi
 
 echo ">> SN Secure agent (arch=$ARCH, hub=$HUB)"
+
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+# Download the agent binary from the hub, verify its sha256, install it.
+install_binary() {
+  echo ">> downloading agent binary"
+  curl -fsSL "$HUB/sn/SHA256SUMS" -o "$TMP/SHA256SUMS"
+  curl -fsSL "$HUB/sn/sn-$ARCH" -o "$TMP/sn"
+  HASH="$(awk -v f="sn-$ARCH" '{n=$2; sub(/^\*/,"",n); if(n==f) print $1}' "$TMP/SHA256SUMS")"
+  [ -n "$HASH" ] || { echo "no checksum for sn-$ARCH"; exit 1; }
+  ( cd "$TMP" && echo "$HASH  sn" | sha256sum -c - >/dev/null ) \
+    || { echo "checksum verification FAILED"; exit 1; }
+  # Keep the previous binary so a bad upgrade can be rolled back.
+  [ -x /usr/local/bin/sn ] && cp -f /usr/local/bin/sn /usr/local/bin/sn.bak
+  install -m 0755 "$TMP/sn" /usr/local/bin/sn
+  echo ">> installed $(/usr/local/bin/sn --version)"
+}
+
+# --upgrade: replace the binary only. Config, enrollment and timers are untouched;
+# the timers start the new binary on their next run, so no restart is needed.
+if [ "$UPGRADE" -eq 1 ]; then
+  install_binary
+  echo ">> upgraded. Rollback: cp /usr/local/bin/sn.bak /usr/local/bin/sn"
+  exit 0
+fi
 
 # nftables is required for enforce; warn (don't fail) if missing.
 if ! command -v nft >/dev/null 2>&1; then
@@ -59,18 +89,7 @@ case "$cg" in
   *) echo "!! could not detect cgroup layout; contain may be limited";;
 esac
 
-TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
-
-echo ">> downloading agent binary"
-curl -fsSL "$HUB/sn/SHA256SUMS" -o "$TMP/SHA256SUMS"
-curl -fsSL "$HUB/sn/sn-$ARCH" -o "$TMP/sn"
-HASH="$(awk -v f="sn-$ARCH" '{n=$2; sub(/^\*/,"",n); if(n==f) print $1}' "$TMP/SHA256SUMS")"
-[ -n "$HASH" ] || { echo "no checksum for sn-$ARCH"; exit 1; }
-( cd "$TMP" && echo "$HASH  sn" | sha256sum -c - >/dev/null ) \
-  || { echo "checksum verification FAILED"; exit 1; }
-install -m 0755 "$TMP/sn" /usr/local/bin/sn
-echo ">> installed $(/usr/local/bin/sn --version)"
+install_binary
 
 # --- detect web server + logs ------------------------------------------------
 mkdir -p /etc/sn
