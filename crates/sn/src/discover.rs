@@ -54,9 +54,10 @@ const APACHE: &[&str] = &[
     "/home/*/logs/*access*log",      // other panels
 ];
 const LITESPEED: &[&str] = &[
-    "/usr/local/lsws/logs/*access*.log",
-    "/usr/local/apache/domlogs/*", // cPanel + LiteSpeed
-    "/home/*/logs/*access*log",    // CyberPanel
+    "/var/log/openlitespeed/*access*.log", // OPanel: <domain>.access.log per website
+    "/usr/local/lsws/logs/*access*.log",   // server-level / default vhost
+    "/usr/local/apache/domlogs/*",         // cPanel + LiteSpeed
+    "/home/*/logs/*access*log",            // CyberPanel
 ];
 
 /// The patterns to try for a given server. When the server is unknown, try
@@ -235,6 +236,55 @@ mod tests {
                 .iter()
                 .any(|t| t.ends_with("/var/log/nginx/domains/*.log"))
         );
+    }
+
+    #[test]
+    fn opanel_openlitespeed_logs_are_found_and_only_access_logs_are_read() {
+        // OPanel on OpenLiteSpeed: one <domain>.access.log per website, next to
+        // its error log, the rolled copies and the server-wide stderr.log. The
+        // per-site PHP error log lives elsewhere (/var/log/opanel-php).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        touch(dir.path(), "var/log/openlitespeed/example.com.access.log");
+        touch(
+            dir.path(),
+            "var/log/openlitespeed/shop.example.net.access.log",
+        );
+        touch(dir.path(), "var/log/openlitespeed/example.com.error.log");
+        touch(
+            dir.path(),
+            "var/log/openlitespeed/example.com.access.log.2026_10_11",
+        );
+        touch(dir.path(), "usr/local/lsws/logs/stderr.log");
+        touch(dir.path(), "var/log/opanel-php/example.com/php_error.log");
+
+        let d = discover(Listener::LiteSpeed, root);
+        assert_eq!(
+            globs(&d),
+            [format!("{root}/var/log/openlitespeed/*access*.log")]
+        );
+        // Exactly the two access logs: not the error log, the rolled copy or stderr.
+        let files = crate::watch::expand_glob(&d.found[0].glob);
+        assert_eq!(files.len(), 2, "{files:?}");
+        assert!(
+            files
+                .iter()
+                .all(|f| f.to_string_lossy().ends_with(".access.log"))
+        );
+        // Still found when the server could not be identified.
+        assert!(!discover(Listener::Unknown, root).found.is_empty());
+    }
+
+    #[test]
+    fn opanel_on_nginx_is_found_by_the_generic_nginx_pattern() {
+        // OPanel's nginx mode writes /var/log/nginx/<domain>.access.log.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        touch(dir.path(), "var/log/nginx/example.com.access.log");
+        touch(dir.path(), "var/log/nginx/example.com.error.log");
+        let d = discover(Listener::Nginx, root);
+        assert_eq!(d.found.len(), 1);
+        assert_eq!(crate::watch::expand_glob(&d.found[0].glob).len(), 1);
     }
 
     #[test]

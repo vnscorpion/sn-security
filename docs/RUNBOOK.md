@@ -63,7 +63,7 @@ Agent **tự tìm log mỗi chu kỳ**, không cần cấu hình theo từng VPS
 | --- | --- |
 | nginx | `/var/log/nginx/domains/*.log` (DirectAdmin, Hestia), `/var/log/nginx/*access*.log`, `/www/wwwlogs/*.log` (aaPanel) |
 | Apache | `/var/log/httpd/domains/*.log` (DirectAdmin), `/var/log/httpd/*access_log`, `/var/log/apache2/*access*.log`, `/usr/local/apache/domlogs/*` (cPanel), `/home/*/logs/*access*log` |
-| LiteSpeed | `/usr/local/lsws/logs/*access*.log`, `/usr/local/apache/domlogs/*`, `/home/*/logs/*access*log` |
+| LiteSpeed / OpenLiteSpeed | `/var/log/openlitespeed/*access*.log` (**OPanel**), `/usr/local/lsws/logs/*access*.log`, `/usr/local/apache/domlogs/*` (cPanel), `/home/*/logs/*access*log` (CyberPanel) |
 
 - Chỉ đọc log của server **ngoài cùng**. Khi nginx đứng trước Apache (DirectAdmin `nginx_apache`), hai bên đều ghi mỗi request, đọc cả hai sẽ đếm đôi mỗi lượt truy cập.
 - Chuyển web server sau khi đã cài agent (ví dụ Apache → nginx bằng custombuild) cũng tự đúng, không phải sửa gì.
@@ -80,7 +80,7 @@ sources_mode = "manual"
 glob   = "/duong/dan/rieng/*.log"
 format = "combined"
 ```
-OpenLiteSpeed chạy trong panel (CyberPanel...) mới chỉ được dò theo `/home/*/logs/*access*log`.
+**OPanel** (OpenLiteSpeed, Ubuntu 24.04) ghi mỗi website một file `/var/log/openlitespeed/<domain>.access.log` (định dạng `combined`, xoay vòng ở 100 MB); nếu dùng nginx thì `/var/log/nginx/<domain>.access.log`. File `*.error.log` và log lỗi PHP (`/var/log/opanel-php/...`) bị bỏ qua. Website đứng sau Cloudflare proxy sẽ thấy IP của Cloudflare trong log: các IP đó nằm trong `trusted_proxies` nên không bị đếm hay chặn nhầm, nhưng agent cũng không thấy IP khách thật.
 
 ## Kill switch (ban nhầm hàng loạt / nghi hub bị chiếm)
 

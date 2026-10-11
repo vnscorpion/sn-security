@@ -48,7 +48,7 @@ VPS **chủ động gọi lên hub** mỗi chu kỳ (5–15 phút): gửi báo c
 ## Yêu cầu
 
 - **Hub (master):** Ubuntu 24.04 / Debian 12 (hay bản mới hơn) có systemd. Mặc định bind `127.0.0.1` — đặt sau VPN hoặc reverse proxy TLS.
-- **Agent (VPS):** Linux với cgroup v2 hoặc v1 và `nftables` (installer tự cài nếu thiếu). Đã nhắm Ubuntu/Debian và AlmaLinux/Rocky; nginx / Apache / LiteSpeed; panel DirectAdmin, cPanel, aaPanel. **Đồng hồ VPS phải đúng** (HTTPS từ chối chứng chỉ nếu giờ lệch, xem [RUNBOOK](docs/RUNBOOK.md)).
+- **Agent (VPS):** Linux với cgroup v2 hoặc v1 và `nftables` (installer tự cài nếu thiếu). Đã nhắm Ubuntu/Debian và AlmaLinux/Rocky; nginx / Apache / LiteSpeed (OpenLiteSpeed); panel DirectAdmin, cPanel, aaPanel, OPanel. **Đồng hồ VPS phải đúng** (HTTPS từ chối chứng chỉ nếu giờ lệch, xem [RUNBOOK](docs/RUNBOOK.md)).
 
 ## Quy trình làm việc
 
