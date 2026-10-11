@@ -255,7 +255,6 @@ pub async fn login_page() -> Html<String> {
                 }
                 p { button type="submit" { "Đăng nhập" } }
             }
-            p class="help" { "Chưa có mật khẩu? Trên máy chủ chạy: " code { "snhub set-admin-password --password '...'" } }
         },
     ))
 }
