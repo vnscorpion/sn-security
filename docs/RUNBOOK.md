@@ -24,6 +24,19 @@
 3. Khi `would_ban` sạch: trên hub đổi **mode → enforce**. Áp dụng ở chu kỳ kế (≤ 15 phút).
 4. Chỉ bật `auto_contain=true` sau khi đã tin tưởng, và không bao giờ trên máy đang thử nghiệm.
 
+## Cài agent báo `SSL certificate problem: certificate is not yet valid`
+
+Nguyên nhân là **đồng hồ của VPS bị chậm**, không phải lỗi hub: chứng chỉ Let's Encrypt chỉ có hiệu lực từ lúc được cấp, nên một VPS nghĩ giờ còn sớm hơn đó sẽ từ chối nó (hay gặp khi chứng chỉ vừa được cấp/gia hạn).
+
+```sh
+date -u && timedatectl                 # so với giờ UTC thật
+sudo dnf install -y chrony || sudo yum install -y chrony   # AlmaLinux/Rocky/CentOS
+sudo systemctl enable --now chronyd && sudo chronyc makestep
+# Debian/Ubuntu:  sudo timedatectl set-ntp true
+# Nếu NTP bị chặn: sudo date -u -s "YYYY-MM-DD HH:MM:SS"   (giờ UTC thật)
+```
+Sau đó tạo **token mới** trên hub (token dùng một lần, hết hạn sau 15 phút) rồi cài lại. Không dùng `curl -k`: nó tắt kiểm tra chứng chỉ trong khi script cài một binary chạy bằng root.
+
 ## Kill switch (ban nhầm hàng loạt / nghi hub bị chiếm)
 
 - Trên VPS: `sn disable` — gỡ table `inet sn`, thả jail ngay. (Hoặc đổi mode→observe từ hub, nhưng đó là chu kỳ sau; `sn disable` là tức thì, tại chỗ.)
