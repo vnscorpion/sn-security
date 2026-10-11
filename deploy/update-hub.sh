@@ -63,10 +63,17 @@ echo ">> restarting snhub"
 systemctl restart snhub
 sleep 1
 if systemctl is-active --quiet snhub; then
+  # The address VPSes use to reach this hub, from the hub's own config.
+  HUB_URL="$(sed -n 's/^public_url *= *"\(.*\)"/\1/p' /etc/snhub/snhub.toml 2>/dev/null | head -n1)"
+  HUB_URL="${HUB_URL%/}"
+  [ -n "$HUB_URL" ] || HUB_URL="https://YOUR-HUB-ADDRESS"
   echo ">> OK: $OLD -> $(/usr/local/bin/snhub --version)"
   echo "   Rollback: cp /usr/local/bin/snhub.bak /usr/local/bin/snhub && systemctl restart snhub"
-  echo "   Now upgrade each VPS agent:"
-  echo "   curl -fsSL <HUB_URL>/install.sh | sudo sh -s -- --hub <HUB_URL> --upgrade"
+  echo
+  echo "   The hub is updated. Next, upgrade the agent on EACH VPS (not on this master)."
+  echo "   Run this on every VPS, as root:"
+  echo
+  echo "   curl -fsSL $HUB_URL/install.sh | sudo sh -s -- --hub $HUB_URL --upgrade"
 else
   echo "!! snhub failed to start, rolling back"
   cp -f /usr/local/bin/snhub.bak /usr/local/bin/snhub
