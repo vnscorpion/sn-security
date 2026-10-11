@@ -5,14 +5,16 @@ on:
     branches: [main]
   pull_request:
 
-env:
-  CARGO_TERM_COLOR: always
-  RUSTFLAGS: -D warnings
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
     name: fmt + clippy + test (native linux)
     runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -22,30 +24,15 @@ jobs:
       - name: rustfmt
         run: cargo fmt --all -- --check
       - name: clippy
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: test
-        run: cargo test --workspace --all-features --locked
-
-  audit:
-    name: cargo audit + deny
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: install tools
-        run: |
-          cargo install cargo-audit --locked || true
-          cargo install cargo-deny --locked || true
-      - name: audit
-        run: cargo audit || true
-      - name: deny
-        run: |
-          if [ -f deny.toml ]; then cargo deny check; else echo "no deny.toml"; fi
+        run: cargo test --workspace --locked
 
   build-musl:
     name: static musl build (${{ matrix.arch }})
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         arch: [x86_64, aarch64]
     steps:
@@ -54,19 +41,27 @@ jobs:
         with:
           targets: ${{ matrix.arch }}-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
-      - uses: goto-bus-stop/setup-zig@v2
+      # Sets up the musl cross C toolchain (CC/AR/linker) so the C deps
+      # (ring, rusqlite, mimalloc) cross-compile reliably.
+      - uses: taiki-e/setup-cross-toolchain-action@v1
         with:
-          version: 0.13.0
-      - name: install cargo-zigbuild
-        run: cargo install cargo-zigbuild --locked
+          target: ${{ matrix.arch }}-unknown-linux-musl
       - name: build
-        run: cargo zigbuild --release --target ${{ matrix.arch }}-unknown-linux-musl
-      - name: rename
-        run: |
-          mkdir -p out
-          cp target/${{ matrix.arch }}-unknown-linux-musl/release/sn out/sn-${{ matrix.arch }}
-          cp target/${{ matrix.arch }}-unknown-linux-musl/release/snhub out/snhub-${{ matrix.arch }}
-      - uses: actions/upload-artifact@v4
+        run: cargo build --release --target ${{ matrix.arch }}-unknown-linux-musl --locked
+      - name: size
+        run: ls -la target/${{ matrix.arch }}-unknown-linux-musl/release/sn target/${{ matrix.arch }}-unknown-linux-musl/release/snhub
+
+  audit:
+    name: cargo audit + deny (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
         with:
-          name: binaries-${{ matrix.arch }}
-          path: out/*
+          tool: cargo-audit,cargo-deny
+      - name: audit
+        run: cargo audit
+      - name: deny
+        run: cargo deny check

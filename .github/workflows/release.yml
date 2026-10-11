@@ -8,37 +8,54 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  build:
+    name: build ${{ matrix.arch }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl
-      - uses: Swatinem/rust-cache@v2
-      - uses: goto-bus-stop/setup-zig@v2
+          targets: ${{ matrix.arch }}-unknown-linux-musl
+      - uses: taiki-e/setup-cross-toolchain-action@v1
         with:
-          version: 0.13.0
-      - name: install cargo-zigbuild
-        run: cargo install cargo-zigbuild --locked
-
-      - name: build both arches
+          target: ${{ matrix.arch }}-unknown-linux-musl
+      - name: build
+        run: cargo build --release --target ${{ matrix.arch }}-unknown-linux-musl --locked
+      - name: stage
         run: |
-          cargo zigbuild --release --target x86_64-unknown-linux-musl
-          cargo zigbuild --release --target aarch64-unknown-linux-musl
+          mkdir -p out
+          cp target/${{ matrix.arch }}-unknown-linux-musl/release/sn    out/sn-${{ matrix.arch }}
+          cp target/${{ matrix.arch }}-unknown-linux-musl/release/snhub out/snhub-${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.arch }}
+          path: out/*
 
-      - name: stage artifacts
+  release:
+    name: package + publish
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: assemble dist
         run: |
           mkdir -p dist
-          cp target/x86_64-unknown-linux-musl/release/sn     dist/sn-x86_64
-          cp target/x86_64-unknown-linux-musl/release/snhub  dist/snhub-x86_64
-          cp target/aarch64-unknown-linux-musl/release/sn    dist/sn-aarch64
-          cp target/aarch64-unknown-linux-musl/release/snhub dist/snhub-aarch64
+          cp artifacts/bin-x86_64/sn-x86_64       dist/sn-x86_64
+          cp artifacts/bin-x86_64/snhub-x86_64    dist/snhub-x86_64
+          cp artifacts/bin-aarch64/sn-aarch64     dist/sn-aarch64
+          cp artifacts/bin-aarch64/snhub-aarch64  dist/snhub-aarch64
           cp deploy/install.sh dist/install.sh
           cd dist && sha256sum sn-* snhub-* install.sh > SHA256SUMS
+          cat SHA256SUMS
 
-      # Optional: sign SHA256SUMS with minisign if a key is configured.
-      - name: sign (optional)
+      - name: sign SHA256SUMS (optional)
         if: ${{ env.MINISIGN_SECRET != '' }}
         env:
           MINISIGN_SECRET: ${{ secrets.MINISIGN_SECRET }}
