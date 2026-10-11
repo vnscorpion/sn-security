@@ -1,0 +1,47 @@
+# SN Secure hub behind Caddy — domain sec.sgd.ovh -> 127.0.0.1:8099
+# Caddy obtains/renews TLS automatically. Requirements:
+#   - DNS A/AAAA record  sec.sgd.ovh  ->  this server's public IP
+#   - inbound tcp/80 and tcp/443 open
+# Install to /etc/caddy/Caddyfile, then: sudo systemctl reload caddy
+
+sec.sgd.ovh {
+	encode zstd gzip
+
+	# Reasonable upload ceiling (reports/enroll are small).
+	request_body {
+		max_size 10MB
+	}
+
+	# --- Agent API + installer artifacts: must stay open to every VPS ---
+	@agent path /v1/* /install.sh /sn/* /healthz
+	handle @agent {
+		reverse_proxy 127.0.0.1:8099
+	}
+
+	# --- Admin UI: everything else ---
+	# The hub already requires an admin password, but restricting the UI to
+	# your admin IP(s) is strongly recommended (defense in depth). Put your
+	# office/VPN IPs in @trusted and uncomment `respond @denied` below.
+	@denied not remote_ip 203.0.113.10 198.51.100.0/24
+	handle {
+		route {
+			# respond @denied "Forbidden" 403   # <-- uncomment to enforce IP allow-list
+			reverse_proxy 127.0.0.1:8099
+		}
+	}
+
+	# Security headers. The hub UI uses inline <style> and no JavaScript.
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		Content-Security-Policy "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'none'; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+		-Server
+	}
+
+	log {
+		output file /var/log/caddy/sec.sgd.ovh.log
+		format console
+	}
+}
