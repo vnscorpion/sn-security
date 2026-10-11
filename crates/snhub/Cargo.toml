@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "SN Secure master: enrollment, reports, signed desired-state, web UI"
+publish = false
 
 [[bin]]
 name = "snhub"

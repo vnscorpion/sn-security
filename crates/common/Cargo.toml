@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Shared schema, signing and parsers for SN Secure"
+publish = false
 
 [dependencies]
 serde.workspace = true

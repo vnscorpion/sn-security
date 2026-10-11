@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "SN Secure agent: triage, contain, hunt, clean, watch, report"
+publish = false
 
 [[bin]]
 name = "sn"
