@@ -139,6 +139,44 @@ fn rel_time(ts: i64) -> String {
     }
 }
 
+/// The address VPSes use to reach this hub (the configured public URL, or the
+/// bind address when none is set).
+fn hub_base(st: &AppState) -> String {
+    if st.cfg.public_url.is_empty() {
+        format!("http://{}", st.cfg.bind)
+    } else {
+        st.cfg.public_url.trim_end_matches('/').to_string()
+    }
+}
+
+/// Version of this hub build. Agents are released together with the hub, so an
+/// agent reporting an older version is missing features the hub can show.
+const HUB_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+fn parse_version(v: &str) -> Option<(u32, u32, u32)> {
+    let mut it = v.trim().trim_start_matches('v').split('.');
+    let major = it.next()?.parse().ok()?;
+    let minor = it.next()?.parse().ok()?;
+    // Ignore a pre-release/build suffix on the patch number ("1-rc1", "1+abc").
+    let patch = it
+        .next()
+        .unwrap_or("0")
+        .split(['-', '+'])
+        .next()?
+        .parse()
+        .ok()?;
+    Some((major, minor, patch))
+}
+
+/// True when the agent reports a version older than this hub. An unknown or
+/// unparsable version (e.g. an agent that has not reported yet) is not flagged.
+fn agent_outdated(agent_version: &str) -> bool {
+    match (parse_version(agent_version), parse_version(HUB_VERSION)) {
+        (Some(agent), Some(hub)) => agent < hub,
+        _ => false,
+    }
+}
+
 /// online if a report arrived within 2 cycles; stale up to 3; else offline.
 fn is_online(last_seen: i64) -> bool {
     last_seen != 0 && (now() - last_seen) <= 2 * 900
@@ -515,7 +553,10 @@ pub async fn overview(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Re
                                 td { (row.req) }
                                 td { @if row.bans > 0 { span class="badge b-bad" { (row.bans) } } @else { "0" } }
                                 td { @if row.alerts > 0 { span class="badge b-warn" { (row.alerts) } } @else { "0" } }
-                                td class="mut" { (a.version) }
+                                td class="mut" {
+                                    (a.version)
+                                    @if agent_outdated(&a.version) { " " span class="badge b-warn" { "cũ" } }
+                                }
                                 td class="mut" { (rel_time(a.last_seen)) }
                             }
                         }
@@ -555,6 +596,14 @@ pub async fn agent_detail(
         p { a href="/" { "← Tổng quan" } }
         h1 { (agent.name) " " (status_badge(agent.last_seen)) " " (mode_badge(mode.as_str())) }
         p class="sub" { code { (agent.id) } " · bản sn " (agent.version) " · cập nhật " (rel_time(agent.last_seen)) }
+
+        @if agent_outdated(&agent.version) {
+            div class="note" style="border-left-color:var(--warn)" {
+                "Agent trên VPS này là bản " b { (agent.version) } ", cũ hơn hub (" (HUB_VERSION) "). "
+                "Một số số liệu mới (như RAM) sẽ chưa hiện cho tới khi cập nhật. Chạy trên VPS, bằng root:"
+                pre style="margin:10px 0 0" { "curl -fsSL " (hub_base(&st)) "/install.sh | sudo sh -s -- --hub " (hub_base(&st)) " --upgrade" }
+            }
+        }
 
         div class="card" {
             h2 { "Điều khiển" }
@@ -634,6 +683,7 @@ pub async fn agent_detail(
                 div class="stat" { div class="n" { (r.cycle.requests) } div class="l" { "Lượt truy cập / lần quét" } }
                 div class="stat" { div class="n" { (format!("{:.2}", r.cycle.load1)) } div class="l" { "Tải CPU (load 1 phút)" } }
                 div class="stat" { div class="n" { (format!("{:.0}%", r.cycle.cpu_busy_pct)) } div class="l" { "CPU đang dùng" } }
+                // Always shown, so a missing figure is explained instead of silently absent.
                 @if r.cycle.mem_total_mb > 0 {
                     div class="stat" {
                         div class="n" style=(if r.cycle.mem_used_pct >= 90.0 {"color:var(--bad)"} else if r.cycle.mem_used_pct >= 75.0 {"color:var(--warn)"} else {""}) {
@@ -645,8 +695,12 @@ pub async fn agent_detail(
                         div class="n" { (format!("{:.0}%", r.cycle.swap_used_pct)) }
                         div class="l" { "Swap đang dùng" }
                     }
+                } @else {
+                    div class="stat" {
+                        div class="n mut" { "—" }
+                        div class="l" { "RAM: chưa có số liệu — agent trên VPS này cần cập nhật" }
+                    }
                 }
-                div class="stat" { div class="n" style=(if bans.is_empty() {""} else {"color:var(--bad)"}) { (bans.len()) } div class="l" { "IP đang bị chặn" } }
             }
 
             @if r.cycle.watch_blind {
@@ -907,11 +961,7 @@ pub async fn add_vps_post(
     };
     drop(db);
 
-    let base = if st.cfg.public_url.is_empty() {
-        format!("http://{}", st.cfg.bind)
-    } else {
-        st.cfg.public_url.trim_end_matches('/').to_string()
-    };
+    let base = hub_base(&st);
     let install = format!(
         "curl -fsSL {base}/install.sh | sudo sh -s -- --hub {base} --name {name} --token {token}",
         name = f.name.trim(),
@@ -1341,6 +1391,23 @@ mod tests {
         assert_eq!(v.len(), 1);
         assert!(v[0].applied);
         assert!(!v[0].by_admin);
+    }
+
+    #[test]
+    fn version_comparison_flags_only_older_agents() {
+        assert_eq!(parse_version("0.2.0"), Some((0, 2, 0)));
+        assert_eq!(parse_version("v1.10.3"), Some((1, 10, 3)));
+        assert_eq!(parse_version("1.2"), Some((1, 2, 0)));
+        assert_eq!(parse_version("1.2.3-rc1"), Some((1, 2, 3)));
+        assert_eq!(parse_version(""), None);
+        assert_eq!(parse_version("abc"), None);
+        // 0.1.0 is older than this hub build; "" (never reported) is not flagged.
+        assert!(agent_outdated("0.0.1"));
+        assert!(!agent_outdated(""));
+        assert!(!agent_outdated("not-a-version"));
+        assert!(!agent_outdated(HUB_VERSION));
+        // Numeric, not lexical: 0.10.0 is newer than 0.9.0.
+        assert!(parse_version("0.10.0") > parse_version("0.9.0"));
     }
 
     #[test]
