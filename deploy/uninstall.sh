@@ -19,6 +19,8 @@ if command -v sn >/dev/null 2>&1; then
 fi
 
 rm -f /usr/local/bin/sn
+# The /usr/bin/sn link made by install.sh (only if it is still our symlink).
+[ -L /usr/bin/sn ] && rm -f /usr/bin/sn
 
 if [ "$PURGE" -eq 1 ]; then
   rm -rf /var/lib/sn /etc/sn

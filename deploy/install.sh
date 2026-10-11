@@ -60,6 +60,12 @@ install_binary() {
   # Keep the previous binary so a bad upgrade can be rolled back.
   [ -x /usr/local/bin/sn ] && cp -f /usr/local/bin/sn /usr/local/bin/sn.bak
   install -m 0755 "$TMP/sn" /usr/local/bin/sn
+  # RHEL-family sudo restricts PATH to secure_path (/sbin:/bin:/usr/sbin:/usr/bin),
+  # which omits /usr/local/bin, so `sudo sn ...` would say "command not found".
+  # Link it into /usr/bin (never replacing a real file someone put there).
+  if [ ! -e /usr/bin/sn ] || [ -L /usr/bin/sn ]; then
+    ln -sf /usr/local/bin/sn /usr/bin/sn
+  fi
   echo ">> installed $(/usr/local/bin/sn --version)"
 }
 
