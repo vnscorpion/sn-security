@@ -246,6 +246,8 @@ fn alert_kind_vi(k: &str) -> &str {
         "log_unreadable" => "Có file log nhưng agent không đọc được",
         "log_format" => "Đọc được log nhưng sai định dạng",
         "mem_high" => "RAM gần đầy",
+        "malware_found" => "Phát hiện file mã độc",
+        "malware_suspect" => "Có file nghi ngờ cần xem",
         _ => k,
     }
 }
@@ -724,8 +726,9 @@ pub async fn agent_detail(
             div class="ctrls" {
                 form method="post" action={"/agent/" (agent.id) "/job"} {
                     input type="hidden" name="kind" value="hunt";
-                    label class="f" { span class="t" { "Quét mã độc (số ngày gần đây)" } input type="number" name="days" value="1" style="width:110px"; }
-                    button type="submit" { "Quét ngay" }
+                    // PHP files are always all scanned; `days` only widens the net for other recently changed files.
+                    input type="hidden" name="days" value="7";
+                    label class="f" { span class="t" { "Quét mã độc (toàn bộ file PHP)" } button type="submit" { "Quét ngay" } }
                 }
                 form method="post" action={"/agent/" (agent.id) "/job"} {
                     input type="hidden" name="kind" value="undo";
@@ -895,21 +898,43 @@ pub async fn agent_detail(
                 }
             }
 
-            @if !r.findings.is_empty() {
-                div class="card" {
-                    h2 { "File nghi ngờ" }
+            // Always shown: "scanned, nothing found" must look different from "never scanned".
+            div class="card" id="scan" {
+                h2 { "Quét mã độc" }
+                @if let Some(h) = &r.hunt {
+                    p style="margin:0 0 12px" {
+                        "Lần quét cuối " b { (rel_time(h.at)) } ": đã xem " b { (h.scanned) } " file PHP trong " (h.duration_secs) " giây. "
+                        @if h.malicious == 0 && h.suspicious == 0 {
+                            span class="badge b-ok" { "Không phát hiện gì" }
+                        } @else {
+                            @if h.malicious > 0 { span class="badge b-bad" { (h.malicious) " độc hại" } " " }
+                            @if h.suspicious > 0 { span class="badge b-warn" { (h.suspicious) " nghi ngờ" } }
+                        }
+                    }
+                } @else if agent_outdated(&agent.version) {
+                    p class="help" style="margin:0 0 12px" { "Agent trên VPS này quá cũ nên chưa gửi kết quả quét lên hub. Cập nhật agent để thấy kết quả." }
+                } @else {
+                    p class="help" style="margin:0 0 12px" { "Chưa có kết quả quét. VPS tự quét lúc 3 giờ sáng mỗi ngày; hoặc bấm “Quét ngay” ở mục Điều khiển phía trên." }
+                }
+
+                @if !r.findings.is_empty() {
                     div class="wrap" {
                         table {
-                            thead { tr { th { "Điểm ngờ" } th { "Kết luận" } th { "Đường dẫn" } th { "Dấu hiệu khớp" } } }
+                            thead { tr { th { "Điểm" } th { "Kết luận" } th { "Đường dẫn" } th { "Dấu hiệu khớp" } } }
                             tbody { @for f in &r.findings {
                                 tr {
                                     td { (f.score) }
                                     td { @if f.verdict == "malicious" { span class="badge b-bad" { (verdict_vi(&f.verdict)) } } @else { span class="badge b-warn" { (verdict_vi(&f.verdict)) } } }
-                                    td { code { (f.path) } }
+                                    td { code { (f.path) } br; span class="mut" style="font-size:12px" { (f.context) } }
                                     td class="mut" { (f.rules.join(", ")) }
                                 }
                             }}
                         }
+                    }
+                    p class="help" {
+                        "Điểm ≥ 100 là “độc hại” (đủ chắc chắn để cách ly), 70–99 là “nghi ngờ” (cần bạn xem). "
+                        "Đây là heuristic nên có thể sai: đọc đoạn mã trích ra trước khi xử lý. Cách ly bằng " code { "sn clean --yes" }
+                        " trên VPS (chỉ file “độc hại”, khôi phục được bằng " code { "sn restore <id>" } ")."
                     }
                 }
             }
@@ -1468,6 +1493,7 @@ mod tests {
             capabilities: vec![],
             active_bans: active,
             active_bans_total: total,
+            hunt: None,
         }
     }
 

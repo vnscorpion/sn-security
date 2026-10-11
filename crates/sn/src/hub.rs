@@ -9,8 +9,8 @@ use anyhow::{Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use snsec_common::crypto;
 use snsec_common::schema::{
-    ActiveBanInfo, BanEvent, CycleStats, DesiredBody, DesiredRef, Envelope, HostInfo, Mode,
-    ReportBody, Signed, TriageSummary,
+    ActiveBanInfo, BanEvent, CycleStats, DesiredBody, DesiredRef, Envelope, Finding, HostInfo,
+    HuntSummary, Mode, ReportBody, Signed, TriageSummary,
 };
 use snsec_common::{AGENT_VERSION, SCHEMA_VERSION};
 
@@ -104,6 +104,11 @@ pub fn sync(
         });
     }
 
+    // The last malware scan: its findings and a summary, so the hub can show
+    // "scanned N files, nothing found" as well as what was found.
+    let (hunt, findings) = latest_hunt(state);
+    alerts.extend(hunt_alerts(hunt.as_ref()));
+
     let triage: Option<TriageSummary> = std::fs::read(state.dir.join("triage-latest.json"))
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok());
@@ -117,11 +122,12 @@ pub fn sync(
         would_ban,
         alerts,
         triage,
-        findings: Vec::new(),
+        findings,
         applied_desired: meta.applied_desired,
         capabilities: capabilities(),
         active_bans: active_list,
         active_bans_total: active_total,
+        hunt,
     };
 
     let body_json = serde_json::to_vec(&body)?;
@@ -142,6 +148,78 @@ pub fn sync(
         eprintln!("hub: report flush failed (queued for retry): {e:#}");
     }
     Ok(())
+}
+
+/// At most this many findings travel in one report (the summary has the totals).
+const MAX_REPORTED_FINDINGS: usize = 100;
+
+/// The most recent `sn hunt` result, as left in the state directory.
+fn latest_hunt(state: &State) -> (Option<HuntSummary>, Vec<Finding>) {
+    let summary = std::fs::read(state.dir.join("hunt-latest.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<HuntSummary>(&b).ok());
+    // Already sorted best-first by `sn hunt`.
+    let mut findings: Vec<Finding> = std::fs::read(state.dir.join("findings-latest.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    findings.truncate(MAX_REPORTED_FINDINGS);
+    (summary, findings)
+}
+
+/// Alerts for what the last scan found. They persist in every report until the
+/// files are dealt with (`sn clean`) or a later scan no longer finds them.
+fn hunt_alerts(hunt: Option<&HuntSummary>) -> Vec<snsec_common::schema::Alert> {
+    let Some(h) = hunt else {
+        return Vec::new();
+    };
+    let mut alerts = Vec::new();
+    if h.malicious > 0 {
+        alerts.push(snsec_common::schema::Alert {
+            kind: "malware_found".into(),
+            message: format!(
+                "{} malicious and {} suspicious file(s) in the last scan",
+                h.malicious, h.suspicious
+            ),
+            severity: "urgent".into(),
+        });
+    } else if h.suspicious > 0 {
+        alerts.push(snsec_common::schema::Alert {
+            kind: "malware_suspect".into(),
+            message: format!("{} suspicious file(s) in the last scan", h.suspicious),
+            severity: "warn".into(),
+        });
+    }
+    alerts
+}
+
+/// Arguments for `systemd-run` that start a malware scan in a unit of its own.
+///
+/// A scan must NOT be a child of `sn-watch.service`: that is a one-shot unit and
+/// systemd kills every process left in it when it finishes, about a second
+/// after the cycle starts. The fixed unit name also stops two scans overlapping,
+/// and `--collect` stops a failed scan from blocking the next one. Priority is
+/// kept low so a scan never starves the sites it is checking.
+fn hunt_unit_args(days: u32) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "--quiet",
+        "--no-block",
+        "--collect",
+        "--unit=sn-hunt-job",
+        "--description=SN Secure malware scan (requested from the hub)",
+        "--property=Nice=15",
+        "--property=IOSchedulingClass=idle",
+        "--property=CPUQuota=40%",
+        "--property=MemoryMax=512M",
+        "/usr/local/bin/sn",
+        "hunt",
+        "--days",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
+    args.push(days.to_string());
+    args
 }
 
 /// At most this many bans are listed per report (the full count is always sent).
@@ -396,17 +474,21 @@ fn run_job(cfg: &Config, state: &State, job: &snsec_common::schema::Job) {
     use snsec_common::schema::Job;
     match job {
         Job::Hunt { days } => {
-            // Spawn a detached hunt so the watch cycle returns promptly; findings
-            // land in the next report.
+            // Run the scan as its own systemd unit (see `hunt_unit_args`): a plain
+            // child process would be killed when this one-shot cycle ends. Its
+            // result reaches the hub in a later report.
             let days = (*days).clamp(1, 30);
-            match std::process::Command::new("/usr/local/bin/sn")
-                .arg("hunt")
-                .arg("--days")
-                .arg(days.to_string())
-                .spawn()
+            match std::process::Command::new("systemd-run")
+                .args(hunt_unit_args(days))
+                .status()
             {
-                Ok(_) => eprintln!("hub: started `sn hunt --days {days}`"),
-                Err(e) => eprintln!("hub: could not start hunt: {e}"),
+                Ok(s) if s.success() => eprintln!("hub: started malware scan (days={days})"),
+                Ok(s) => eprintln!(
+                    "hub: could not start the scan ({s}); one may already be running (`systemctl status sn-hunt-job`)"
+                ),
+                Err(e) => {
+                    eprintln!("hub: could not start the scan (is systemd-run installed?): {e}")
+                }
             }
         }
         Job::Undo => {
@@ -566,5 +648,123 @@ mod tests {
         assert_eq!(list.len(), 2);
         // Longest-lasting first.
         assert_eq!(list[0].ip, "198.51.100.2");
+    }
+
+    fn finding(path: &str, score: u32, verdict: &str) -> Finding {
+        Finding {
+            path: path.into(),
+            score,
+            verdict: verdict.into(),
+            rules: vec![],
+            context: String::new(),
+            sha256: String::new(),
+        }
+    }
+
+    #[test]
+    fn the_scan_result_reaches_the_report() {
+        // The bug this guards: the report used to carry `findings: []` always,
+        // so a scan's result never appeared on the hub.
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::at(dir.path().to_path_buf());
+        let findings = vec![
+            finding("/home/a/uploads/x.php", 140, "malicious"),
+            finding("/home/a/y.php", 80, "suspicious"),
+        ];
+        std::fs::write(
+            state.dir.join("findings-latest.json"),
+            serde_json::to_vec(&findings).unwrap(),
+        )
+        .unwrap();
+        let summary = HuntSummary {
+            at: 1_000,
+            scanned: 4_200,
+            duration_secs: 31,
+            malicious: 1,
+            suspicious: 1,
+        };
+        std::fs::write(
+            state.dir.join("hunt-latest.json"),
+            serde_json::to_vec(&summary).unwrap(),
+        )
+        .unwrap();
+
+        let (got_summary, got_findings) = latest_hunt(&state);
+        assert_eq!(got_findings.len(), 2);
+        assert_eq!(got_findings[0].path, "/home/a/uploads/x.php");
+        let got_summary = got_summary.unwrap();
+        assert_eq!((got_summary.scanned, got_summary.malicious), (4_200, 1));
+    }
+
+    #[test]
+    fn no_scan_yet_means_no_summary_not_a_clean_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::at(dir.path().to_path_buf());
+        let (summary, findings) = latest_hunt(&state);
+        assert!(summary.is_none());
+        assert!(findings.is_empty());
+        assert!(hunt_alerts(summary.as_ref()).is_empty());
+    }
+
+    #[test]
+    fn reported_findings_are_capped_but_the_summary_keeps_the_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::at(dir.path().to_path_buf());
+        let many: Vec<Finding> = (0..(MAX_REPORTED_FINDINGS + 25))
+            .map(|i| finding(&format!("/x/{i}.php"), 100, "malicious"))
+            .collect();
+        std::fs::write(
+            state.dir.join("findings-latest.json"),
+            serde_json::to_vec(&many).unwrap(),
+        )
+        .unwrap();
+        let (_, got) = latest_hunt(&state);
+        assert_eq!(got.len(), MAX_REPORTED_FINDINGS);
+    }
+
+    #[test]
+    fn malware_alerts_follow_the_scan_counts() {
+        let s = |malicious, suspicious| HuntSummary {
+            malicious,
+            suspicious,
+            ..HuntSummary::default()
+        };
+        // Clean scan: no alert.
+        assert!(hunt_alerts(Some(&s(0, 0))).is_empty());
+        // Only suspicious: a warning, not an emergency.
+        let a = hunt_alerts(Some(&s(0, 3)));
+        assert_eq!(a.len(), 1);
+        assert_eq!(
+            (a[0].kind.as_str(), a[0].severity.as_str()),
+            ("malware_suspect", "warn")
+        );
+        // Anything malicious: urgent, and it says how many.
+        let a = hunt_alerts(Some(&s(2, 3)));
+        assert_eq!(a.len(), 1);
+        assert_eq!(
+            (a[0].kind.as_str(), a[0].severity.as_str()),
+            ("malware_found", "urgent")
+        );
+        assert!(a[0].message.contains("2 malicious") && a[0].message.contains("3 suspicious"));
+    }
+
+    #[test]
+    fn a_hub_requested_scan_runs_in_its_own_unit() {
+        let args = hunt_unit_args(7);
+        // Not a child of the one-shot watch unit, or systemd kills it.
+        assert!(args.contains(&"--unit=sn-hunt-job".to_string()));
+        assert!(args.contains(&"--no-block".to_string()));
+        assert!(args.contains(&"--collect".to_string()));
+        // Low priority, and the command + days come last.
+        assert!(args.contains(&"--property=Nice=15".to_string()));
+        assert!(args.contains(&"--property=IOSchedulingClass=idle".to_string()));
+        let tail: Vec<&str> = args
+            .iter()
+            .rev()
+            .take(4)
+            .map(String::as_str)
+            .rev()
+            .collect();
+        assert_eq!(tail, ["/usr/local/bin/sn", "hunt", "--days", "7"]);
     }
 }

@@ -1,33 +1,72 @@
-# Reference copy of the PHP web-shell heuristic weights compiled into `sn`
-# (crates/sn/src/heuristic.rs). Score >= 70 = suspicious, >= 100 = malicious.
-# A single source->sink match alone reaches 100.
+# Reference copy of the PHP web-shell heuristic compiled into `sn`
+# (crates/common/src/heuristic.rs). Score >= 100 = malicious (certain enough for
+# `sn clean` to quarantine), 70-99 = suspicious (for a human), below = clean.
+#
+# Design rule: a false "malicious" on legitimate code (WordPress core!) is worse
+# than a miss, so rules need the evidence to be IN the call, not merely nearby.
+#
+# Regression set: `cargo run -p snsec-common --release --example scan_dir -- <dir>`
+# over WordPress core + popular plugins must flag nothing (9,024 files at 0.3.1).
+
+definitions:
+  bare_call: >
+    `name(` that is not the tail of a longer identifier (WP_Filesystem( is not
+    system(), not a method/static call ($pdo->exec(, Foo::exec(), and not a
+    definition (function exec().
+  in_arguments: >
+    Inside the call's argument text (to the end of the statement, max 240 bytes).
+    For call_user_func / call_user_func_array only the FIRST argument counts: the
+    rest is data handed to a callback.
+  from_input: $_POST $_GET $_REQUEST $_COOKIE $_SERVER $_FILES php://input
+  tainted_variable: >
+    A variable whose assignment BEGINS with request input, bare or through a plain
+    PHP decoder/trimmer (trim, stripslashes, urldecode, base64_decode, ...).
+    `isset($_GET[x]) ? ..` and sanitizers (intval, sanitize_*) do not taint. A
+    tainted variable used as an array key ($registry[ $name ]) does not count.
 
 rules:
-  - name: source-to-sink        # superglobal within ~300B of a code/cmd sink
-    weight: 100
-  - name: decode-into-eval      # base64_decode/gzinflate/... feeding eval/assert
-    weight: 60                  # 80 when two or more decoders chain
-  - name: preg_replace-e        # the /e modifier
+  - name: source-to-sink
+    weight: 100            # malicious on its own
+    when: request input is in the arguments of a bare eval/assert/system/exec/shell_exec/passthru/popen/proc_open/pcntl_exec/create_function/call_user_func(_array) call
+  - name: input-as-function
+    weight: 100            # malicious on its own
+    when: $_POST['f'](...)  — the request chooses which function runs
+  - name: tainted-to-sink
+    weight: 70             # suspicious on its own, never auto-quarantined
+    when: a tainted variable is in the arguments of one of those calls
+  - name: decode-into-eval
+    weight: 60             # 80 when two or more decoders chain
+    when: base64_decode/gzinflate/gzuncompress/str_rot13/strrev/hex2bin/... inside a bare eval/assert
+  - name: preg_replace-e
     weight: 60
-  - name: command-sink          # bare system/shell_exec/passthru/proc_open
+    when: preg_replace( with a pattern string whose modifiers include `e` (not preg_replace_callback, not the letters "/e" elsewhere)
+  - name: command-sink
     weight: 20
-  - name: backtick-exec
-    weight: 15
-  - name: dropper               # move_uploaded_file/file_put_contents from request or http
+    when: a bare system/shell_exec/passthru/proc_open call exists at all
+  - name: dropper
     weight: 40
-  - name: variable-function     # $_GET[...](  or  ${'_PO'.'ST'}
+    when: move_uploaded_file/file_put_contents/fwrite takes request input, or the file fetches http content
+  - name: obfuscated-variable
     weight: 20
-  - name: long-base64           # > 512-char blob (30 in a small file, 15 otherwise)
-    weight: 30
-  - name: high-entropy-literal  # > 256B literal, Shannon entropy > 5.2 bits/byte
+    when: ${'...  built from string pieces
+  - name: long-base64
+    weight: 30             # 15 in a file over 20 KB
+    when: a base64-looking run longer than 512 characters
+  - name: high-entropy-literal
     weight: 25
-  - name: php-in-image-ext      # .jpg/.png that is actually PHP
+    when: a string literal over 256 bytes with entropy above 5.2 bits/byte
+  - name: php-in-image-ext
     weight: 50
-  - name: php-in-uploads        # code where only media should be
+  - name: php-in-uploads
     weight: 40
 
-# Commercial encoders (ionCube/SourceGuardian/Zend) are classified
-# 'encoded-commercial' and are NOT scored on entropy/base64.
-#
-# v1.1: token-based lexer (strip comments/strings), plugin/theme checksums from
-# wordpress.org, and .user.ini auto_prepend_file / mu-plugins / .htaccess checks.
+removed:
+  - backtick-exec          # two backticks matched markdown in comments
+  - variable-function      # replaced by input-as-function (precise)
+
+notes:
+  - Commercial encoders (ionCube, SourceGuardian, Zend) are classified
+    `encoded-commercial` and are not scored on entropy/base64.
+  - Known gaps: function names built by concatenation ($f = 'ev'.'al'; $f($x)),
+    non-PHP injections (JavaScript, database), no WordPress core/plugin checksum
+    comparison yet, detection rate never measured on a real malware corpus.

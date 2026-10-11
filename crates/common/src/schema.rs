@@ -100,6 +100,24 @@ pub struct ReportBody {
     /// unblocked just because it is absent from it.
     #[serde(default)]
     pub active_bans_total: u32,
+    /// The most recent malware scan (`sn hunt`), so the hub can tell "scanned and
+    /// clean" apart from "never scanned". `None` before the first scan.
+    #[serde(default)]
+    pub hunt: Option<HuntSummary>,
+}
+
+/// Outcome of one `sn hunt` run.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HuntSummary {
+    /// Unix time the scan finished.
+    pub at: i64,
+    /// Files actually opened and scored.
+    pub scanned: u64,
+    pub duration_secs: u64,
+    /// Files scoring "malicious" (>= 100): certain enough to quarantine.
+    pub malicious: u32,
+    /// Files scoring "suspicious" (70-99): for a human to look at.
+    pub suspicious: u32,
 }
 
 /// One ban currently in force on a VPS.

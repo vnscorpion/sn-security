@@ -45,16 +45,27 @@ pub fn clean(state: &State, yes: bool) -> Result<usize> {
         return Ok(0);
     }
     let mut n = 0;
+    let mut quarantined: Vec<String> = Vec::new();
     for f in findings.iter().filter(|f| f.verdict == "malicious") {
         match quarantine(state, Path::new(&f.path)) {
             Ok(id) => {
                 println!("quarantined {} -> {id}", f.path);
+                quarantined.push(f.path.clone());
                 n += 1;
             }
             Err(e) => eprintln!("clean: {}: {e:#}", f.path),
         }
     }
+    // What is left to look at: so the hub stops reporting files already dealt with.
+    let remaining: Vec<Finding> = findings
+        .into_iter()
+        .filter(|f| !quarantined.contains(&f.path))
+        .collect();
+    crate::hunt::store_remaining(state, &remaining);
     println!("{n} file(s) quarantined. Restore any with `sn restore <id>`.");
+    if remaining.iter().any(|f| f.verdict == "suspicious") {
+        println!("Suspicious files were left alone: review them with `sn hunt` output / the hub.");
+    }
     Ok(n)
 }
 

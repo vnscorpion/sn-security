@@ -20,3 +20,4 @@ memchr.workspace = true
 
 [dev-dependencies]
 rand.workspace = true
+walkdir.workspace = true

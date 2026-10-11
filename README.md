@@ -136,7 +136,7 @@ Có — từ giao diện snhub bạn **đặt lệnh cho VPS mà không cần SS
 | --- | --- | --- |
 | **Ban / Unban IP** (nhập tay hoặc nút cạnh top IP) | Agent áp vào nftables chu kỳ kế, TTL ≤ 24h | Chỉ cổng web; whitelist/trusted_proxies vẫn được loại trừ |
 | **Đổi observe ↔ enforce** | Agent đổi chế độ chu kỳ kế | observe→enforce luôn được; enforce→observe cần `[remote] allow_mode_observe=true` (mặc định tắt) hoặc chữ ký root |
-| **Chạy hunt ngay** (chọn số ngày) | Agent spawn `sn hunt`, findings vào báo cáo sau | Chạy đúng một lần cho mỗi lần bấm |
+| **Quét ngay** (quét mã độc) | Agent chạy `sn hunt` trong một unit systemd riêng, ưu tiên thấp; kết quả lên hub ở báo cáo sau khi quét xong | Chạy một lần mỗi lần bấm; không chạy chồng hai lần quét |
 | **Undo** (gỡ contain + ban của sn) | Agent chạy `sn undo` chu kỳ kế | Chỉ khi VPS bật `[remote] allow_undo=true` |
 
 Tier chính sách (đổi `patterns`, `trusted_proxies`, ép observe hàng loạt) cần **chữ ký root key offline** — hub bị chiếm cũng không hạ được bảo vệ. `contain`/`fetch` từ xa là **v1.1** (hiện làm qua SSH). Cần tức thì tại chỗ thì dùng `sn disable` (kill switch) hoặc chạy lệnh qua SSH.
@@ -166,6 +166,25 @@ Mỗi chu kỳ (~5 phút) agent đếm các dòng log mới theo **từng IP** (
 > - Luật `rate` đếm **mọi** request, kể cả ảnh/CSS/JS. Một trang WordPress có thể kéo 30–100 file, nên 120 request/5 phút dễ bị khách bình thường vượt qua, nhất là nhiều người dùng chung một IP (văn phòng, mạng di động). Hãy xem `would_ban` ở chế độ observe ít nhất vài ngày trước khi bật chặn.
 > - `/config.json` và `/phpmyadmin` trong luật `probe` cũng là đường dẫn hợp lệ của một số ứng dụng và của admin.
 > - Chưa có danh sách bot tự miễn chặn: Googlebot, Bingbot... cần thêm tay vào `[fw] whitelist` (ví dụ `66.249.64.0/19` cho Googlebot).
+
+## Quét mã độc
+
+`sn hunt` quét **toàn bộ file PHP** trong `[hunt] allowed_roots` (mặc định `/home` và `/var/www`), cộng file `.php` giả đuôi ảnh trong `uploads/`. Mỗi file được chấm điểm bằng heuristic; **≥ 100 là "độc hại"**, **70–99 là "nghi ngờ"**.
+
+```sh
+sn hunt                 # quét ngay, in kết quả
+sn clean --yes          # cách ly các file "độc hại" (khôi phục được: sn restore <id>)
+```
+
+Ba cách chạy: **tự động lúc 3 giờ sáng** (timer `sn-hunt`, ưu tiên CPU/IO thấp), **bấm "Quét ngay" trên hub**, hoặc chạy tay như trên. Kết quả (số file đã quét, số độc hại/nghi ngờ, danh sách file kèm đoạn mã trích ra) hiện ở mục **Quét mã độc** trên trang VPS; có file độc hại thì hub báo cảnh báo khẩn. Trang cũng cho biết "đã quét, không có gì" khác với "chưa quét lần nào".
+
+**Nó bắt được gì:** request đi thẳng vào lệnh chạy mã/lệnh hệ thống (`eval`, `system`, `exec`, `call_user_func`...), biến lấy từ request rồi đưa vào các lệnh đó, request quyết định tên hàm được gọi, `eval` của dữ liệu đã giải mã (base64/gzinflate...), `preg_replace` với modifier `/e`, file ghi dữ liệu từ request ra đĩa, file PHP trong `uploads/` hoặc đuôi ảnh, blob base64/entropy cao.
+
+**Độ chính xác đã đo, và chưa đo:**
+- **Báo nhầm:** 0 trên **9.024 file PHP hợp lệ** (lõi WordPress, WooCommerce, Yoast SEO, Contact Form 7, Elementor). Con số này đo bằng công cụ `cargo run -p snsec-common --release --example scan_dir -- <thư mục>`, chạy lại mỗi khi sửa bộ chấm điểm. Phiên bản đầu từng báo nhầm 10 file "độc hại" trên cùng bộ này (kể cả file lõi WordPress); đã sửa.
+- **Phát hiện:** mới kiểm trên các mẫu tự dựng của những dạng web shell phổ biến. **Chưa kiểm trên bộ mã độc thật**, nên không có số liệu tỷ lệ bắt được. Kết quả "sạch" không phải bằng chứng máy không bị nhiễm.
+
+**Giới hạn:** chỉ quét file PHP (không quét database, không quét mã JavaScript bị chèn, không đối chiếu checksum lõi/plugin của WordPress); web shell dựng tên hàm bằng cách nối chuỗi (`$f = 'ev'.'al'; $f($x)`) chưa bắt được; file lớn hơn `max_file_mb` (5 MB) bị bỏ qua. `sn clean --yes` chỉ cách ly file "độc hại"; file "nghi ngờ" luôn để bạn xem tay. Heuristic có thể sai, nên đọc đoạn mã trích ra trước khi cách ly.
 
 ## Cấp cứu một VPS đang bị (chạy tay)
 
@@ -238,6 +257,9 @@ rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 cargo install cargo-zigbuild      # cần zig
 cargo zigbuild --release --target x86_64-unknown-linux-musl
 cargo test --workspace            # chạy trên Linux
+
+# Đo báo nhầm của bộ quét mã độc trên mã hợp lệ (vd. một bản WordPress giải nén):
+cargo run -p snsec-common --release --example scan_dir -- /duong/dan/wordpress
 ```
 
 ## Giấy phép

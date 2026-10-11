@@ -9,7 +9,7 @@ use std::path::Path;
 use anyhow::Result;
 use sha2::{Digest, Sha256};
 use snsec_common::heuristic::{self, Verdict};
-use snsec_common::schema::Finding;
+use snsec_common::schema::{Finding, HuntSummary};
 use walkdir::WalkDir;
 
 use crate::config::Config;
@@ -38,6 +38,7 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<Vec<Finding>> 
     let max_bytes = opts.max_file_mb.max(1) * 1024 * 1024;
     let window = opts.days as i64 * 86_400;
     let now = util::now_secs();
+    let started = std::time::Instant::now();
 
     let mut findings = Vec::new();
     let mut scanned = 0u64;
@@ -114,15 +115,68 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<Vec<Finding>> 
 
     findings.sort_by_key(|f| std::cmp::Reverse(f.score));
 
+    // Findings first, then the summary: the summary is what marks a scan as
+    // finished, so the report never pairs a fresh summary with stale findings.
     let _ = std::fs::write(
         state.dir.join("findings-latest.json"),
         serde_json::to_vec_pretty(&findings)?,
+    );
+    let summary = summarize(
+        &findings,
+        scanned,
+        util::now_secs(),
+        started.elapsed().as_secs(),
+    );
+    let _ = std::fs::write(
+        state.dir.join("hunt-latest.json"),
+        serde_json::to_vec_pretty(&summary)?,
     );
 
     if opts.print {
         print_findings(&findings, scanned);
     }
     Ok(findings)
+}
+
+/// Count findings by verdict into the scan summary that goes to the hub.
+pub fn summarize(findings: &[Finding], scanned: u64, at: i64, duration_secs: u64) -> HuntSummary {
+    let count = |verdict: &str| {
+        u32::try_from(findings.iter().filter(|f| f.verdict == verdict).count()).unwrap_or(u32::MAX)
+    };
+    HuntSummary {
+        at,
+        scanned,
+        duration_secs,
+        malicious: count("malicious"),
+        suspicious: count("suspicious"),
+    }
+}
+
+/// After `sn clean`, keep only the findings still outstanding and bring the
+/// summary's counts in line, so the hub stops flagging files already handled.
+/// The scan time and file count stay as they were: nothing was re-scanned.
+pub fn store_remaining(state: &State, remaining: &[Finding]) {
+    if let Ok(bytes) = serde_json::to_vec_pretty(remaining) {
+        let _ = std::fs::write(state.dir.join("findings-latest.json"), bytes);
+    }
+    let path = state.dir.join("hunt-latest.json");
+    let Some(mut summary) = std::fs::read(&path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<HuntSummary>(&b).ok())
+    else {
+        return;
+    };
+    let fresh = summarize(
+        remaining,
+        summary.scanned,
+        summary.at,
+        summary.duration_secs,
+    );
+    summary.malicious = fresh.malicious;
+    summary.suspicious = fresh.suspicious;
+    if let Ok(bytes) = serde_json::to_vec_pretty(&summary) {
+        let _ = std::fs::write(&path, bytes);
+    }
 }
 
 fn is_upload_path(path: &Path) -> bool {
@@ -172,6 +226,150 @@ fn print_findings(findings: &[Finding], scanned: u64) {
         }
     }
     println!(
-        "\nreview, then `sn clean --yes` to quarantine malicious files (reversible with `sn restore`)."
+        "\nScore >= 100 is \"malicious\" (certain enough to quarantine), 70-99 is \"suspicious\" \
+         (look at it yourself)."
     );
+    println!(
+        "`sn clean --yes` quarantines ONLY the malicious ones (reversible with `sn restore <id>`). \
+         A heuristic can be wrong: read the context above before you run it."
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::State;
+
+    fn fixture_root() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let w = |rel: &str, body: &str| {
+            let p = dir.path().join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+        // A shell dropped into uploads (fragments keep the source AV-clean).
+        w(
+            "site/wp-content/uploads/2026/x.php",
+            &["<?php sys", "tem($_", "GET['c']); ?>"].concat(),
+        );
+        // Ordinary WordPress code.
+        w(
+            "site/wp-content/themes/t/functions.php",
+            "<?php add_action('init', 'my_init'); function my_init() { register_post_type('x'); }",
+        );
+        // Not PHP at all.
+        w("site/readme.txt", "hello");
+        dir
+    }
+
+    fn opts(root: &std::path::Path) -> Options {
+        Options {
+            days: 1,
+            roots: vec![root.to_string_lossy().to_string()],
+            deep: false,
+            max_file_mb: 5,
+            print: false,
+        }
+    }
+
+    fn default_cfg() -> Config {
+        toml::from_str("").unwrap()
+    }
+
+    #[test]
+    fn finds_the_shell_and_leaves_ordinary_code_alone() {
+        let dir = fixture_root();
+        let state_dir = tempfile::tempdir().unwrap();
+        let state = State::at(state_dir.path().to_path_buf());
+
+        let findings = run(&default_cfg(), &state, &opts(dir.path())).unwrap();
+
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].path.ends_with("uploads/2026/x.php"));
+        assert_eq!(findings[0].verdict, "malicious");
+    }
+
+    #[test]
+    fn writes_findings_and_a_summary_the_hub_can_show() {
+        let dir = fixture_root();
+        let state_dir = tempfile::tempdir().unwrap();
+        let state = State::at(state_dir.path().to_path_buf());
+        run(&default_cfg(), &state, &opts(dir.path())).unwrap();
+
+        let findings: Vec<Finding> =
+            serde_json::from_slice(&std::fs::read(state.dir.join("findings-latest.json")).unwrap())
+                .unwrap();
+        assert_eq!(findings.len(), 1);
+        let summary: HuntSummary =
+            serde_json::from_slice(&std::fs::read(state.dir.join("hunt-latest.json")).unwrap())
+                .unwrap();
+        assert_eq!(summary.malicious, 1);
+        assert_eq!(summary.suspicious, 0);
+        // Both PHP files were opened; the .txt was not.
+        assert_eq!(summary.scanned, 2);
+        assert!(summary.at > 0);
+    }
+
+    #[test]
+    fn a_clean_scan_still_records_that_it_ran() {
+        // "Scanned and clean" must be distinguishable from "never scanned".
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.php"), "<?php echo 'hi';").unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let state = State::at(state_dir.path().to_path_buf());
+        run(&default_cfg(), &state, &opts(dir.path())).unwrap();
+
+        let summary: HuntSummary =
+            serde_json::from_slice(&std::fs::read(state.dir.join("hunt-latest.json")).unwrap())
+                .unwrap();
+        assert_eq!((summary.malicious, summary.suspicious), (0, 0));
+        assert_eq!(summary.scanned, 1);
+    }
+
+    #[test]
+    fn cleaning_updates_what_is_outstanding() {
+        let dir = fixture_root();
+        let state_dir = tempfile::tempdir().unwrap();
+        let state = State::at(state_dir.path().to_path_buf());
+        let findings = run(&default_cfg(), &state, &opts(dir.path())).unwrap();
+        assert_eq!(findings.len(), 1);
+
+        // The only finding is handled: nothing left, and the counts follow.
+        store_remaining(&state, &[]);
+        let left: Vec<Finding> =
+            serde_json::from_slice(&std::fs::read(state.dir.join("findings-latest.json")).unwrap())
+                .unwrap();
+        assert!(left.is_empty());
+        let summary: HuntSummary =
+            serde_json::from_slice(&std::fs::read(state.dir.join("hunt-latest.json")).unwrap())
+                .unwrap();
+        assert_eq!((summary.malicious, summary.suspicious), (0, 0));
+        // It still says a scan ran, over the same number of files.
+        assert_eq!(summary.scanned, 2);
+        assert!(summary.at > 0);
+    }
+
+    #[test]
+    fn summarize_counts_by_verdict() {
+        let f = |verdict: &str| Finding {
+            path: "/x".into(),
+            score: 0,
+            verdict: verdict.into(),
+            rules: vec![],
+            context: String::new(),
+            sha256: String::new(),
+        };
+        let s = summarize(
+            &[
+                f("malicious"),
+                f("suspicious"),
+                f("suspicious"),
+                f("encoded-commercial"),
+            ],
+            10,
+            5,
+            2,
+        );
+        assert_eq!((s.malicious, s.suspicious, s.scanned), (1, 2, 10));
+    }
 }
