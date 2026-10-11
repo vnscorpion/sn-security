@@ -170,10 +170,12 @@ impl Db {
             "UPDATE agents SET last_seen = ?1, last_report_seq = ?2, version = ?3, host_json = ?4 WHERE id = ?5",
             params![now, seq as i64, body.agent_version, host_json, agent_id],
         )?;
-        // Keep only the most recent 500 reports per agent.
+        // Keep only the most recent reports per agent. The UI only ever reads the
+        // latest one, and a report with a long ban list can be ~50 KB, so a deep
+        // history would only grow the database.
         self.conn.execute(
             "DELETE FROM reports WHERE agent_id = ?1 AND id NOT IN \
-             (SELECT id FROM reports WHERE agent_id = ?1 ORDER BY id DESC LIMIT 500)",
+             (SELECT id FROM reports WHERE agent_id = ?1 ORDER BY id DESC LIMIT 100)",
             params![agent_id],
         )?;
         Ok(())

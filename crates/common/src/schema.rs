@@ -95,6 +95,11 @@ pub struct ReportBody {
     /// this, so the hub must tolerate it being empty.
     #[serde(default)]
     pub active_bans: Vec<ActiveBanInfo>,
+    /// How many bans are really in force. `active_bans` is capped, so when this
+    /// is larger the list is partial and the hub must not claim an address is
+    /// unblocked just because it is absent from it.
+    #[serde(default)]
+    pub active_bans_total: u32,
 }
 
 /// One ban currently in force on a VPS.

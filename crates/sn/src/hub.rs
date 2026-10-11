@@ -122,6 +122,7 @@ pub fn sync(
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok());
 
+    let (active_list, active_total) = active_bans(state);
     let body = ReportBody {
         agent_version: AGENT_VERSION.to_string(),
         host: host_info(),
@@ -133,7 +134,8 @@ pub fn sync(
         findings: Vec::new(),
         applied_desired: meta.applied_desired,
         capabilities: capabilities(),
-        active_bans: active_bans(state),
+        active_bans: active_list,
+        active_bans_total: active_total,
     };
 
     let body_json = serde_json::to_vec(&body)?;
@@ -156,8 +158,14 @@ pub fn sync(
     Ok(())
 }
 
-/// Every ban still in force, whoever set it. Expired entries are dropped.
-fn active_bans(state: &State) -> Vec<ActiveBanInfo> {
+/// At most this many bans are listed per report (the full count is always sent).
+const MAX_LISTED_BANS: usize = 500;
+
+/// Every ban still in force, whoever set it (expired entries dropped), as
+/// `(listed, total)`. When there are more than `MAX_LISTED_BANS` the list keeps
+/// the ones that last longest — repeat offenders and admin orders — and `total`
+/// still reports the real number so the hub can say the list is partial.
+fn active_bans(state: &State) -> (Vec<ActiveBanInfo>, u32) {
     let now = util::now_secs();
     let mut v: Vec<ActiveBanInfo> = state
         .bans()
@@ -171,9 +179,15 @@ fn active_bans(state: &State) -> Vec<ActiveBanInfo> {
             layer: b.layer,
         })
         .collect();
-    v.sort_by(|a, b| a.ip.cmp(&b.ip));
-    v.truncate(500);
-    v
+    let total = u32::try_from(v.len()).unwrap_or(u32::MAX);
+    // Longest-lasting first; ties broken by address so the cut is deterministic.
+    v.sort_by(|a, b| {
+        b.expires_at
+            .cmp(&a.expires_at)
+            .then_with(|| a.ip.cmp(&b.ip))
+    });
+    v.truncate(MAX_LISTED_BANS);
+    (v, total)
 }
 
 fn http_agent() -> ureq::Agent {
@@ -505,4 +519,66 @@ struct EnrollResp {
     hub_pubkeys: Vec<String>,
     #[serde(default)]
     root_pubkeys: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::ActiveBan;
+    use std::collections::HashMap;
+
+    fn ban(expires_ts: i64) -> ActiveBan {
+        ActiveBan {
+            reason: "rate".into(),
+            expires_ts,
+            strike: 1,
+            layer: "l3".into(),
+        }
+    }
+
+    #[test]
+    fn long_ban_list_is_cut_to_the_longest_lasting_but_total_stays_true() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::at(dir.path().to_path_buf());
+        let now = util::now_secs();
+
+        let extra = 20usize;
+        let mut bans = HashMap::new();
+        for i in 0..(MAX_LISTED_BANS + extra) {
+            bans.insert(
+                format!("10.0.{}.{}", i / 250, i % 250),
+                ban(now + 1000 + i as i64),
+            );
+        }
+        // Already expired: neither listed nor counted.
+        bans.insert("192.0.2.1".into(), ban(now - 5));
+        state.save_bans(&bans).unwrap();
+
+        let (list, total) = active_bans(&state);
+        assert_eq!(total as usize, MAX_LISTED_BANS + extra);
+        assert_eq!(list.len(), MAX_LISTED_BANS);
+        // The `extra` shortest-lived bans were the ones dropped.
+        assert!(
+            list.iter()
+                .all(|b| b.expires_at >= now + 1000 + extra as i64)
+        );
+        assert!(!list.iter().any(|b| b.ip == "192.0.2.1"));
+    }
+
+    #[test]
+    fn short_list_is_sent_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::at(dir.path().to_path_buf());
+        let now = util::now_secs();
+        let mut bans = HashMap::new();
+        bans.insert("198.51.100.1".into(), ban(now + 60));
+        bans.insert("198.51.100.2".into(), ban(now + 120));
+        state.save_bans(&bans).unwrap();
+
+        let (list, total) = active_bans(&state);
+        assert_eq!(total, 2);
+        assert_eq!(list.len(), 2);
+        // Longest-lasting first.
+        assert_eq!(list[0].ip, "198.51.100.2");
+    }
 }

@@ -314,6 +314,57 @@ fn ban_views(report: Option<&ReportBody>, desired: Option<&DesiredBody>, at: i64
     out
 }
 
+/// `(listed, total)` when the VPS had more bans than it listed in its report, so
+/// the hub's view of its blocklist is partial. `None` when the list is complete.
+fn ban_list_partial(report: Option<&ReportBody>) -> Option<(usize, usize)> {
+    let r = report?;
+    let listed = r.active_bans.len();
+    let total = r.active_bans_total as usize;
+    (total > listed).then_some((listed, total))
+}
+
+/// Number of bans in force that the hub cannot list individually.
+fn hidden_bans(report: Option<&ReportBody>) -> usize {
+    ban_list_partial(report).map_or(0, |(listed, total)| total - listed)
+}
+
+/// Rows per page in the blocklist.
+const BAN_PAGE_SIZE: usize = 50;
+
+/// Slice bounds for a 1-based `page`: `(start, end, page, pages)`. An
+/// out-of-range page is clamped to the nearest valid one; an empty list is one
+/// (empty) page.
+fn page_bounds(total: usize, page: usize, size: usize) -> (usize, usize, usize, usize) {
+    let pages = total.div_ceil(size).max(1);
+    let page = page.clamp(1, pages);
+    let start = (page - 1) * size;
+    (start, (start + size).min(total), page, pages)
+}
+
+/// Percent-encode a query-string value (everything but unreserved characters).
+fn urlenc(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Link to a page of an agent's blocklist, keeping the filter.
+fn bans_url(agent_id: &str, q: &str, page: usize) -> String {
+    let mut url = format!("/agent/{agent_id}?page={page}");
+    if !q.is_empty() {
+        url.push_str("&q=");
+        url.push_str(&urlenc(q));
+    }
+    url.push_str("#bans");
+    url
+}
+
 /// "còn 12 phút" / "còn 3 giờ" until `ts`.
 fn expires_in(ts: i64) -> String {
     let d = (ts - now()).max(0);
@@ -484,7 +535,9 @@ pub async fn overview(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Re
         .map(|a| {
             let rep = db.latest_report(&a.id).ok().flatten();
             let desired = db.get_desired(&a.id).ok().flatten();
-            let bans = ban_views(rep.as_ref(), desired.as_ref().map(|(_, _, d)| d), now()).len();
+            // Listed bans plus any the VPS has but could not fit in its report.
+            let bans = ban_views(rep.as_ref(), desired.as_ref().map(|(_, _, d)| d), now()).len()
+                + hidden_bans(rep.as_ref());
             match rep {
                 Some(r) => OverviewRow {
                     agent: a.clone(),
@@ -570,10 +623,20 @@ pub async fn overview(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Re
 
 // ---- agent detail ----------------------------------------------------------
 
+#[derive(Deserialize, Default)]
+pub struct AgentQuery {
+    /// Filter for the blocklist (substring of the address).
+    #[serde(default)]
+    q: String,
+    #[serde(default)]
+    page: usize,
+}
+
 pub async fn agent_detail(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    Query(aq): Query<AgentQuery>,
 ) -> Response {
     if let Some(r) = guard(&st, &headers) {
         return r;
@@ -591,6 +654,21 @@ pub async fn agent_detail(
         .map(|(_, _, b)| b.mode)
         .unwrap_or(Mode::Observe);
     let bans = ban_views(report.as_ref(), desired.as_ref().map(|(_, _, d)| d), now());
+    let partial = ban_list_partial(report.as_ref());
+    let hidden = hidden_bans(report.as_ref());
+
+    // Blocklist: filter by address, then show one page.
+    let needle = aq.q.trim().to_lowercase();
+    let filtered: Vec<&BanView> = bans
+        .iter()
+        .filter(|b| {
+            needle.is_empty()
+                || b.ip.to_lowercase().contains(&needle)
+                || b.key.to_lowercase().contains(&needle)
+        })
+        .collect();
+    let (start, end, page, pages) = page_bounds(filtered.len(), aq.page, BAN_PAGE_SIZE);
+    let shown = &filtered[start..end];
 
     let body = html! {
         p { a href="/" { "← Tổng quan" } }
@@ -647,14 +725,38 @@ pub async fn agent_detail(
             p class="help" { "“Hoàn tác” chỉ chạy nếu VPS bật tuỳ chọn cho phép (" code { "[remote] allow_undo" } ")." }
         }
 
-        div class="card" {
-            h2 { "IP đang bị chặn (" (bans.len()) ")" }
+        div class="card" id="bans" {
+            h2 { "IP đang bị chặn (" (bans.len() + hidden) ")" }
+
+            @if let Some((listed, total)) = partial {
+                div class="note" style="border-left-color:var(--warn)" {
+                    "VPS này đang chặn " b { (total) } " IP nhưng chỉ gửi về hub " b { (listed) } " IP (những IP bị chặn lâu nhất). "
+                    "Phần còn lại vẫn đang bị chặn trên VPS nhưng hub không liệt kê được, nên ô lọc và ô tra cứu IP "
+                    "chỉ chắc chắn với các IP trong danh sách này."
+                }
+            }
+
+            @if !bans.is_empty() || !needle.is_empty() {
+                form method="get" action={"/agent/" (agent.id)} style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px" {
+                    input type="text" name="q" value=(aq.q.trim()) placeholder="Lọc theo IP, vd: 203.0.113" style="flex:1;min-width:200px" autocomplete="off";
+                    button type="submit" { "Lọc" }
+                    @if !needle.is_empty() { a href={"/agent/" (agent.id) "#bans"} style="align-self:center" { "Xoá lọc" } }
+                }
+                @if !needle.is_empty() {
+                    p class="help" style="margin:0 0 10px" { "Có " b { (filtered.len()) } " IP khớp “" (aq.q.trim()) "”." }
+                }
+            }
+
             div class="wrap" {
                 table {
                     thead { tr { th { "IP" } th { "Do ai chặn" } th { "Lý do" } th { "Hết hạn" } th { "Trạng thái" } th {} } }
                     tbody {
-                        @if bans.is_empty() { tr { td colspan="6" { div class="empty" { "Hiện không có IP nào bị chặn." } } } }
-                        @for b in &bans {
+                        @if filtered.is_empty() {
+                            tr { td colspan="6" { div class="empty" {
+                                @if needle.is_empty() { "Hiện không có IP nào bị chặn." } @else { "Không có IP nào khớp bộ lọc." }
+                            } } }
+                        }
+                        @for b in shown {
                             tr {
                                 td { code { (b.ip) } }
                                 td { @if b.by_admin { span class="badge b-mut" { "Admin" } } @else { span class="badge b-mut" { "Tự động" } } }
@@ -673,6 +775,13 @@ pub async fn agent_detail(
                             }
                         }
                     }
+                }
+            }
+            @if pages > 1 {
+                div style="display:flex;gap:14px;align-items:center;justify-content:center;margin-top:14px" {
+                    @if page > 1 { a href=(bans_url(&agent.id, aq.q.trim(), page - 1)) { "← Trước" } } @else { span class="mut" { "← Trước" } }
+                    span class="mut" { "Trang " (page) " / " (pages) " · hiển thị " (start + 1) "–" (end) " trong " (filtered.len()) }
+                    @if page < pages { a href=(bans_url(&agent.id, aq.q.trim(), page + 1)) { "Sau →" } } @else { span class="mut" { "Sau →" } }
                 }
             }
             p class="help" { "“Chờ VPS áp dụng” = lệnh chặn đã gửi, VPS sẽ nhận ở lần quét kế tiếp (tối đa ~15 phút) rồi tự chuyển sang “Đang hiệu lực”." }
@@ -1034,6 +1143,12 @@ struct IpOnAgent {
     traffic: Option<(u64, u64, u64)>,
     /// The ban on this address, in force or on its way to the VPS.
     ban: Option<BanView>,
+    /// `(listed, total)` if the VPS's reported blocklist is cut short, in which
+    /// case "not in the list" does not prove the address is unblocked.
+    partial: Option<(usize, usize)>,
+    /// Agent version; an agent older than the blocklist report cannot say
+    /// whether an address is blocked.
+    version: String,
     would_ban: Option<String>,
     hub_unban: bool,
 }
@@ -1107,6 +1222,8 @@ pub async fn check_ip(
             last_seen: a.last_seen,
             traffic: None,
             ban: None,
+            partial: ban_list_partial(rep.as_ref()),
+            version: a.version.clone(),
             would_ban: None,
             hub_unban: false,
         };
@@ -1203,7 +1320,17 @@ pub async fn check_ip(
                                         span class="badge b-ok" { "Admin đã gỡ chặn" }
                                     }
                                     @if h.ban.is_none() && h.would_ban.is_none() && !h.hub_unban {
-                                        span class="mut" { "—" }
+                                        @if let Some((listed, total)) = h.partial {
+                                            span class="badge b-warn" { "Chưa chắc" } " "
+                                            span class="mut" { "VPS chặn " (total) " IP nhưng hub chỉ nhận " (listed) " — không loại trừ được IP này" }
+                                        } @else if agent_outdated(&h.version) {
+                                            span class="badge b-warn" { "Chưa chắc" } " "
+                                            span class="mut" { "agent cũ (" (h.version) ") chưa báo đủ danh sách chặn — hãy cập nhật agent" }
+                                        } @else if h.version.is_empty() {
+                                            span class="mut" { "—" }
+                                        } @else {
+                                            span class="mut" { "Không bị chặn" }
+                                        }
                                     }
                                 }
                                 td style="white-space:nowrap" {
@@ -1303,6 +1430,7 @@ mod tests {
 
     fn report_with(active: Vec<snsec_common::schema::ActiveBanInfo>) -> ReportBody {
         use snsec_common::schema::{CycleStats, HostInfo};
+        let total = active.len() as u32;
         ReportBody {
             agent_version: "t".into(),
             host: HostInfo::default(),
@@ -1315,6 +1443,7 @@ mod tests {
             applied_desired: Default::default(),
             capabilities: vec![],
             active_bans: active,
+            active_bans_total: total,
         }
     }
 
@@ -1391,6 +1520,59 @@ mod tests {
         assert_eq!(v.len(), 1);
         assert!(v[0].applied);
         assert!(!v[0].by_admin);
+    }
+
+    #[test]
+    fn paging_covers_every_row_exactly_once() {
+        // 120 rows, 50 per page -> 3 pages: 0..50, 50..100, 100..120.
+        assert_eq!(page_bounds(120, 1, 50), (0, 50, 1, 3));
+        assert_eq!(page_bounds(120, 2, 50), (50, 100, 2, 3));
+        assert_eq!(page_bounds(120, 3, 50), (100, 120, 3, 3));
+        // An exact multiple does not add an empty trailing page.
+        assert_eq!(page_bounds(100, 2, 50), (50, 100, 2, 2));
+        // Out-of-range pages clamp instead of slicing out of bounds.
+        assert_eq!(page_bounds(120, 0, 50), (0, 50, 1, 3));
+        assert_eq!(page_bounds(120, 99, 50), (100, 120, 3, 3));
+        // An empty list is one empty page.
+        assert_eq!(page_bounds(0, 1, 50), (0, 0, 1, 1));
+        assert_eq!(page_bounds(0, 7, 50), (0, 0, 1, 1));
+    }
+
+    #[test]
+    fn urlenc_escapes_everything_unsafe() {
+        assert_eq!(urlenc("203.0.113"), "203.0.113");
+        assert_eq!(urlenc("a b&c=d"), "a%20b%26c%3Dd");
+        assert_eq!(urlenc("2001:db8::1"), "2001%3Adb8%3A%3A1");
+        assert_eq!(urlenc("đ"), "%C4%91");
+        assert_eq!(
+            bans_url("web-01-ab12cd", "10.0 ", 2),
+            "/agent/web-01-ab12cd?page=2&q=10.0%20#bans"
+        );
+        assert_eq!(bans_url("x", "", 1), "/agent/x?page=1#bans");
+    }
+
+    #[test]
+    fn truncated_blocklist_is_detected() {
+        let mut r = report_with(vec![]);
+        assert_eq!(ban_list_partial(Some(&r)), None);
+        assert_eq!(hidden_bans(Some(&r)), 0);
+        // The VPS says it blocks 1234 but listed 500.
+        r.active_bans = (0..500)
+            .map(|i| snsec_common::schema::ActiveBanInfo {
+                ip: format!("10.0.{}.{}", i / 250, i % 250),
+                reason: "rate".into(),
+                expires_at: 9_999,
+                strike: 1,
+                layer: "l3".into(),
+            })
+            .collect();
+        r.active_bans_total = 1234;
+        assert_eq!(ban_list_partial(Some(&r)), Some((500, 1234)));
+        assert_eq!(hidden_bans(Some(&r)), 734);
+        // An older agent leaves the total at 0: never "partial", never negative.
+        r.active_bans_total = 0;
+        assert_eq!(ban_list_partial(Some(&r)), None);
+        assert_eq!(hidden_bans(None), 0);
     }
 
     #[test]
