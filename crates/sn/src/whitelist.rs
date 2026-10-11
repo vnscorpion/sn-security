@@ -134,10 +134,10 @@ fn admin_listen_ports(conns: &[netstat::Conn]) -> BTreeSet<u16> {
         };
         if st.comm == "sshd" || st.comm.starts_with("sshd") {
             for ino in proc::socket_inodes(pid) {
-                if let Some(c) = by_inode.get(&ino) {
-                    if c.state == netstat::ST_LISTEN {
-                        ports.insert(c.local_port);
-                    }
+                if let Some(c) = by_inode.get(&ino)
+                    && c.state == netstat::ST_LISTEN
+                {
+                    ports.insert(c.local_port);
                 }
             }
         }
@@ -185,12 +185,11 @@ fn recent_ssh_logins() -> Vec<IpAddr> {
     for path in ["/var/log/auth.log", "/var/log/secure"] {
         if let Some(text) = read_tail(path, 512 * 1024) {
             for line in text.lines() {
-                if line.contains("Accepted ") {
-                    if let Some(ip) = extract_after(line, " from ") {
-                        if let Ok(parsed) = ip.parse::<IpAddr>() {
-                            out.insert(parsed);
-                        }
-                    }
+                if line.contains("Accepted ")
+                    && let Some(ip) = extract_after(line, " from ")
+                    && let Ok(parsed) = ip.parse::<IpAddr>()
+                {
+                    out.insert(parsed);
                 }
             }
         }

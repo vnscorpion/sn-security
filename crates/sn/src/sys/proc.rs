@@ -60,10 +60,10 @@ pub fn list_pids() -> Vec<i32> {
     let mut out = Vec::new();
     if let Ok(rd) = fs::read_dir("/proc") {
         for ent in rd.flatten() {
-            if let Ok(name) = ent.file_name().into_string() {
-                if let Ok(pid) = name.parse::<i32>() {
-                    out.push(pid);
-                }
+            if let Ok(name) = ent.file_name().into_string()
+                && let Ok(pid) = name.parse::<i32>()
+            {
+                out.push(pid);
             }
         }
     }
@@ -127,12 +127,11 @@ pub fn socket_inodes(pid: i32) -> Vec<u64> {
         for ent in rd.flatten() {
             if let Ok(target) = fs::read_link(ent.path()) {
                 let s = target.to_string_lossy();
-                if let Some(rest) = s.strip_prefix("socket:[") {
-                    if let Some(num) = rest.strip_suffix(']') {
-                        if let Ok(ino) = num.parse::<u64>() {
-                            out.push(ino);
-                        }
-                    }
+                if let Some(rest) = s.strip_prefix("socket:[")
+                    && let Some(num) = rest.strip_suffix(']')
+                    && let Ok(ino) = num.parse::<u64>()
+                {
+                    out.push(ino);
                 }
             }
         }

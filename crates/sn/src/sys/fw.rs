@@ -179,13 +179,13 @@ fn collect_elem_key(e: &serde_json::Value, out: &mut Vec<String>) {
                     serde_json::Value::String(s) => out.push(s.clone()),
                     serde_json::Value::Object(_) => {
                         // prefix form { "prefix": { "addr": .., "len": .. } }
-                        if let Some(pfx) = val.get("prefix") {
-                            if let (Some(addr), Some(len)) = (
+                        if let Some(pfx) = val.get("prefix")
+                            && let (Some(addr), Some(len)) = (
                                 pfx.get("addr").and_then(|a| a.as_str()),
                                 pfx.get("len").and_then(|l| l.as_u64()),
-                            ) {
-                                out.push(format!("{addr}/{len}"));
-                            }
+                            )
+                        {
+                            out.push(format!("{addr}/{len}"));
                         }
                     }
                     _ => {}

@@ -75,10 +75,11 @@ pub fn run(state: &State, print: bool) -> Result<TriageSummary> {
         // Outbound connections of this process.
         let mut out_conns = Vec::new();
         for ino in proc::socket_inodes(pid) {
-            if let Some(c) = by_inode.get(&ino) {
-                if c.state == netstat::ST_ESTABLISHED && !c.remote.is_loopback() {
-                    out_conns.push(format!("{}:{}", c.remote, c.remote_port));
-                }
+            if let Some(c) = by_inode.get(&ino)
+                && c.state == netstat::ST_ESTABLISHED
+                && !c.remote.is_loopback()
+            {
+                out_conns.push(format!("{}:{}", c.remote, c.remote_port));
             }
         }
 
@@ -166,10 +167,12 @@ fn score_process(
         score += 30;
     }
     // comm vs exe basename mismatch (name spoofing).
-    if let Some(base) = exe.rsplit('/').next() {
-        if !base.is_empty() && !st.comm.is_empty() && !base.starts_with(&st.comm) {
-            score += 20;
-        }
+    if let Some(base) = exe.rsplit('/').next()
+        && !base.is_empty()
+        && !st.comm.is_empty()
+        && !base.starts_with(&st.comm)
+    {
+        score += 20;
     }
     // kernel-thread-looking name with a real userspace exe.
     if st.comm.starts_with('[') && !exe.is_empty() && st.ppid != 2 {
@@ -178,11 +181,11 @@ fn score_process(
     }
     // outbound to a mining/C2 port.
     for c in out_conns {
-        if let Some(port) = c.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()) {
-            if BAD_OUT_PORTS.contains(&port) {
-                score += 40;
-                miner = true;
-            }
+        if let Some(port) = c.rsplit(':').next().and_then(|p| p.parse::<u16>().ok())
+            && BAD_OUT_PORTS.contains(&port)
+        {
+            score += 40;
+            miner = true;
         }
     }
     // miner hints in cmdline/argv.
@@ -240,12 +243,11 @@ fn decide_label(
 
 fn scan_persistence() -> Vec<String> {
     let mut hits = Vec::new();
-    if Path::new("/etc/ld.so.preload").exists() {
-        if let Ok(c) = std::fs::read_to_string("/etc/ld.so.preload") {
-            if !c.trim().is_empty() {
-                hits.push(format!("/etc/ld.so.preload: {}", c.trim()));
-            }
-        }
+    if Path::new("/etc/ld.so.preload").exists()
+        && let Ok(c) = std::fs::read_to_string("/etc/ld.so.preload")
+        && !c.trim().is_empty()
+    {
+        hits.push(format!("/etc/ld.so.preload: {}", c.trim()));
     }
     for path in proc::persistence_files() {
         if let Ok(content) = std::fs::read_to_string(&path) {

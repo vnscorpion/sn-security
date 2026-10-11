@@ -186,10 +186,10 @@ fn ban_flood_sources(state: &State, cfg: &Config, dry_run: bool) -> Result<usize
         }
         // key is a plain v4 or v6 /64; parse the representative ip for checks.
         let probe_ip = key.split('/').next().unwrap_or(&key);
-        if let Ok(ip) = probe_ip.parse() {
-            if wl.protects(ip) || net::in_any(&trusted, ip) {
-                continue;
-            }
+        if let Ok(ip) = probe_ip.parse()
+            && (wl.protects(ip) || net::in_any(&trusted, ip))
+        {
+            continue;
         }
         if seen.insert(key.clone()) {
             adds.push((key, 3600));

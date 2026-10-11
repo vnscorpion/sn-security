@@ -148,10 +148,10 @@ pub fn list(state: &State) -> Result<()> {
     let v = vault(state);
     if let Ok(rd) = std::fs::read_dir(&v) {
         for ent in rd.flatten() {
-            if let Ok(meta) = std::fs::read(ent.path().join("meta.json")) {
-                if let Ok(qm) = serde_json::from_slice::<QuarantineMeta>(&meta) {
-                    println!("{}  {}", qm.id, qm.orig_path);
-                }
+            if let Ok(meta) = std::fs::read(ent.path().join("meta.json"))
+                && let Ok(qm) = serde_json::from_slice::<QuarantineMeta>(&meta)
+            {
+                println!("{}  {}", qm.id, qm.orig_path);
             }
         }
     }

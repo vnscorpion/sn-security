@@ -226,19 +226,18 @@ pub fn score_php(content: &[u8], is_upload: bool, is_image_ext: bool) -> Score {
         s(&["file_put_", "contents("]),
         s(&["fw", "rite("]),
     ] {
-        if let Some(off) = find_all(&low, &n).first().copied() {
-            if memchr::memmem::find(&low, http_single.as_bytes()).is_some()
+        if let Some(off) = find_all(&low, &n).first().copied()
+            && (memchr::memmem::find(&low, http_single.as_bytes()).is_some()
                 || memchr::memmem::find(&low, http_double.as_bytes()).is_some()
-                || any_source_within(&low, off, 200)
-            {
-                score += 40;
-                hits.push(Hit {
-                    rule: "dropper",
-                    weight: 40,
-                });
-                strong_offset.get_or_insert(off);
-                break;
-            }
+                || any_source_within(&low, off, 200))
+        {
+            score += 40;
+            hits.push(Hit {
+                rule: "dropper",
+                weight: 40,
+            });
+            strong_offset.get_or_insert(off);
+            break;
         }
     }
 

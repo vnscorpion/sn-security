@@ -120,10 +120,10 @@ fn resolve_client(peer: IpAddr, cf: &str, xff: &str, trusted: &[Cidr]) -> IpAddr
         return net::normalize(ip);
     }
     for part in xff.split(',').rev() {
-        if let Ok(ip) = part.trim().parse::<IpAddr>() {
-            if !net::in_any(trusted, ip) {
-                return net::normalize(ip);
-            }
+        if let Ok(ip) = part.trim().parse::<IpAddr>()
+            && !net::in_any(trusted, ip)
+        {
+            return net::normalize(ip);
         }
     }
     net::normalize(peer)
