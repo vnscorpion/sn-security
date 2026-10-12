@@ -145,7 +145,14 @@ jobs:
           nohup python3 -m http.server 8765 --bind 127.0.0.1 --directory "$rel" >/dev/null 2>&1 &
           for _ in $(seq 20); do curl -fsS -o /dev/null http://127.0.0.1:8765/dist/SHA256SUMS && break; sleep 0.5; done
           cat > "$RUNNER_TEMP/check.sh" <<'EOF'
-          fail() { echo "::error::$*"; exit 1; }
+          # The annotation carries the hub's state and last log lines: job logs need a
+          # sign-in to read, annotations do not.
+          fail() {
+            st="$(systemctl show -p ActiveState,SubState,Result,NRestarts snhub 2>/dev/null | tr '\n' ' ')"
+            lg="$(sudo journalctl -u snhub -n 6 --no-pager -o cat 2>/dev/null | tr '\n' '|' | cut -c1-600)"
+            echo "::error::$* [snhub: $st] [$lg]"
+            exit 1
+          }
           want_mode() {
             got="$(sudo stat -c '%a %U:%G' "$1")"
             [ "$got" = "$2" ] || fail "$1 is $got, want $2"

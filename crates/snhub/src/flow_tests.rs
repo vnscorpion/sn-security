@@ -1095,3 +1095,6 @@ fn shell_words_are_quoted_only_when_needed() {
     assert_eq!(web::sh_quote("-x"), "'-x'");
     assert_eq!(web::sh_quote(""), "''");
 }
+
+#[path = "flow_tests_mcp.rs"]
+mod mcp_flow;

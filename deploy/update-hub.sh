@@ -39,13 +39,30 @@ esac
 TMP="$(mktemp -d)"
 STOPPED=0
 NEWPUB=""
+# Start the hub and wait until it is really running. Repeated stops and starts
+# (a re-run, a failed run) can leave the unit "failed" or rate-limited, which a
+# plain start does not clear.
+start_hub() {
+  systemctl reset-failed snhub >/dev/null 2>&1 || true
+  systemctl start snhub >/dev/null 2>&1 || true
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    systemctl is-active --quiet snhub && return 0
+    sleep 1
+  done
+  return 1
+}
 cleanup() {
   rm -rf "$TMP"
   [ -z "$NEWPUB" ] || rm -rf -- "$NEWPUB"
-  # A failure between stop and start must not leave the hub down.
+  # A failure between stop and start must not leave the hub down: start it, and
+  # if the new binary will not run, the previous one.
   if [ "$STOPPED" = 1 ] && ! systemctl is-active --quiet snhub; then
     echo "!! update failed; starting snhub again" >&2
-    systemctl start snhub || true
+    if ! start_hub && [ -x /usr/local/bin/snhub.bak ]; then
+      echo "!! the new snhub does not start; going back to the previous one" >&2
+      cp -f /usr/local/bin/snhub.bak /usr/local/bin/snhub
+      start_hub || journalctl -u snhub -n 20 --no-pager >&2 || true
+    fi
   fi
 }
 trap cleanup EXIT
@@ -128,9 +145,8 @@ echo ">> refreshing the agent files served to VPSes"
 refresh_public "$TMP"
 
 echo ">> starting snhub"
-systemctl start snhub
-sleep 1
-if systemctl is-active --quiet snhub; then
+if start_hub; then
+  STOPPED=0
   # The address VPSes use to reach this hub, from the hub's own config.
   HUB_URL="$(sed -n 's/^public_url *= *"\(.*\)"/\1/p' /etc/snhub/snhub.toml 2>/dev/null | head -n1)"
   HUB_URL="${HUB_URL%/}"
@@ -144,8 +160,9 @@ if systemctl is-active --quiet snhub; then
   echo "   curl -fsSL $HUB_URL/install.sh | sudo sh -s -- --hub $HUB_URL --upgrade"
 else
   echo "!! snhub failed to start, rolling back"
-  cp -f /usr/local/bin/snhub.bak /usr/local/bin/snhub
-  systemctl restart snhub || true
   journalctl -u snhub -n 20 --no-pager || true
+  cp -f /usr/local/bin/snhub.bak /usr/local/bin/snhub
+  start_hub || true
+  STOPPED=0
   exit 1
 fi

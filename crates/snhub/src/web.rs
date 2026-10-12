@@ -104,6 +104,7 @@ pub(crate) fn shell(title: &str, body: Markup) -> Markup {
                         a href="/add-vps" { "Thêm VPS" }
                         a href="/log" { "Nhật ký" }
                         a href="/settings" { "Cài đặt AI" }
+                        a href="/settings/hermes" { "Hermes" }
                         a href="/security" { "Bảo mật" }
                     }
                     span class="sp" {}
@@ -143,7 +144,7 @@ pub(crate) fn rel_time(ts: i64) -> String {
 
 /// The address VPSes use to reach this hub (the configured public URL, or the
 /// bind address when none is set).
-fn hub_base(st: &AppState) -> String {
+pub(crate) fn hub_base(st: &AppState) -> String {
     if st.cfg.public_url.is_empty() {
         format!("http://{}", st.cfg.bind)
     } else {

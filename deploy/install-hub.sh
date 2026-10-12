@@ -59,10 +59,17 @@ NEWPUB=""
 cleanup() {
   rm -rf "$TMP"
   [ -z "$NEWPUB" ] || rm -rf -- "$NEWPUB"
-  # A re-run that fails after stopping the hub must not leave it down.
+  # A re-run that fails after stopping the hub must not leave it down. Repeated
+  # stops and starts can leave the unit "failed" or rate-limited: clear that and
+  # wait until it really runs.
   if [ "$STOPPED" = 1 ] && ! systemctl is-active --quiet snhub; then
     echo "!! install failed; starting snhub again" >&2
-    systemctl start snhub || true
+    systemctl reset-failed snhub >/dev/null 2>&1 || true
+    systemctl start snhub >/dev/null 2>&1 || true
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+      systemctl is-active --quiet snhub && break
+      sleep 1
+    done
   fi
 }
 trap cleanup EXIT
@@ -166,6 +173,7 @@ lock_down
 echo ">> installing systemd service"
 install -m 0644 "$SYSTEMD_SRC" /etc/systemd/system/snhub.service
 systemctl daemon-reload
+systemctl reset-failed snhub.service >/dev/null 2>&1 || true
 systemctl enable --now snhub.service
 
 cat <<EOF

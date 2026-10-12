@@ -450,6 +450,15 @@ impl Db {
             .optional()?)
     }
 
+    /// The `n` newest proposals for a VPS, newest first.
+    pub fn recent_proposals(&self, agent_id: &str, n: i64) -> Result<Vec<ProposalRow>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {PROPOSAL_COLS} FROM proposals WHERE agent_id = ?1 ORDER BY id DESC LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map(params![agent_id, n], proposal_row)?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
+    }
+
     pub fn get_proposal(&self, id: i64) -> Result<Option<ProposalRow>> {
         Ok(self
             .conn

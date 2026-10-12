@@ -137,6 +137,8 @@ impl Db {
         conn.execute_batch(crate::db_auth::SCHEMA_AUTH)
             .context("applying auth schema")?;
         crate::db_auth::migrate_auth(&conn).context("migrating auth schema")?;
+        conn.execute_batch(crate::db_mcp::SCHEMA_MCP)
+            .context("applying MCP schema")?;
         // Not fatal: `get_desired` leaves such entries out anyway.
         if let Err(e) = scrub_desired(&conn) {
             tracing::error!("checking stored ban orders: {e:#}");

@@ -13,12 +13,15 @@ mod config;
 mod db;
 mod db_ai;
 mod db_auth;
+mod db_mcp;
 mod desired;
 mod keys;
+mod mcp;
 mod totp;
 mod web;
 mod web_ai;
 mod web_auth;
+mod web_mcp;
 mod webauthn;
 
 use std::path::{Path, PathBuf};
@@ -412,6 +415,17 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/agent/{id}/ai/{pid}/apply", post(web_ai::ai_apply_post))
         .route("/agent/{id}/ai/{pid}/reject", post(web_ai::ai_reject_post))
         .route("/settings", get(web_ai::settings_page))
+        .route("/settings/hermes", get(web_mcp::page))
+        .route("/settings/hermes/token", post(web_mcp::create_post))
+        .route(
+            "/settings/hermes/token/{id}/revoke",
+            post(web_mcp::revoke_post),
+        )
+        // MCP (Streamable HTTP) for an outside agent such as Hermes; bearer token.
+        .route(
+            "/mcp",
+            get(mcp::mcp_get).post(mcp::mcp_post).delete(mcp::mcp_get),
+        )
         .route("/settings/provider", post(web_ai::provider_save_post))
         .route(
             "/settings/provider/{pid}/default",

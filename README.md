@@ -263,6 +263,27 @@ Luật cố định không viết hết được các biến thể kiểu: miner
 
 **Giới hạn đã biết:** các luật kiểm tra (đặc biệt "đáng ngờ" của dòng `.bashrc`, tiến trình giả danh) là heuristic nên có thể bỏ sót hoặc báo thừa; chưa chặn IP bằng ipset/firewall toàn cổng (nft của agent chỉ chặn cổng web) và chưa tự chặn bot ở Nginx của DirectAdmin; AI có thể chẩn đoán sai, nên đọc kỹ trước khi duyệt. **Chưa thử trên VPS thật.**
 
+## Kết nối Hermes (MCP)
+
+Hub có sẵn một **MCP server** (Model Context Protocol, kiểu Streamable HTTP) ở `https://HUB/mcp`, để Hermes Agent hoặc agent nào hỗ trợ MCP qua HTTP làm "bộ não" cho đội VPS: đọc tình trạng, lấy bằng chứng, và nếu được phép thì xử lý sự cố.
+
+1. Vào **Hermes** trên menu hub, tạo token (hỏi lại mật khẩu). Chọn quyền:
+   - **Chỉ xem**: `list_vps`, `get_vps_status`, `get_evidence`, `get_proposals`, `get_activity_log`.
+   - **Xem + đề xuất**: thêm `request_evidence` (VPS thu thập bằng chứng mới) và `submit_plan` (kế hoạch xử lý chờ admin duyệt trên trang VPS).
+   - **Toàn quyền xử lý**: thêm `submit_plan` với `execute: true`, `execute_proposal`, `reject_proposal`, `ban_ip`/`unban_ip` (một VPS hoặc `all`, tối đa 24 giờ), `set_mode`, `run_malware_scan`, `install_clamav`.
+2. Trên máy chạy Hermes, thêm token vào `~/.hermes/.env` (`SNSEC_MCP_TOKEN=snmcp_…`) và vào `~/.hermes/config.yaml`:
+   ```yaml
+   mcp_servers:
+     snsec:
+       url: "https://HUB/mcp"
+       headers:
+         Authorization: "Bearer ${SNSEC_MCP_TOKEN}"
+       timeout: 120
+   ```
+   Kiểm tra bằng `hermes mcp test snsec`. Hermes chạy trên chính máy hub thì dùng `http://127.0.0.1:8099/mcp`.
+
+**Giới hạn an toàn (không phụ thuộc vào việc Hermes nghe lời):** mỗi kế hoạch đi đúng đường của AI tích hợp. Chỉ có danh sách hành động cố định (`kill_process`, `kill_matching`, `lock_user_shell`, `quarantine_file`, `remove_shell_line`, `disable_service`), không có lệnh tuỳ ý. Hub đối chiếu từng hành động với bằng chứng mới nhất của VPS (không quá 100 phút) và loại cái không khớp hoặc chạm dịch vụ được bảo vệ; agent trên VPS kiểm lại lần nữa trước khi làm và ghi cách hoàn tác. Lệnh chặn chỉ nhận một địa chỉ IP thường (hoặc một IPv6 /64). Token lưu dạng băm, thu hồi được ngay, bị giới hạn 120 lần gọi/phút; token sai bị đếm như đoán mật khẩu. Mọi thao tác ghi vào Nhật ký với tên `mcp:<tên token>`. Dữ liệu trả về từ VPS được đánh dấu là không tin cậy để Hermes không làm theo chữ nằm trong đó.
+
 ## Bot phân tán và CPU cao
 
 Luật theo IP ở trên **không chặn được** bot chạy qua hàng trăm IP dân dụng, mỗi IP chỉ vài request và trông như trình duyệt thường (ví dụ vụ `?tss-sc=…&tsscat=…` kéo CPU lên 100%). Với loại này agent **chỉ cảnh báo và cho bạn thấy**, không tự chặn:
