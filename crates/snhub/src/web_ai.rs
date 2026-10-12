@@ -18,7 +18,7 @@ use snsec_common::ai::{self, Proposed};
 use snsec_common::schema::{Action, Evidence, ReportBody};
 
 use crate::AppState;
-use crate::ai_client::{self, KIND_ANTHROPIC, KIND_OPENAI};
+use crate::ai_client::{self, KIND_ANTHROPIC, KIND_OPENAI, KIND_RESPONSES};
 use crate::analysis;
 use crate::db_ai::{AiState, ProposalRow, ProviderInput};
 use crate::web::{guard, now, rel_time, shell, urlenc};
@@ -39,6 +39,15 @@ pub fn autonomy_vi(a: &str) -> &'static str {
         }
         ai::AUTONOMY_AUTO_ALL => "Tự xử lý tất cả, kể cả dừng tiến trình",
         _ => "?",
+    }
+}
+
+/// How a provider kind is named on the settings page.
+fn kind_vi(kind: &str) -> &'static str {
+    match kind {
+        KIND_ANTHROPIC => "Anthropic",
+        KIND_RESPONSES => "OpenAI Responses",
+        _ => "OpenAI-compatible",
     }
 }
 
@@ -499,7 +508,7 @@ pub async fn settings_page(
                         @for p in &providers {
                             tr {
                                 td { b { (p.name) } @if p.is_default { " " span class="badge b-ok" { "đang dùng" } } }
-                                td { (if p.kind == KIND_ANTHROPIC { "Anthropic" } else { "OpenAI-compatible" }) }
+                                td { (kind_vi(&p.kind)) }
                                 td {
                                     code style="word-break:break-all" { (if p.endpoint.is_empty() { "(mặc định)" } else { p.endpoint.as_str() }) }
                                     br;
@@ -541,6 +550,7 @@ pub async fn settings_page(
                     label class="f" { span class="t" { "Loại API" }
                         select name="kind" {
                             option value=(KIND_OPENAI) selected[editing.as_ref().is_none_or(|e| e.kind == KIND_OPENAI)] { "OpenAI-compatible (Hermes, OpenRouter, vLLM, Ollama, LiteLLM…)" }
+                            option value=(KIND_RESPONSES) selected[editing.as_ref().is_some_and(|e| e.kind == KIND_RESPONSES)] { "OpenAI Responses API (wire_api = responses)" }
                             option value=(KIND_ANTHROPIC) selected[editing.as_ref().is_some_and(|e| e.kind == KIND_ANTHROPIC)] { "Anthropic (Claude)" }
                         } }
                 }

@@ -15,6 +15,8 @@ use serde_json::{Value, json};
 
 pub const KIND_OPENAI: &str = "openai";
 pub const KIND_ANTHROPIC: &str = "anthropic";
+/// OpenAI's newer Responses API (`POST /v1/responses`, "wire_api = responses").
+pub const KIND_RESPONSES: &str = "openai_responses";
 const ANTHROPIC_DEFAULT: &str = "https://api.anthropic.com";
 /// Longest reply read from a model.
 const MAX_REPLY_BYTES: u64 = 2 * 1024 * 1024;
@@ -34,7 +36,7 @@ pub struct Provider {
 
 #[must_use]
 pub fn is_valid_kind(kind: &str) -> bool {
-    kind == KIND_OPENAI || kind == KIND_ANTHROPIC
+    kind == KIND_OPENAI || kind == KIND_ANTHROPIC || kind == KIND_RESPONSES
 }
 
 /// The full URL to POST to, from what the operator typed. For OpenAI-style
@@ -47,6 +49,7 @@ pub fn request_url(kind: &str, endpoint: &str) -> Result<String> {
     let e = endpoint.trim().trim_end_matches('/');
     let (tail, default) = match kind {
         KIND_OPENAI => ("/chat/completions", ""),
+        KIND_RESPONSES => ("/responses", ""),
         KIND_ANTHROPIC => ("/v1/messages", ANTHROPIC_DEFAULT),
         _ => bail!("loại provider không hợp lệ"),
     };
@@ -60,7 +63,9 @@ pub fn request_url(kind: &str, endpoint: &str) -> Result<String> {
     if base.contains(char::is_whitespace) {
         bail!("endpoint không được chứa khoảng trắng");
     }
-    let full_already = base.ends_with("/chat/completions") || base.ends_with("/messages");
+    let full_already = base.ends_with("/chat/completions")
+        || base.ends_with("/responses")
+        || base.ends_with("/messages");
     Ok(if full_already {
         base.to_string()
     } else {
@@ -77,6 +82,13 @@ pub fn request_body(kind: &str, model: &str, system: &str, user: &str) -> Value 
             "max_tokens": 4096,
             "system": system,
             "messages": [{ "role": "user", "content": user }],
+        })
+    } else if kind == KIND_RESPONSES {
+        json!({
+            "model": model,
+            "instructions": system,
+            "input": user,
+            "stream": false,
         })
     } else {
         // Deliberately only the fields every compatible server accepts: some
@@ -105,6 +117,14 @@ pub fn reply_text(kind: &str, v: &Value) -> Option<String> {
             .collect();
         return (!parts.is_empty()).then(|| parts.join("\n"));
     }
+    // Either shape is read for either OpenAI-style kind: some gateways answer a
+    // `/responses` call in the chat shape (and the other way round), and the
+    // operator should not have to know which.
+    chat_text(v).or_else(|| responses_text(v))
+}
+
+/// `choices[0].message.content` (Chat Completions).
+fn chat_text(v: &Value) -> Option<String> {
     let content = v.get("choices")?.get(0)?.get("message")?.get("content")?;
     match content {
         Value::String(s) => Some(s.clone()),
@@ -118,6 +138,32 @@ pub fn reply_text(kind: &str, v: &Value) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// `output_text`, or the `output_text` parts of the `message` items in `output`
+/// (the Responses API). Reasoning items are not part of the answer.
+fn responses_text(v: &Value) -> Option<String> {
+    if let Some(s) = v.get("output_text").and_then(Value::as_str)
+        && !s.is_empty()
+    {
+        return Some(s.to_string());
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for item in v.get("output")?.as_array()? {
+        if item.get("type").and_then(Value::as_str) != Some("message") {
+            continue;
+        }
+        for c in item.get("content")?.as_array()? {
+            if matches!(
+                c.get("type").and_then(Value::as_str),
+                Some("output_text" | "text")
+            ) && let Some(t) = c.get("text").and_then(Value::as_str)
+            {
+                parts.push(t);
+            }
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("\n"))
 }
 
 /// A short, key-free description of a failed call.
@@ -154,6 +200,10 @@ fn snippet(body: &str, max: usize) -> String {
 
 /// The text one server-sent-events chunk carries, in either provider's shape.
 fn chunk_text(v: &Value) -> Option<String> {
+    // Responses API: `response.output_text.delta` events carry the answer text.
+    if v.get("type").and_then(Value::as_str) == Some("response.output_text.delta") {
+        return v.get("delta").and_then(Value::as_str).map(str::to_string);
+    }
     // OpenAI: choices[0].delta.content (streaming) or .message.content.
     if let Some(c) = v.get("choices").and_then(|c| c.get(0)) {
         let t = c
@@ -450,6 +500,51 @@ mod tests {
     fn the_request_asks_for_a_plain_non_streamed_reply() {
         let o = request_body(KIND_OPENAI, "m", "S", "U");
         assert_eq!(o["stream"], false);
+    }
+
+    #[test]
+    fn the_responses_api_has_its_own_url_body_and_reply_shape() {
+        assert_eq!(
+            request_url(KIND_RESPONSES, "https://router.sgd.ovh/v1").unwrap(),
+            "https://router.sgd.ovh/v1/responses"
+        );
+        assert_eq!(
+            request_url(KIND_RESPONSES, "https://h/v1/responses").unwrap(),
+            "https://h/v1/responses"
+        );
+        let b = request_body(KIND_RESPONSES, "m", "SYS", "USER");
+        assert_eq!(
+            (b["instructions"].as_str(), b["input"].as_str()),
+            (Some("SYS"), Some("USER"))
+        );
+        assert_eq!(b["stream"], false);
+        assert!(b.get("messages").is_none());
+        assert!(is_valid_kind("openai_responses"));
+        // The reply: output_text, or the text parts of message items (not reasoning).
+        let r1 = json!({"output_text": "OK"});
+        assert_eq!(reply_text(KIND_RESPONSES, &r1).as_deref(), Some("OK"));
+        let r2 = json!({"output":[
+            {"type":"reasoning","summary":[{"type":"summary_text","text":"thinking"}]},
+            {"type":"message","content":[{"type":"output_text","text":"Xin"},{"type":"output_text","text":"chao"}]}
+        ]});
+        assert_eq!(
+            reply_text(KIND_RESPONSES, &r2).as_deref(),
+            Some("Xin\nchao")
+        );
+        // A gateway that answers /responses in the chat shape is still understood.
+        let chat = json!({"choices":[{"message":{"content":"OK."}}]});
+        assert_eq!(reply_text(KIND_RESPONSES, &chat).as_deref(), Some("OK."));
+        // And the other way round.
+        assert_eq!(reply_text(KIND_OPENAI, &r1).as_deref(), Some("OK"));
+    }
+
+    #[test]
+    fn a_responses_stream_is_collected_from_its_delta_events() {
+        let sse = "event: response.created\ndata: {\"type\":\"response.created\"}\n\n\
+                   event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"O\"}\n\n\
+                   event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"K\"}\n\n\
+                   event: response.completed\ndata: {\"type\":\"response.completed\"}\n";
+        assert_eq!(parse_body(KIND_RESPONSES, sse).unwrap(), "OK");
     }
 
     #[test]

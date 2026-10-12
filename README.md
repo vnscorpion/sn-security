@@ -183,7 +183,8 @@ Mỗi chu kỳ (~5 phút) agent đếm các dòng log mới theo **từng IP** (
 Luật cố định không viết hết được các biến thể kiểu: miner giả tiến trình `[kworker/0:1Z]`, mã độc cài trong `.bashrc`, công cụ đào trong `/dev/shm`, đăng nhập SSH lạ, cổng 111 mở công khai. Hub vì thế có thể nhờ một mô hình AI do bạn cấu hình làm "bộ não": agent thu thập bằng chứng, AI chẩn đoán và đề xuất hành động, bạn duyệt (hoặc cho phép tự xử), agent thực hiện.
 
 **1. Cài đặt AI (`/settings` trên hub).** Tự nhập **endpoint, model, API key**, không gắn cứng nhà cung cấp nào:
-- **OpenAI-compatible**: Hermes (Nous Portal, OpenRouter, vLLM, Ollama `/v1`, LiteLLM…), OpenAI… Nhập địa chỉ gốc (ví dụ `https://openrouter.ai/api/v1`) hoặc đầy đủ tới `/chat/completions`. Hermes chạy trên máy bạn thì dùng `http://127.0.0.1:11434/v1`, key có thể để trống.
+- **OpenAI-compatible**: Hermes (Nous Portal, OpenRouter, vLLM, Ollama `/v1`, LiteLLM…), OpenAI… Nhập địa chỉ gốc (ví dụ `https://openrouter.ai/api/v1`) hoặc đầy đủ tới `/chat/completions`.
+- **OpenAI Responses API** (`wire_api = "responses"` trong Codex): endpoint `…/v1/responses`, gửi `instructions` + `input`. Hub đọc được cả câu trả lời dạng `output_text`/`output[]` lẫn dạng chat, và cả luồng SSE. Hermes chạy trên máy bạn thì dùng `http://127.0.0.1:11434/v1`, key có thể để trống.
 - **Anthropic (Claude)**: để trống endpoint thì dùng `api.anthropic.com`.
 - Có nút **Thử kết nối**, đặt mặc định, sửa (để trống key = giữ key cũ), xoá. Dưới mỗi nhà cung cấp hub hiện **URL sẽ gọi**; khi lỗi, thông báo nêu mã HTTP, loại nội dung, URL đã gọi và đoạn đầu phản hồi. “Phản hồi không phải JSON … trang web (HTML)” gần như luôn là endpoint sai (thiếu `/v1`, hoặc trỏ vào giao diện web của dịch vụ thay vì API); hub không theo chuyển hướng (để không gửi key sang máy khác) nên báo địa chỉ đích để bạn nhập lại. API key lưu nguyên văn trong file SQLite của hub (chỉ user chạy hub đọc được) vì hub phải dùng nó; trang chỉ hiện 4 ký tự cuối.
 
