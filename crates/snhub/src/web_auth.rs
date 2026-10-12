@@ -232,24 +232,38 @@ fn origin_authority(origin: &str) -> Option<String> {
 }
 
 /// May this state-changing request come from this browser page? The session
-/// cookie is `SameSite=Strict` already; this is the second lock. A request that
-/// names an `Origin` must name this hub (its `Host`, or the configured public
-/// URL); one that does not is judged by `Sec-Fetch-Site` when the browser sends
-/// it. Agents (no browser headers at all) are not affected: `/v1/*` skips this.
+/// cookie is `SameSite=Strict` already; this is the second lock.
+///
+/// 1. When the browser sends `Sec-Fetch-Site` (every current browser, over https
+///    or localhost) it is the verdict: only `same-origin` passes. The browser sets
+///    it itself and a page cannot forge it, and it does not depend on what `Host`
+///    the reverse proxy forwards.
+/// 2. Otherwise, a request that names an `Origin` must name this hub: its `Host`,
+///    the proxy's `X-Forwarded-Host`, or the configured public URL.
+/// 3. With neither header (not a browser) it passes; the cookie still has to be
+///    valid. Agents (`/v1/*`) skip this check altogether.
 pub(crate) fn same_origin(headers: &HeaderMap, public_url: &str) -> bool {
     let get = |n: &str| headers.get(n).and_then(|v| v.to_str().ok());
-    if let Some(origin) = get("origin") {
-        let Some(got) = origin_authority(origin) else {
-            // "null" and anything odd.
-            return false;
-        };
-        let host = get("host").map(str::to_ascii_lowercase);
-        let public = public_url
-            .split_once("://")
-            .map(|(_, r)| r.trim_end_matches('/').to_ascii_lowercase());
-        return host.as_deref() == Some(got.as_str()) || public.as_deref() == Some(got.as_str());
+    if let Some(site) = get("sec-fetch-site") {
+        return site.trim().eq_ignore_ascii_case("same-origin");
     }
-    !matches!(get("sec-fetch-site"), Some("cross-site"))
+    let Some(origin) = get("origin") else {
+        return true;
+    };
+    let Some(got) = origin_authority(origin) else {
+        // "null" and anything odd.
+        return false;
+    };
+    let lower = |v: Option<&str>| v.map(|s| s.trim().to_ascii_lowercase());
+    let host = lower(get("host"));
+    // Only the last entry: the one the proxy itself added.
+    let forwarded = lower(get("x-forwarded-host").and_then(|v| v.rsplit(',').next()));
+    let public = public_url
+        .split_once("://")
+        .map(|(_, r)| r.trim_end_matches('/').to_ascii_lowercase());
+    [host, forwarded, public]
+        .iter()
+        .any(|c| c.as_deref() == Some(got.as_str()))
 }
 
 /// Origin check on POSTs from browsers plus conservative response headers.
@@ -1389,18 +1403,61 @@ mod tests {
             h
         };
         let public = "https://sec.sgd.ovh";
-        // Same site through the proxy (Host is what Caddy forwards).
+        // Browsers say it themselves; whatever Host the proxy forwards is irrelevant.
+        for host in ["sec.sgd.ovh", "127.0.0.1:8099", "upstream.internal"] {
+            assert!(
+                same_origin(
+                    &hdr(&[
+                        ("sec-fetch-site", "same-origin"),
+                        ("origin", "https://sec.sgd.ovh"),
+                        ("host", host)
+                    ]),
+                    public
+                ),
+                "{host}"
+            );
+        }
+        // Anything but same-origin is refused, even if Origin looks right.
+        for site in ["cross-site", "same-site", "none", ""] {
+            assert!(
+                !same_origin(
+                    &hdr(&[
+                        ("sec-fetch-site", site),
+                        ("origin", "https://sec.sgd.ovh"),
+                        ("host", "sec.sgd.ovh")
+                    ]),
+                    public
+                ),
+                "{site}"
+            );
+        }
+        // No Sec-Fetch-Site (old browser, plain http): Origin must name this hub.
         assert!(same_origin(
             &hdr(&[("origin", "https://sec.sgd.ovh"), ("host", "sec.sgd.ovh")]),
             public
         ));
-        // Or matching the configured public URL even if Host is rewritten.
+        assert!(same_origin(
+            &hdr(&[
+                ("origin", "http://10.0.0.5:8099"),
+                ("host", "10.0.0.5:8099")
+            ]),
+            ""
+        ));
+        // Host rewritten by the proxy: the public URL or X-Forwarded-Host still match.
         assert!(same_origin(
             &hdr(&[
                 ("origin", "https://sec.sgd.ovh"),
                 ("host", "127.0.0.1:8099")
             ]),
             public
+        ));
+        assert!(same_origin(
+            &hdr(&[
+                ("origin", "https://sec.sgd.ovh"),
+                ("host", "127.0.0.1:8099"),
+                ("x-forwarded-host", "evil.example, sec.sgd.ovh")
+            ]),
+            ""
         ));
         // Another site, "null", odd values and look-alikes are refused.
         for bad in [
@@ -1416,16 +1473,17 @@ mod tests {
                 "{bad}"
             );
         }
-        // No Origin: fine unless the browser says it is cross-site.
-        assert!(same_origin(&hdr(&[]), public));
-        assert!(same_origin(
-            &hdr(&[("sec-fetch-site", "same-origin")]),
-            public
-        ));
+        // A forwarded host that is not the last entry does not count.
         assert!(!same_origin(
-            &hdr(&[("sec-fetch-site", "cross-site")]),
+            &hdr(&[
+                ("origin", "https://evil.example"),
+                ("host", "127.0.0.1:8099"),
+                ("x-forwarded-host", "evil.example, sec.sgd.ovh")
+            ]),
             public
         ));
+        // Neither header: not a browser page.
+        assert!(same_origin(&hdr(&[]), public));
     }
 
     #[test]

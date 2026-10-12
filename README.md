@@ -1,4 +1,4 @@
-# SN Secure
+﻿# SN Secure
 
 [![CI](https://github.com/vnscorpion/sn-security/actions/workflows/ci.yml/badge.svg)](https://github.com/vnscorpion/sn-security/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#giấy-phép)
@@ -105,7 +105,7 @@ Hub điều khiển được mọi VPS, nên đăng nhập hub được bảo v�
 - **Passkey cần HTTPS**: đặt `public_url = "https://..."` trong `/etc/snhub/snhub.toml` (đúng tên miền bạn mở hub). Chỉ hỗ trợ khoá ES256 (hầu hết thiết bị hiện nay), không đòi chứng thực thiết bị.
 - **Mật khẩu**: băm Argon2id; tối thiểu 10 ký tự; đổi ngay trong trang Bảo mật (đăng xuất mọi phiên khác). Mọi thay đổi (đổi mật khẩu, thêm/xoá passkey, bật/tắt 2FA, mã khôi phục mới) đều hỏi lại mật khẩu hiện tại.
 - **Chống dò mật khẩu**: sai quá 5 lần (tính ngay khi nhận yêu cầu, kể cả gửi song song) thì khoá theo địa chỉ IP 30 giây, tăng gấp đôi mỗi lần sai tiếp (tối đa 15 phút); nếu bị dò từ nhiều nơi cùng lúc, hub tạm dừng mọi đăng nhập vài phút. Hub lấy IP khách từ mục cuối của `X-Forwarded-For` (mục do reverse proxy của bạn thêm; IPv6 gộp theo /64), nên chỉ để hub sau đúng một proxy tin cậy (Caddy/Nginx), đừng mở cổng hub thẳng ra internet. Nếu bị dò từ nhiều nơi cùng lúc, bước nhập mật khẩu tạm dừng vài phút, còn bước hai của người đã đúng mật khẩu vẫn vào được.
-- **Phiên đăng nhập** hết hạn sau 24 giờ (hoặc 8 giờ không hoạt động), cookie `HttpOnly`, `SameSite=Strict`, thêm `Secure` khi `public_url` là HTTPS; trang Bảo mật liệt kê các phiên đang mở và nhật ký đăng nhập gần đây để đăng xuất từng phiên. Các yêu cầu ghi từ trình duyệt phải cùng nguồn (kiểm tra `Origin`).
+- **Phiên đăng nhập** hết hạn sau 24 giờ (hoặc 8 giờ không hoạt động), cookie `HttpOnly`, `SameSite=Strict`, thêm `Secure` khi `public_url` là HTTPS; trang Bảo mật liệt kê các phiên đang mở và nhật ký đăng nhập gần đây để đăng xuất từng phiên. Các yêu cầu ghi từ trình duyệt phải cùng nguồn (trình duyệt tự khai `Sec-Fetch-Site`, hoặc so `Origin` với `Host`/`X-Forwarded-Host`/`public_url`).
 
 Hub cập nhật từ bản trước: mật khẩu cũ vẫn dùng được (kể cả kiểu băm cũ); đặt lại bằng `set-admin-password` sẽ chuyển sang Argon2id.
 
