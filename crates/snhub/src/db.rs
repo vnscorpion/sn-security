@@ -54,7 +54,18 @@ CREATE TABLE IF NOT EXISTS decisions (
 
 pub struct Db {
     pub(crate) conn: Connection,
+    /// Per-agent report budget, `(tokens, last refill)`: see `take_report_token`.
+    report_budget: std::cell::RefCell<std::collections::HashMap<String, (f64, i64)>>,
 }
+
+/// Reports a VPS may send back to back: a queue flushed after the hub was
+/// unreachable is up to 50 at once.
+const REPORT_BURST: f64 = 60.0;
+/// After that, one report per this many seconds on average. A VPS reports every
+/// 5–15 minutes, plus one now and then when an incident is being handled.
+const REPORT_REFILL_SECS: f64 = 10.0;
+/// Reports kept per agent. The UI reads only the latest one.
+const REPORTS_KEPT: i64 = 10;
 
 /// One row of the decisions log: `(agent_id, who, action, detail, ts)`.
 pub type Decision = (String, String, String, String, i64);
@@ -69,8 +80,41 @@ pub struct AgentRow {
     pub mode: String,
 }
 
+/// The database holds AI API keys, the TOTP secret and enrollment tokens: create
+/// it readable by its owner only (SQLite gives its `-wal`/`-shm` files the same
+/// mode), and tighten one that an older version left readable, if it is ours.
+#[cfg(unix)]
+fn private_db_file(path: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("creating db {}", path.display()))?;
+    // Owner of /proc/self is this process's effective uid.
+    let me = std::fs::metadata("/proc/self").map(|m| m.uid()).ok();
+    let mut files = vec![path.to_path_buf()];
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut p = path.as_os_str().to_owned();
+        p.push(suffix);
+        files.push(p.into());
+    }
+    for f in files {
+        let Ok(meta) = std::fs::metadata(&f) else {
+            continue;
+        };
+        if meta.mode() & 0o077 != 0 && me.is_none_or(|uid| uid == meta.uid()) {
+            let _ = std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+    Ok(())
+}
+
 impl Db {
     pub fn open(path: &std::path::Path) -> Result<Db> {
+        #[cfg(unix)]
+        private_db_file(path)?;
         let conn =
             Connection::open(path).with_context(|| format!("opening db {}", path.display()))?;
         conn.pragma_update(None, "journal_mode", "WAL").ok();
@@ -81,7 +125,10 @@ impl Db {
         conn.execute_batch(crate::db_auth::SCHEMA_AUTH)
             .context("applying auth schema")?;
         crate::db_auth::migrate_auth(&conn).context("migrating auth schema")?;
-        Ok(Db { conn })
+        Ok(Db {
+            conn,
+            report_budget: std::cell::RefCell::default(),
+        })
     }
 
     // ---- enrollment -------------------------------------------------------
@@ -180,10 +227,27 @@ impl Db {
         // history would only grow the database.
         self.conn.execute(
             "DELETE FROM reports WHERE agent_id = ?1 AND id NOT IN \
-             (SELECT id FROM reports WHERE agent_id = ?1 ORDER BY id DESC LIMIT 100)",
-            params![agent_id],
+             (SELECT id FROM reports WHERE agent_id = ?1 ORDER BY id DESC LIMIT ?2)",
+            params![agent_id, REPORTS_KEPT],
         )?;
         Ok(())
+    }
+
+    /// May this agent's report be stored now? A token bucket per agent: a burst
+    /// of [`REPORT_BURST`], then one per [`REPORT_REFILL_SECS`], so an enrolled
+    /// VPS cannot flood the hub with reports while a queue flushed after an
+    /// outage still goes through. Only for a report whose signature checked out.
+    pub fn take_report_token(&self, agent_id: &str, now: i64) -> bool {
+        let mut m = self.report_budget.borrow_mut();
+        let (tokens, at) = m.entry(agent_id.to_string()).or_insert((REPORT_BURST, now));
+        let refill = (now - *at).max(0) as f64 / REPORT_REFILL_SECS;
+        *tokens = (*tokens + refill).min(REPORT_BURST);
+        *at = now;
+        if *tokens < 1.0 {
+            return false;
+        }
+        *tokens -= 1.0;
+        true
     }
 
     pub fn latest_report(&self, agent_id: &str) -> Result<Option<ReportBody>> {
@@ -388,7 +452,9 @@ fn agent_id(name: &str) -> String {
         })
         .collect();
     let slug = slug.trim_matches('-');
-    let mut buf = [0u8; 3];
+    // 128 random bits: the id is all an outsider needs to ask for this VPS's
+    // desired state. Ids given out earlier (3 bytes) keep working.
+    let mut buf = [0u8; 16];
     rand::rngs::OsRng.fill_bytes(&mut buf);
     format!(
         "{}-{}",
@@ -411,6 +477,40 @@ mod tests {
             jobs_seq,
             ..DesiredBody::default()
         }
+    }
+
+    #[test]
+    fn reports_get_a_burst_then_a_steady_rate_per_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let burst = REPORT_BURST as usize;
+        let ok = (0..burst + 5)
+            .filter(|_| db.take_report_token("a", 1_000))
+            .count();
+        assert_eq!(ok, burst);
+        // Another agent has its own budget.
+        assert!(db.take_report_token("b", 1_000));
+        // It refills slowly, up to the burst.
+        assert!(!db.take_report_token("a", 1_000 + REPORT_REFILL_SECS as i64 - 1));
+        assert!(db.take_report_token("a", 1_000 + REPORT_REFILL_SECS as i64));
+        assert!(!db.take_report_token("a", 1_000 + REPORT_REFILL_SECS as i64));
+        let later = 1_000_000;
+        let ok = (0..burst + 5)
+            .filter(|_| db.take_report_token("a", later))
+            .count();
+        assert_eq!(ok, burst);
+    }
+
+    #[test]
+    fn new_agent_ids_are_long_random_and_keep_the_name() {
+        let a = agent_id("Web 01!");
+        let b = agent_id("Web 01!");
+        assert_ne!(a, b);
+        let (slug, rand) = a.rsplit_once('-').unwrap();
+        assert_eq!(slug, "web-01");
+        assert_eq!(rand.len(), 32);
+        assert!(rand.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(agent_id("!!!").starts_with("vps-"));
     }
 
     #[test]

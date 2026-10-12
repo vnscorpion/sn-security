@@ -29,10 +29,15 @@ pub async fn post_report(State(st): State<Arc<AppState>>, body: String) -> impl 
         Err(_) => return (StatusCode::BAD_REQUEST, "bad json").into_response(),
     };
 
-    let db = st.db.lock().expect("db mutex");
-    let pubkey = match db.agent_pubkey(&signed.key_id) {
-        Ok(Some(pk)) => pk,
-        _ => return (StatusCode::UNAUTHORIZED, "unknown agent").into_response(),
+    // The lock is held only to read the key, and again below for the writes:
+    // checking the signature over a large body and parsing it happen without it.
+    let (pubkey, last) = {
+        let db = st.db.lock().expect("db mutex");
+        let pubkey = match db.agent_pubkey(&signed.key_id) {
+            Ok(Some(pk)) => pk,
+            _ => return (StatusCode::UNAUTHORIZED, "unknown agent").into_response(),
+        };
+        (pubkey, db.last_report_seq(&signed.key_id).unwrap_or(0))
     };
     let vk = match crypto::parse_pubkey(&pubkey) {
         Ok(k) => k,
@@ -48,12 +53,20 @@ pub async fn post_report(State(st): State<Arc<AppState>>, body: String) -> impl 
     }
 
     // Replay / monotonicity: ignore an already-seen or older seq idempotently.
-    let last = db.last_report_seq(&env.agent_id).unwrap_or(0);
     if env.seq <= last {
         return (StatusCode::OK, "duplicate").into_response();
     }
-
     let body_json = serde_json::to_string(&env.body).unwrap_or_default();
+
+    let db = st.db.lock().expect("db mutex");
+    // Again under the lock: a concurrent report may have moved it on.
+    if env.seq <= db.last_report_seq(&env.agent_id).unwrap_or(0) {
+        return (StatusCode::OK, "duplicate").into_response();
+    }
+    // Not stored, so the agent keeps it queued and sends it again later.
+    if !db.take_report_token(&env.agent_id, now()) {
+        return (StatusCode::TOO_MANY_REQUESTS, "too many reports").into_response();
+    }
     if let Err(e) = db.record_report(&env.agent_id, env.seq, now(), &env.body, &body_json) {
         tracing::error!("record_report: {e:#}");
         return (StatusCode::INTERNAL_SERVER_ERROR, "store failed").into_response();
@@ -102,11 +115,14 @@ pub async fn post_report(State(st): State<Arc<AppState>>, body: String) -> impl 
             }
         }
     }
-    drop(db);
-    if analyse_now {
-        let st2 = Arc::clone(&st);
-        tokio::task::spawn_blocking(move || analysis::run(&st2, &agent_id));
+    // Claimed while the lock is still held, so two reports cannot both start one.
+    if analyse_now && let Err(e) = analysis::start(&st, &db, &agent_id, at) {
+        tracing::info!("analysis for {agent_id} not started: {e}");
+        if e == analysis::Refused::Busy {
+            analysis::note_busy(&db, &agent_id, at);
+        }
     }
+    drop(db);
     (StatusCode::OK, "ok").into_response()
 }
 

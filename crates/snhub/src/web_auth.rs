@@ -120,21 +120,158 @@ fn check_password(st: &AppState, pw: &str) -> bool {
 }
 
 /// At most this many password hashes run at once (each takes ~19 MiB and some
-/// CPU); the rest wait their turn instead of piling up in the thread pool.
+/// CPU); the rest wait their turn instead of piling up in the thread pool, and
+/// past `auth::MAX_HASH_WAITERS` waiting a new one is turned away (`HASH_QUEUE`).
 const HASH_SLOTS: usize = 3;
 
-async fn check_password_blocking(st: &Arc<AppState>, pw: String) -> bool {
+static HASH_QUEUE: auth::HashQueue = auth::HashQueue::new();
+
+/// Check the password once `ticket` (a place in the queue) gets a slot.
+async fn check_password_queued(
+    st: &Arc<AppState>,
+    pw: String,
+    ticket: auth::HashTicket<'_>,
+) -> bool {
     static GATE: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
     let gate = GATE.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(HASH_SLOTS)));
     let Ok(permit) = Arc::clone(gate).acquire_owned().await else {
         return false;
     };
+    drop(ticket);
     let st2 = Arc::clone(st);
     let ok = tokio::task::spawn_blocking(move || check_password(&st2, &pw))
         .await
         .unwrap_or(false);
     drop(permit);
     ok
+}
+
+/// For a signed-in session: its re-checks are bounded by the limiter, so they
+/// always get a place in the queue.
+async fn check_password_blocking(st: &Arc<AppState>, pw: String) -> bool {
+    check_password_queued(st, pw, HASH_QUEUE.join()).await
+}
+
+fn busy_page() -> Response {
+    let mut r = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        login_card(
+            "Đăng nhập",
+            html! {
+                h1 { "Hub đang bận" }
+                p { "Đang có quá nhiều lượt đăng nhập cùng lúc. Thử lại sau vài giây." }
+                p { a href="/login" { "← Quay lại" } }
+            },
+        ),
+    )
+        .into_response();
+    r.headers_mut().insert(
+        header::RETRY_AFTER,
+        axum::http::HeaderValue::from_static("5"),
+    );
+    r
+}
+
+/// The key that signs known-device cookies, derived from the hub's own key so
+/// it needs no storage and changes when that key does.
+fn device_secret(st: &AppState) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"snhub-known-device-v1|");
+    h.update(st.hubkey.signing.to_bytes());
+    h.finalize().into()
+}
+
+/// Has this browser signed in to this hub before (and since the last sign-out
+/// of every session from the command line)?
+fn known_device(st: &AppState, headers: &HeaderMap, at: i64) -> bool {
+    auth::device_from_headers(headers).is_some_and(|v| {
+        auth::device_cookie_ok(&device_secret(st), &v, at, st.sessions.revoked_at())
+    })
+}
+
+/// Pick up a sign-out of every session ordered from the command line
+/// (`set-admin-password`, `reset-2fa` write the time to the database): read it
+/// at most every few seconds, then end every older session and half-finished
+/// login.
+fn refresh_revocation(st: &AppState, at: i64) {
+    if !st.sessions.revocation_due(at) {
+        return;
+    }
+    let Some(revoked) = st.db.lock().ok().map(|d| d.sessions_revoked_at()) else {
+        return;
+    };
+    if revoked > st.sessions.revoked_at() {
+        let ended = st.sessions.revoke_through(revoked);
+        st.pending.drop_through(revoked);
+        if ended > 0 {
+            tracing::warn!(
+                "snhub-auth sessions-revoked: {ended} web session(s) ended by a password or 2FA reset from the command line"
+            );
+        }
+    }
+}
+
+/// Is this a live session? Every route that needs a signed-in admin asks this.
+pub(crate) fn session_valid(st: &AppState, token: &str) -> bool {
+    let at = now();
+    refresh_revocation(st, at);
+    st.sessions.valid(token, at)
+}
+
+/// A wrong answer behind a right password. Too many of them, from any number of
+/// addresses, pause that step for everyone and drop every half-finished login:
+/// whoever is answering already has the password (or a session).
+fn factor_failed(st: &AppState, at: i64) {
+    if let Some(secs) = st.limiter.wrong_factor(at) {
+        let dropped = st.pending.drop_through(i64::MAX);
+        tracing::error!(
+            "snhub-auth second-factor-flood: too many wrong second factors or password re-checks; \
+             those steps are paused for {secs} s and {dropped} half-finished login(s) dropped. \
+             The admin password is likely known to someone else: set a new one with \
+             `snhub set-admin-password` (restarting snhub lifts the pause)."
+        );
+        if let Ok(db) = st.db.lock() {
+            db.log_login(
+                at,
+                "-",
+                false,
+                "tạm khoá bước 2",
+                &format!("quá nhiều lần sai sau bước mật khẩu, khoá {secs} giây"),
+            );
+        }
+    }
+}
+
+/// The outcome of asking for the current password again.
+pub(crate) enum Recheck {
+    Right,
+    Wrong,
+    /// Too many tries: wait this many seconds.
+    Wait(i64),
+}
+
+/// Check the current password on a signed-in page, with the limiter. A wrong
+/// one counts towards the all-keys pause behind the password.
+pub(crate) async fn recheck_password(
+    st: &Arc<AppState>,
+    headers: &HeaderMap,
+    pw: String,
+) -> Recheck {
+    if pw.is_empty() {
+        return Recheck::Wrong;
+    }
+    let at = now();
+    let key = auth::limiter_key("pw", &auth::client_ip(headers));
+    if let Err(wait) = st.limiter.begin(&key, at) {
+        return Recheck::Wait(wait);
+    }
+    if pw.len() > 1024 || !check_password_blocking(st, pw).await {
+        factor_failed(st, at);
+        return Recheck::Wrong;
+    }
+    st.limiter.success(&key);
+    Recheck::Right
 }
 
 fn redirect_with(location: &str, cookies: &[String]) -> Response {
@@ -206,6 +343,13 @@ fn finish_login(st: &AppState, headers: &HeaderMap, method: &str, note: &str) ->
         auth::cookie(auth::COOKIE, &token, 86_400, sec),
         // The half-finished login is over.
         auth::cookie(PENDING_COOKIE, "", 0, sec),
+        // This browser is known from now on (see `known_device`).
+        auth::cookie(
+            auth::DEVICE_COOKIE,
+            &auth::device_cookie(&device_secret(st), at),
+            auth::DEVICE_TTL_SECS,
+            sec,
+        ),
     ]
 }
 
@@ -362,10 +506,34 @@ pub async fn login_post(
     let at = now();
     let ip = auth::client_ip(&headers);
     let key = auth::limiter_key("ip", &ip);
-    if let Err(wait) = st.limiter.begin(&key, at) {
+    refresh_revocation(&st, at);
+    // A browser that has signed in here before is not held by the all-keys pause
+    // (only by its own limit) and does not queue behind a burst of guesses.
+    let known = known_device(&st, &headers, at);
+    let ticket = if known {
+        HASH_QUEUE.join()
+    } else {
+        match HASH_QUEUE.try_join() {
+            Some(t) => t,
+            None => return busy_page(),
+        }
+    };
+    let started = if known {
+        st.limiter.begin_known_device(&key, at)
+    } else {
+        st.limiter.begin(&key, at)
+    };
+    if let Err(wait) = started {
         return wait_page(wait);
     }
-    if f.password.len() > 1024 || !check_password_blocking(&st, f.password).await {
+    // Longer than any password can be: counted against this address by `begin`,
+    // but not towards the all-keys pause, which it would trip without the cost
+    // of a hash.
+    if f.password.len() > 1024 {
+        log_fail(&st, &ip, "password", "sai mật khẩu");
+        return redirect_with("/login?err=pw", &[]);
+    }
+    if !check_password_queued(&st, f.password, ticket).await {
         st.limiter.wrong(at);
         log_fail(&st, &ip, "password", "sai mật khẩu");
         return redirect_with("/login?err=pw", &[]);
@@ -385,7 +553,14 @@ pub async fn login_post(
     if !enrolled {
         return redirect_with("/", &finish_login(&st, &headers, "password", ""));
     }
-    // Password right, factor still to come: no session yet.
+    // Password right, factor still to come: no session yet, and only so many
+    // such logins an hour.
+    if let Err(wait) = st.limiter.begin_pending(at) {
+        tracing::warn!(
+            "snhub-auth second-factor-paused ip={ip}: right password, but the second step is paused or too many logins are waiting for it"
+        );
+        return wait_page(wait);
+    }
     let token = st.pending.create(&ip, &user_agent(&headers), at);
     redirect_with(
         "/login/2fa",
@@ -578,7 +753,7 @@ pub async fn login_2fa_post(
         };
         return redirect_with("/", &finish_login(&st, &headers, method, &note));
     }
-    st.limiter.wrong(at);
+    factor_failed(&st, at);
     log_fail(&st, &ip, method, "mã sai");
     if st.pending.fail(&ptoken) == 0 {
         return redirect_with(
@@ -693,7 +868,7 @@ pub async fn login_passkey_verify(
             json_with_cookies(StatusCode::OK, &json!({ "ok": true }), &cookies)
         }
         Err(e) => {
-            st.limiter.wrong(at);
+            factor_failed(&st, at);
             log_fail(&st, &ip, "password+passkey", &e);
             if st.pending.fail(&ptoken) == 0 {
                 return json_with_cookies(
@@ -712,7 +887,7 @@ pub async fn login_passkey_verify(
 // ---------------------------------------------------------------------------
 
 fn session_token(st: &AppState, headers: &HeaderMap) -> Option<String> {
-    auth::session_from_headers(headers).filter(|t| st.sessions.valid(t, now()))
+    auth::session_from_headers(headers).filter(|t| session_valid(st, t))
 }
 
 fn to_login() -> Response {
@@ -817,10 +992,20 @@ pub async fn security_page(
         ))
     });
     let enrolled = totp_on || !passkeys.is_empty();
+    let factor_paused = st.limiter.factor_paused(at);
 
     let body = html! {
         h1 { "Bảo mật đăng nhập" }
         p class="sub" { "Mật khẩu, xác thực hai bước (ứng dụng hoặc passkey), mã khôi phục và các phiên đang mở." }
+        @if let Some(secs) = factor_paused {
+            div class="note" style="border-left-color:var(--bad);color:var(--fg)" {
+                b { "Đã tạm khoá bước sau mật khẩu (còn " (secs / 60 + 1) " phút)." }
+                " Có quá nhiều lần nhập sai mã xác thực hoặc mật khẩu hiện tại, nên nhiều khả năng mật khẩu quản trị đã lộ. "
+                "Trong lúc khoá, không đăng nhập bằng bước hai và không đổi cài đặt cần mật khẩu được. Trên máy chủ hub, bằng root: "
+                code { "sudo snhub set-admin-password --password '...'" }
+                " (đặt mật khẩu mới và đăng xuất mọi phiên), rồi " code { "systemctl restart snhub" } " để gỡ khoá."
+            }
+        }
         // While a new authenticator secret is on screen the message belongs next to
         // its form (the page jumps there), not at the top where it would be scrolled away.
         @if !q.msg.is_empty() && pending_totp.is_none() { div class="note" { (q.msg) } }
@@ -944,7 +1129,7 @@ pub async fn security_page(
                     button type="submit" { "Tạo mã khôi phục mới" }
                 }
             }
-            p class="help" { "Mất hết cả mã? Trên máy chủ hub, bằng root: " code { "sudo -u snhub snhub reset-2fa" } " (xoá mọi cách xác thực thứ hai; mật khẩu giữ nguyên)." }
+            p class="help" { "Mất hết cả mã? Trên máy chủ hub, bằng root: " code { "sudo -u snhub snhub reset-2fa" } " (xoá mọi cách xác thực thứ hai và đăng xuất mọi phiên; mật khẩu giữ nguyên)." }
         }
         }
 
@@ -1016,13 +1201,8 @@ pub async fn change_password(
         return to_login();
     };
     let at = now();
-    let key = auth::limiter_key("pw", &auth::client_ip(&headers));
-    if let Err(wait) = st.limiter.begin(&key, at) {
-        return wait_page(wait);
-    }
-    if !check_password_blocking(&st, f.current).await {
-        st.limiter.wrong(at);
-        return back("Mật khẩu hiện tại không đúng.");
+    if let Some(r) = confirm_password(&st, &headers, f.current).await {
+        return r;
     }
     if f.new != f.confirm {
         return back("Hai lần nhập mật khẩu mới không giống nhau.");
@@ -1043,7 +1223,6 @@ pub async fn change_password(
     if saved.is_err() {
         return back("Không lưu được mật khẩu mới.");
     }
-    st.limiter.success(&key);
     let ended = st.sessions.remove_all_except(&tok);
     if let Ok(db) = st.db.lock() {
         db.log_login(
@@ -1080,17 +1259,11 @@ fn factors_changed(st: &AppState, keep: &str) {
 
 /// Check the current password for a sensitive change, with the limiter.
 async fn confirm_password(st: &Arc<AppState>, headers: &HeaderMap, pw: String) -> Option<Response> {
-    let at = now();
-    let key = auth::limiter_key("pw", &auth::client_ip(headers));
-    if let Err(wait) = st.limiter.begin(&key, at) {
-        return Some(wait_page(wait));
+    match recheck_password(st, headers, pw).await {
+        Recheck::Right => None,
+        Recheck::Wrong => Some(back("Mật khẩu hiện tại không đúng.")),
+        Recheck::Wait(wait) => Some(wait_page(wait)),
     }
-    if pw.len() > 1024 || !check_password_blocking(st, pw).await {
-        st.limiter.wrong(at);
-        return Some(back("Mật khẩu hiện tại không đúng."));
-    }
-    st.limiter.success(&key);
-    None
 }
 
 // ---- authenticator app ---------------------------------------------------
@@ -1317,18 +1490,18 @@ pub async fn passkey_register_options(
         );
     };
     let at = now();
-    let key = auth::limiter_key("pw", &auth::client_ip(&headers));
-    if let Err(wait) = st.limiter.begin(&key, at) {
-        return jerr(
-            StatusCode::TOO_MANY_REQUESTS,
-            &format!("Thử quá nhiều lần, chờ {wait} giây."),
-        );
+    match recheck_password(&st, &headers, req.password).await {
+        Recheck::Right => {}
+        Recheck::Wrong => {
+            return jerr(StatusCode::UNAUTHORIZED, "Mật khẩu hiện tại không đúng.");
+        }
+        Recheck::Wait(wait) => {
+            return jerr(
+                StatusCode::TOO_MANY_REQUESTS,
+                &format!("Thử quá nhiều lần, chờ {wait} giây."),
+            );
+        }
     }
-    if req.password.len() > 1024 || !check_password_blocking(&st, req.password).await {
-        st.limiter.wrong(at);
-        return jerr(StatusCode::UNAUTHORIZED, "Mật khẩu hiện tại không đúng.");
-    }
-    st.limiter.success(&key);
     let (user, exclude) = {
         let db = st.db.lock().expect("db");
         (db.webauthn_user().unwrap_or_default(), db.passkey_ids())

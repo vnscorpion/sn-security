@@ -120,7 +120,7 @@ pub(crate) fn shell(title: &str, body: Markup) -> Markup {
 
 pub(crate) fn guard(st: &AppState, headers: &HeaderMap) -> Option<Response> {
     match auth::session_from_headers(headers) {
-        Some(tok) if st.sessions.valid(&tok, now()) => None,
+        Some(tok) if crate::web_auth::session_valid(st, &tok) => None,
         _ => Some(Redirect::to("/login").into_response()),
     }
 }
@@ -764,7 +764,8 @@ pub struct AgentQuery {
     /// A one-line result to show after an action.
     #[serde(default)]
     msg: String,
-    /// Which card shows `msg`: `scan` (malware scan / ClamAV) or the AI card.
+    /// Which card shows `msg`: `scan` (malware scan / ClamAV), `ctl` (the
+    /// controls) or the AI card.
     #[serde(default)]
     at: String,
 }
@@ -918,8 +919,11 @@ pub async fn agent_detail(
             }
         }
 
-        div class="card" {
+        div class="card" id="ctl" {
             h2 { "Điều khiển" }
+            @if aq.at == "ctl" && !aq.msg.trim().is_empty() {
+                div class="note" style="border-left-color:var(--bad);color:var(--fg)" { (aq.msg.trim()) }
+            }
             p class="help" { "Mọi thao tác áp dụng ở lần quét kế tiếp của VPS (tối đa ~15 phút), vì VPS tự gọi về hub chứ hub không gọi vào VPS." }
             div class="ctrls" {
                 form method="post" action={"/agent/" (agent.id) "/mode"} {
@@ -960,7 +964,7 @@ pub async fn agent_detail(
             }
             p class="help" { "“Hoàn tác” gỡ chặn IP và thả nhốt tiến trình do agent đặt; không đụng tới việc của AI." }        }
 
-        (crate::web_ai::ai_card(&agent.id, report.as_ref(), &ai_data, if aq.at == "scan" { "" } else { aq.msg.trim() }))
+        (crate::web_ai::ai_card(&agent.id, report.as_ref(), &ai_data, if aq.at == "scan" || aq.at == "ctl" { "" } else { aq.msg.trim() }))
 
         div class="card" id="bans" {
             h2 { "IP đang bị chặn (" (bans.len() + hidden) ")" }
@@ -1248,10 +1252,13 @@ pub async fn ban_post(
         return r;
     }
     let ttl = f.ttl.unwrap_or(3600).min(24 * 3600);
-    let ip = f.ip.trim().to_string();
-    if ip.is_empty() {
+    if f.ip.trim().is_empty() {
         return Redirect::to(&format!("/agent/{id}")).into_response();
     }
+    // Only the canonical text of one address goes into the order the VPS runs.
+    let Some(ip) = ban_target(&f.ip) else {
+        return control_msg(&id, &bad_ip_msg(&f.ip, false));
+    };
     let ts = now();
     let key = key_of(&ip);
     let db = st.db.lock().expect("db");
@@ -1282,10 +1289,12 @@ pub async fn unban_post(
     if let Some(r) = guard(&st, &headers) {
         return r;
     }
-    let ip = f.ip.trim().to_string();
-    if ip.is_empty() {
+    if f.ip.trim().is_empty() {
         return Redirect::to(&format!("/agent/{id}")).into_response();
     }
+    let Some(ip) = unban_target(&f.ip) else {
+        return control_msg(&id, &bad_ip_msg(&f.ip, true));
+    };
     let key = key_of(&ip);
     let db = st.db.lock().expect("db");
     let _ = db.update_desired(&id, now(), "admin", "unban", &ip, |d| {
@@ -1475,6 +1484,66 @@ pub async fn add_vps_post(
         .into_string(),
     )
     .into_response()
+}
+
+/// Back to the VPS page with a message in its "Điều khiển" card.
+fn control_msg(id: &str, msg: &str) -> Response {
+    Redirect::to(&format!("/agent/{id}?msg={}&at=ctl#ctl", urlenc(msg))).into_response()
+}
+
+fn bad_ip_msg(input: &str, unban: bool) -> String {
+    let shown: String = input
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(60)
+        .collect();
+    format!(
+        "Không {} “{shown}”: cần đúng một địa chỉ IP (vd: 203.0.113.7 hoặc 2001:db8::1){}, \
+         không phải địa chỉ nội bộ của máy (loopback), địa chỉ 0, multicast hay broadcast.",
+        if unban { "gỡ chặn" } else { "chặn" },
+        if unban {
+            ", hoặc một dải IPv6 /64 (vd: 2001:db8:1:2::/64)"
+        } else {
+            ""
+        }
+    )
+}
+
+/// One address a ban may name: not this machine, not "every address", not a
+/// group address.
+fn banable(ip: IpAddr) -> bool {
+    match snsec_common::net::normalize(ip) {
+        IpAddr::V4(v4) => {
+            !(v4.is_loopback() || v4.is_unspecified() || v4.is_multicast() || v4.is_broadcast())
+        }
+        IpAddr::V6(v6) => !(v6.is_loopback() || v6.is_unspecified() || v6.is_multicast()),
+    }
+}
+
+/// What an admin ban order stores: the canonical text of a single address, or
+/// `None` for anything else. The agent turns it into an nftables entry as root,
+/// so free text never goes into the order.
+fn ban_target(input: &str) -> Option<String> {
+    let ip = snsec_common::net::normalize(input.trim().parse::<IpAddr>().ok()?);
+    banable(ip).then(|| ip.to_string())
+}
+
+/// What an unban order stores: a single address as for a ban, or an IPv6 /64
+/// (the form the VPS reports its IPv6 bans in) rebuilt from the parsed network.
+fn unban_target(input: &str) -> Option<String> {
+    let s = input.trim();
+    if let Some(ip) = ban_target(s) {
+        return Some(ip);
+    }
+    let (addr, len) = s.split_once('/')?;
+    let v6 = addr.parse::<std::net::Ipv6Addr>().ok()?;
+    if len != "64" || v6.to_ipv4_mapped().is_some() {
+        return None;
+    }
+    let key = snsec_common::net::ban_key(IpAddr::V6(v6));
+    let net: std::net::Ipv6Addr = key.strip_suffix("/64")?.parse().ok()?;
+    banable(IpAddr::V6(net)).then_some(key)
 }
 
 // ---- ip check --------------------------------------------------------------
@@ -1797,6 +1866,69 @@ mod tests {
         assert_eq!(key_of("::ffff:203.0.113.7"), "203.0.113.7");
         // Non-addresses are compared verbatim (e.g. decision details).
         assert_eq!(key_of("hunt 1 ngày"), "hunt 1 ngày");
+    }
+
+    #[test]
+    fn a_ban_order_carries_only_the_canonical_text_of_one_address() {
+        assert_eq!(ban_target(" 203.0.113.7 ").as_deref(), Some("203.0.113.7"));
+        assert_eq!(
+            ban_target("2001:DB8:0:0:0:0:0:1").as_deref(),
+            Some("2001:db8::1")
+        );
+        assert_eq!(
+            ban_target("::ffff:203.0.113.7").as_deref(),
+            Some("203.0.113.7")
+        );
+        // A private address is the admin's call; it is only flagged elsewhere.
+        assert_eq!(ban_target("10.0.0.5").as_deref(), Some("10.0.0.5"));
+        for bad in [
+            "",
+            "hunt 1 ngày",
+            "1.2.3.4 }; flush ruleset; add element inet sn sn_ban4 { 5.6.7.8",
+            "1.2.3.4\n5.6.7.8",
+            "0.0.0.0/0",
+            "::/0",
+            "2001:db8::/32",
+            "203.0.113.0/24",
+            "127.0.0.1",
+            "::1",
+            "::ffff:127.0.0.1",
+            "0.0.0.0",
+            "::",
+            "255.255.255.255",
+            "224.0.0.1",
+            "ff02::1",
+        ] {
+            assert_eq!(ban_target(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn an_unban_order_also_takes_the_ipv6_64_the_vps_reports() {
+        assert_eq!(unban_target("203.0.113.7").as_deref(), Some("203.0.113.7"));
+        assert_eq!(
+            unban_target("2001:db8:1:2::/64").as_deref(),
+            Some("2001:db8:1:2::/64")
+        );
+        // Rebuilt from the parsed network, never passed through as typed.
+        assert_eq!(
+            unban_target(" 2001:DB8:1:2:aa::5/64 ").as_deref(),
+            Some("2001:db8:1:2::/64")
+        );
+        for bad in [
+            "2001:db8::/48",
+            "2001:db8::/0",
+            "203.0.113.0/64",
+            "::ffff:1.2.3.4/64",
+            "::/64",
+            "::1/64",
+            "ff02::/64",
+            "2001:db8::/64 ; flush ruleset",
+            "2001:db8::/064",
+            "x/64",
+        ] {
+            assert_eq!(unban_target(bad), None, "{bad}");
+        }
     }
 
     #[test]
