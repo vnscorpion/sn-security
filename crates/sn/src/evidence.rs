@@ -95,14 +95,10 @@ pub fn collect(state: &State) -> Result<Evidence> {
         .map(|p| {
             let ppid = proc::read_stat(p.pid).map_or(0, |s| s.ppid);
             let cmd = proc::cmdline(p.pid).join(" ");
-            let lower = cmd.to_ascii_lowercase();
-            let miner_hint = triage::MINER_HINTS.iter().any(|h| lower.contains(h))
-                || p.out_conns.iter().any(|c| {
-                    c.rsplit(':')
-                        .next()
-                        .and_then(|port| port.parse::<u16>().ok())
-                        .is_some_and(|port| triage::BAD_OUT_PORTS.contains(&port))
-                });
+            // `out_conns` holds only connections the process opened: the remote
+            // port of one a server accepted is the client's to choose.
+            let miner_hint = snsec_common::ai::has_miner_marker(&cmd)
+                || p.out_conns.iter().any(|c| triage::to_bad_port(c));
             EvProc {
                 pid: p.pid,
                 starttime: p.starttime,
@@ -170,7 +166,8 @@ pub fn collect(state: &State) -> Result<Evidence> {
 // Persistence
 // ---------------------------------------------------------------------------
 
-/// Triage already finds cron and `ld.so.preload` hits as `path: line` strings.
+/// Triage already finds cron and `ld.so.preload` hits as `path: line` strings,
+/// with secrets masked; masking again changes nothing.
 fn triage_persistence(hits: &[String]) -> Vec<EvPersist> {
     hits.iter()
         .map(|h| {
@@ -184,7 +181,7 @@ fn triage_persistence(hits: &[String]) -> Vec<EvPersist> {
                 kind: kind.into(),
                 path: util::ellipsize(path, 200),
                 line: util::ellipsize(&parse::redact(line), 240),
-                sha256: parse::line_sha(line),
+                sha256: parse::redacted_line_sha(line),
                 reason: "suspicious scheduled or preloaded entry".into(),
                 ..EvPersist::default()
             }
@@ -193,18 +190,22 @@ fn triage_persistence(hits: &[String]) -> Vec<EvPersist> {
 }
 
 /// A small regular file's text. A symlink, a device or a big file is skipped.
-fn read_small(path: &Path) -> Option<String> {
-    let meta = std::fs::symlink_metadata(path).ok()?;
-    if !meta.file_type().is_file() || meta.len() > RC_MAX_BYTES {
+/// Triage reads cron and `ld.so.preload` through this too.
+pub(crate) fn read_small(path: &Path) -> Option<String> {
+    read_small_owned(path).map(|(text, _)| text)
+}
+
+/// [`read_small`], with the owner of the file that was read (from the handle).
+pub(crate) fn read_small_owned(path: &Path) -> Option<(String, u32)> {
+    let f = open_regular(path)?;
+    let meta = f.metadata().ok()?;
+    if meta.len() > RC_MAX_BYTES {
         return None;
     }
     // Lossy: a single stray byte must not hide a whole start-up file from view.
     let mut bytes = Vec::new();
-    open_regular(path)?
-        .take(RC_MAX_BYTES)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    Some(String::from_utf8_lossy(&bytes).into_owned())
+    f.take(RC_MAX_BYTES).read_to_end(&mut bytes).ok()?;
+    Some((String::from_utf8_lossy(&bytes).into_owned(), meta.uid()))
 }
 
 fn home_persistence(users: &[EvUser]) -> Vec<EvPersist> {
@@ -413,9 +414,18 @@ fn ssh_logins() -> Vec<snsec_common::schema::EvLogin> {
         return Vec::new();
     };
     let len = f.metadata().map_or(0, |m| m.len());
-    let _ = f.seek(SeekFrom::Start(len.saturating_sub(AUTH_TAIL_BYTES)));
+    let start = len.saturating_sub(AUTH_TAIL_BYTES);
+    let _ = f.seek(SeekFrom::Start(start));
     let mut bytes = Vec::new();
     let _ = f.take(AUTH_TAIL_BYTES).read_to_end(&mut bytes);
+    // A line cut by the window could read as a different line: start at a whole one.
+    if start > 0 {
+        let first = bytes
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(bytes.len(), |i| i + 1);
+        bytes.drain(..first);
+    }
     parse::parse_ssh_logins(&String::from_utf8_lossy(&bytes))
 }
 
