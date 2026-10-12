@@ -164,6 +164,10 @@ pub struct HuntCfg {
     /// Longest a ClamAV scan may run before it is stopped.
     #[serde(default = "default_clamav_timeout_secs")]
     pub clamav_timeout_secs: u64,
+    /// An unchanged file is scanned by ClamAV again after this many days (new
+    /// signatures arrive daily); new and changed files are scanned every time.
+    #[serde(default = "default_clamav_rescan_days")]
+    pub clamav_rescan_days: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -183,6 +187,7 @@ impl Default for HuntCfg {
             clamav: ClamavMode::default(),
             clamav_min_ram_mb: default_clamav_min_ram_mb(),
             clamav_timeout_secs: default_clamav_timeout_secs(),
+            clamav_rescan_days: default_clamav_rescan_days(),
         }
     }
 }
@@ -248,6 +253,9 @@ fn default_clamav_min_ram_mb() -> u64 {
 }
 fn default_clamav_timeout_secs() -> u64 {
     1200
+}
+fn default_clamav_rescan_days() -> u32 {
+    7
 }
 
 impl Config {

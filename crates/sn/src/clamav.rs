@@ -11,8 +11,6 @@
 //! accepted for a file we asked it to scan, and signature names are restricted to
 //! a safe character set before they reach a report or a web page.
 
-use std::collections::HashSet;
-
 use serde::{Deserialize, Serialize};
 use snsec_common::schema::Finding;
 
@@ -44,41 +42,6 @@ pub fn sanitize_sig(sig: &str) -> Option<String> {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+' | '/'));
     ok.then(|| sig.to_string())
-}
-
-/// Parse the `--infected` output: lines of `path: Signature.Name FOUND`.
-///
-/// Only paths in `asked` are accepted. A file name can itself contain `": "` or
-/// ` FOUND`, so the line is split from the right and then checked against the
-/// list of files that were actually scanned.
-#[must_use]
-pub fn parse_detections(output: &str, asked: &HashSet<&str>) -> Vec<Detection> {
-    let mut out = Vec::new();
-    let mut seen: HashSet<(String, String)> = HashSet::new();
-    for line in output.lines() {
-        let Some(body) = line.strip_suffix(" FOUND") else {
-            continue;
-        };
-        let Some((path, sig)) = body.rsplit_once(": ") else {
-            continue;
-        };
-        if !asked.contains(path) {
-            continue;
-        }
-        // An unreadable name is still a detection ClamAV made on a file we asked
-        // about: keep it under a placeholder rather than lose it.
-        let sig = sanitize_sig(sig).unwrap_or_else(|| UNRECOGNIZED_SIG.to_string());
-        if seen.insert((path.to_string(), sig.clone())) {
-            out.push(Detection {
-                path: path.to_string(),
-                sig,
-            });
-            if out.len() >= MAX_DETECTIONS {
-                break;
-            }
-        }
-    }
-    out
 }
 
 /// How much to trust a signature: ClamAV's own heuristics and "potentially
@@ -364,91 +327,10 @@ pub fn update_units(freshclam: &str) -> (String, String) {
 mod tests {
     use super::*;
 
-    fn asked<'a>(paths: &[&'a str]) -> HashSet<&'a str> {
-        paths.iter().copied().collect()
-    }
-
-    #[test]
-    fn detections_are_read_from_found_lines() {
-        let out = "/home/a/x.php: Php.Webshell.C99-7 FOUND\n\
-                   /home/a/y.php: OK\n\
-                   WARNING: something\n\
-                   /home/b/z.php: Php.Trojan.Agent-1 FOUND\n";
-        let d = parse_detections(out, &asked(&["/home/a/x.php", "/home/b/z.php"]));
-        assert_eq!(
-            d,
-            vec![
-                Detection {
-                    path: "/home/a/x.php".into(),
-                    sig: "Php.Webshell.C99-7".into()
-                },
-                Detection {
-                    path: "/home/b/z.php".into(),
-                    sig: "Php.Trojan.Agent-1".into()
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn only_files_we_asked_about_are_accepted() {
-        // A path ClamAV was never given (or one crafted inside a file name).
-        let out = "/etc/passwd: Php.Evil FOUND\n/home/a/x.php: Php.Ok FOUND\n";
-        let d = parse_detections(out, &asked(&["/home/a/x.php"]));
-        assert_eq!(d.len(), 1);
-        assert_eq!(d[0].path, "/home/a/x.php");
-    }
-
-    #[test]
-    fn file_names_containing_the_separator_still_parse() {
-        let name = "/home/a/we: ird FOUND.php";
-        let out = format!("{name}: Php.X FOUND\n");
-        let d = parse_detections(&out, &asked(&[name]));
-        assert_eq!(d.len(), 1);
-        assert_eq!(d[0].path, name);
-        assert_eq!(d[0].sig, "Php.X");
-    }
-
-    #[test]
-    fn odd_signature_names_are_neutralised_and_repeats_are_dropped() {
-        let out = "/a.php: Sig With Space FOUND\n\
-                   /a.php: <b>x</b> FOUND\n\
-                   /a.php: Php.Good FOUND\n\
-                   /a.php: Php.Good FOUND\n";
-        let d = parse_detections(out, &asked(&["/a.php"]));
-        // Both odd names collapse into one placeholder; the repeat is dropped.
-        let sigs: Vec<&str> = d.iter().map(|x| x.sig.as_str()).collect();
-        assert_eq!(sigs, [UNRECOGNIZED_SIG, "Php.Good"]);
-        assert!(sanitize_sig(&"A".repeat(SIG_MAX + 1)).is_none());
-        assert!(sanitize_sig("").is_none());
-    }
-
-    #[test]
-    fn a_detection_with_an_unreadable_signature_name_is_kept_as_suspicious() {
-        let out = "/a.php: <script>x</script> FOUND\n";
-        let d = parse_detections(out, &asked(&["/a.php"]));
-        assert_eq!(d.len(), 1);
-        assert_eq!(d[0].sig, UNRECOGNIZED_SIG);
-        assert_eq!(verdict_for(&d[0].sig), ("suspicious", 70));
-    }
-
     #[test]
     fn child_process_text_loses_its_control_characters() {
         assert_eq!(clean_text("a\u{1b}[31mb\0c\nd"), "a [31mb c d");
         assert_eq!(tail_lines("ok\n\u{1b}[2Jboom\n", 1), "[2Jboom");
-    }
-
-    #[test]
-    fn the_number_of_detections_is_capped() {
-        let paths: Vec<String> = (0..MAX_DETECTIONS + 50)
-            .map(|i| format!("/f/{i}.php"))
-            .collect();
-        let out: String = paths
-            .iter()
-            .map(|p| format!("{p}: Php.X FOUND\n"))
-            .collect();
-        let set: HashSet<&str> = paths.iter().map(String::as_str).collect();
-        assert_eq!(parse_detections(&out, &set).len(), MAX_DETECTIONS);
     }
 
     #[test]

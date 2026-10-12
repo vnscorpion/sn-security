@@ -24,6 +24,7 @@ use nix::unistd::Pid;
 use snsec_common::schema::ClamavInfo;
 
 use crate::clamav::{self, Detection, InstallState, Step};
+use crate::clamav_cache;
 use crate::config::{ClamavMode, Config};
 use crate::state::State;
 use crate::sys::proc;
@@ -219,25 +220,47 @@ pub fn pick_engine(cfg: &Config, avail_mb: u64, now: i64) -> Pick {
 #[derive(Debug, Default)]
 pub struct ClamScan {
     pub engine: String,
+    /// Files ClamAV finished in this run.
     pub scanned: u64,
+    /// Unchanged files scanned recently enough to skip this time.
+    pub up_to_date: u64,
+    /// Files that were due but not reached before the time ran out.
+    pub pending: u64,
     pub detections: Vec<Detection>,
     /// Why it did not run, or what went wrong; empty when all is well.
     pub note: String,
 }
 
+/// What has been scanned, and in what state each file was (see `clamav_cache`).
+const SCANNED_RECORD: &str = "clamav-scanned.tsv";
+/// The record and ClamAV's output are a line per file; more than this is not ours.
+const RECORD_CAP: u64 = 64 * 1024 * 1024;
+/// One line of ClamAV output longer than this is not a result line.
+const LINE_CAP: usize = 64 * 1024;
+
 fn scan_command(engine: &Engine, mb: u64, list: &Path) -> Command {
     let mut cmd = match engine {
         Engine::Clamscan(bin) => {
             let mut c = Command::new(bin);
-            c.args(["--infected", "--no-summary"])
-                .arg(format!("--max-filesize={mb}M"))
-                .arg(format!("--max-scansize={}M", mb * 2));
+            // Every file's result is printed (not only the infected ones), so a run
+            // stopped at its time limit still tells which files it finished. The
+            // parsers for formats a PHP file never is stay off: less time, and less
+            // C code run as root on files users wrote.
+            c.args([
+                "--no-summary",
+                "--scan-pdf=no",
+                "--scan-ole2=no",
+                "--scan-mail=no",
+                "--scan-xmldocs=no",
+            ])
+            .arg(format!("--max-filesize={mb}M"))
+            .arg(format!("--max-scansize={}M", mb * 2));
             c
         }
         Engine::Clamdscan(bin) => {
             let mut c = Command::new(bin);
             // The daemon runs as its own user: pass it open files instead of paths.
-            c.args(["--fdpass", "--infected", "--no-summary"]);
+            c.args(["--fdpass", "--no-summary"]);
             c
         }
     };
@@ -247,7 +270,6 @@ fn scan_command(engine: &Engine, mb: u64, list: &Path) -> Command {
 
 struct ScanRun {
     status: Result<Option<ExitStatus>>,
-    stdout: String,
     stderr: String,
 }
 
@@ -280,13 +302,81 @@ fn run_scan(
     let status = run_with_timeout(&mut cmd, timeout_secs);
     Some(ScanRun {
         status,
-        stdout: read_capped(out_path),
         stderr: clamav::tail_lines(&read_capped(err_path), 1),
     })
 }
 
+/// The files ClamAV finished, read from its output one line at a time (a big
+/// scan's output is more than is worth holding as one string).
+fn finished_files(out_path: &Path, asked: &HashSet<&str>) -> Vec<clamav_cache::Done> {
+    use std::io::BufRead;
+    let Ok(f) = File::open(out_path) else {
+        return Vec::new();
+    };
+    let mut reader = std::io::BufReader::new(f.take(RECORD_CAP));
+    let mut done = Vec::new();
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        if buf.len() > LINE_CAP {
+            continue;
+        }
+        let line = String::from_utf8_lossy(&buf);
+        if let Some(d) = clamav_cache::parse_line(&line, asked) {
+            done.push(d);
+        }
+    }
+    done
+}
+
+fn load_record(state: &State) -> clamav_cache::Cache {
+    let mut text = String::new();
+    let opened = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(state.dir.join(SCANNED_RECORD));
+    if let Ok(f) = opened
+        && f.metadata().is_ok_and(|m| m.is_file())
+    {
+        let _ = f.take(RECORD_CAP).read_to_string(&mut text);
+    }
+    clamav_cache::parse(&text)
+}
+
+fn save_record(state: &State, cache: &clamav_cache::Cache) {
+    let path = state.dir.join(SCANNED_RECORD);
+    let tmp = state
+        .dir
+        .join(format!("{SCANNED_RECORD}.{}.tmp", std::process::id()));
+    let written = private_file(&tmp).and_then(|mut f| {
+        f.write_all(clamav_cache::render(cache).as_bytes())?;
+        f.sync_all()
+    });
+    if written.is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+fn write_list(path: &Path, files: &[&clamav_cache::FileInfo]) -> std::io::Result<()> {
+    let mut f = private_file(path)?;
+    for x in files {
+        writeln!(f, "{}", x.path)?;
+    }
+    f.flush()
+}
+
 /// Scan the files `sn hunt` selected. Never fails the hunt: any problem becomes
 /// a note and the heuristic results stand on their own.
+///
+/// Incremental (see `clamav_cache`): files flagged before, then new or changed
+/// ones, then unchanged ones due for a periodic rescan; a run that runs out of
+/// time keeps what it finished and the next one carries on.
 ///
 /// `skipped` counts files the caller could not hand over (a name that is not
 /// valid UTF-8, or past the cap), so partial coverage is said out loud.
@@ -294,7 +384,7 @@ fn run_scan(
 pub fn scan(
     cfg: &Config,
     state: &State,
-    files: &[String],
+    files: &[clamav_cache::FileInfo],
     skipped: u64,
     max_file_mb: u64,
     budget_secs: u64,
@@ -325,16 +415,17 @@ pub fn scan(
     let timeout = cfg.hunt.clamav_timeout_secs.max(60).min(budget_secs);
     out.engine = engine.name().into();
 
-    // The list of files, one per line. A name with a newline cannot be listed.
-    let mut dropped = skipped;
-    let mut listed: Vec<&String> = Vec::with_capacity(files.len().min(MAX_LIST_FILES));
-    for f in files {
-        if f.contains(['\n', '\r']) || listed.len() >= MAX_LIST_FILES {
-            dropped += 1;
-        } else {
-            listed.push(f);
-        }
-    }
+    // A name with a line break cannot go in a one-per-line list; the list is capped.
+    let listable = files.iter().filter(|f| !f.path.contains(['\n', '\r']));
+    let eligible: Vec<clamav_cache::FileInfo> = listable.take(MAX_LIST_FILES).cloned().collect();
+    let dropped = skipped + (files.len() - eligible.len()) as u64;
+
+    let before = load_record(state);
+    let rescan_secs = i64::from(cfg.hunt.clamav_rescan_days.clamp(1, 90)) * 86_400;
+    let plan = clamav_cache::plan(&eligible, &before, now, rescan_secs);
+    out.up_to_date = plan.up_to_date as u64;
+    let ordered: Vec<&clamav_cache::FileInfo> = plan.order.iter().map(|&i| &eligible[i]).collect();
+
     // A name per run, so two hunts at once (timer + hub button) cannot trample
     // each other's files.
     let pid = std::process::id();
@@ -346,70 +437,92 @@ pub fn scan(
             let _ = std::fs::remove_file(p);
         }
     };
-    let written = private_file(&list_path).and_then(|mut f| {
-        for p in &listed {
-            writeln!(f, "{p}")?;
-        }
-        f.flush()
-    });
-    if let Err(e) = written {
-        out.note = format!("không ghi được danh sách file cho ClamAV: {e}");
-        cleanup();
-        return out;
-    }
-    out.scanned = listed.len() as u64;
 
-    let mb = max_file_mb.max(1);
-    let Some(mut run) = run_scan(&engine, &list_path, &out_path, &err_path, mb, timeout) else {
-        out.note = "không tạo được file kết quả cho ClamAV".into();
-        cleanup();
-        return out;
-    };
+    let mut done: Vec<clamav_cache::Done> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
+    let mut last_run: Option<ScanRun> = None;
+    if !ordered.is_empty() {
+        if let Err(e) = write_list(&list_path, &ordered) {
+            out.note = format!("không ghi được danh sách file cho ClamAV: {e}");
+            cleanup();
+            return out;
+        }
+        let mb = max_file_mb.max(1);
+        let asked: HashSet<&str> = ordered.iter().map(|f| f.path.as_str()).collect();
+        let Some(run) = run_scan(&engine, &list_path, &out_path, &err_path, mb, timeout) else {
+            out.note = "không tạo được file kết quả cho ClamAV".into();
+            cleanup();
+            return out;
+        };
+        done = finished_files(&out_path, &asked);
+        let daemon_failed = matches!(engine, Engine::Clamdscan(_)) && !run.finished();
+        last_run = Some(run);
 
-    // A daemon that was up a moment ago can still fail (socket permissions under
-    // the unit's sandbox, clamd reloading). Fall back to clamscan if it can run.
-    if matches!(engine, Engine::Clamdscan(_)) && !run.finished() {
+        // A daemon that was up a moment ago can still fail (socket permissions under
+        // the unit's sandbox, clamd reloading). Hand what it did not finish to
+        // clamscan, if that can run.
         let left = timeout.saturating_sub(started.elapsed().as_secs());
-        if left >= MIN_SCAN_BUDGET_SECS
+        if daemon_failed
+            && left >= MIN_SCAN_BUDGET_SECS
             && let Ok(bin) = usable_clamscan(cfg, avail_mb, now)
         {
+            let finished: HashSet<String> = done.iter().map(|(p, _)| p.clone()).collect();
+            let rest: Vec<&clamav_cache::FileInfo> = ordered
+                .iter()
+                .copied()
+                .filter(|f| !finished.contains(&f.path))
+                .collect();
             notes.push("clamdscan lỗi nên đã chuyển sang clamscan".into());
             let fallback = Engine::Clamscan(bin);
-            if let Some(r) = run_scan(&fallback, &list_path, &out_path, &err_path, mb, left) {
+            if write_list(&list_path, &rest).is_ok()
+                && let Some(r) = run_scan(&fallback, &list_path, &out_path, &err_path, mb, left)
+            {
                 out.engine = fallback.name().into();
-                run = r;
+                done.extend(finished_files(&out_path, &asked));
+                last_run = Some(r);
             }
         }
     }
 
-    let asked: HashSet<&str> = listed.iter().map(|s| s.as_str()).collect();
-    out.detections = clamav::parse_detections(&run.stdout, &asked);
+    out.scanned = done.len() as u64;
+    out.pending = ordered.len().saturating_sub(done.len()) as u64;
+    out.detections = clamav_cache::detections(&eligible, &before, &done);
+    let mut record = before;
+    clamav_cache::update(&mut record, &eligible, &done, now);
+    save_record(state, &record);
 
-    match &run.status {
-        Ok(Some(s)) if run.finished() => {
-            if run.found_something() && out.detections.is_empty() {
+    if let Some(run) = &last_run {
+        let found_now = done.iter().any(|(_, s)| s.is_some());
+        match &run.status {
+            Ok(Some(s)) if run.finished() => {
+                if run.found_something() && !found_now {
+                    notes.push(format!(
+                        "ClamAV báo có file nhiễm (mã {}) nhưng không đọc được kết quả",
+                        s.code().unwrap_or(1)
+                    ));
+                }
+            }
+            Ok(Some(s)) => {
                 notes.push(format!(
-                    "ClamAV báo có file nhiễm (mã {}) nhưng không đọc được kết quả",
-                    s.code().unwrap_or(1)
+                    "ClamAV báo lỗi (mã {}){}",
+                    s.code().map_or_else(|| "?".to_string(), |c| c.to_string()),
+                    if run.stderr.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {}", util::ellipsize(&run.stderr, 160))
+                    }
                 ));
             }
+            // Out of time is no longer a failure: the next run carries on.
+            Ok(None) => {}
+            Err(e) => notes.push(format!("không chạy được ClamAV: {e}")),
         }
-        Ok(Some(s)) => {
-            notes.push(format!(
-                "ClamAV báo lỗi (mã {}){}",
-                s.code().map_or_else(|| "?".to_string(), |c| c.to_string()),
-                if run.stderr.is_empty() {
-                    String::new()
-                } else {
-                    format!(": {}", util::ellipsize(&run.stderr, 160))
-                }
-            ));
-        }
-        Ok(None) => notes.push(format!(
-            "ClamAV chạy quá {timeout} giây nên bị dừng; kết quả có thể chưa đủ"
-        )),
-        Err(e) => notes.push(format!("không chạy được ClamAV: {e}")),
+    }
+    if out.pending > 0 {
+        notes.push(format!(
+            "lần này quét được {} file trong {timeout} giây; còn {} file sẽ được quét tiếp ở các lần sau (file mới hoặc vừa đổi được ưu tiên)",
+            out.scanned, out.pending
+        ));
     }
     if dropped > 0 {
         notes.push(format!(
@@ -688,5 +801,71 @@ pub fn install(state: &State) -> Result<()> {
         }
         (None, _) => Err(fail("cài xong nhưng không thấy clamscan".into())),
         (_, None) => Err(fail("cài xong nhưng chưa có CSDL chữ ký".into())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(path: &str) -> clamav_cache::FileInfo {
+        clamav_cache::FileInfo {
+            path: path.into(),
+            size: 10,
+            mtime: 100,
+            ctime: 100,
+        }
+    }
+
+    #[test]
+    fn a_partial_output_file_yields_the_files_finished_so_far() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.txt");
+        // The run was stopped in the middle of a line: that file is not finished.
+        std::fs::write(
+            &out,
+            "/w/a.php: OK\n/w/b.php: Php.Shell-1 FOUND\nLibClamAV Warning: x\n/w/c.php: O",
+        )
+        .unwrap();
+        let asked: HashSet<&str> = ["/w/a.php", "/w/b.php", "/w/c.php"].into_iter().collect();
+        let done = finished_files(&out, &asked);
+        assert_eq!(
+            done,
+            vec![
+                ("/w/a.php".to_string(), None),
+                ("/w/b.php".to_string(), Some("Php.Shell-1".to_string())),
+            ]
+        );
+        assert!(finished_files(&dir.path().join("missing"), &asked).is_empty());
+    }
+
+    #[test]
+    fn the_record_is_saved_privately_and_read_back() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let state = State {
+            dir: dir.path().to_path_buf(),
+        };
+        assert!(load_record(&state).is_empty());
+        let files = vec![info("/w/a.php"), info("/w/b.php")];
+        let mut rec = clamav_cache::Cache::new();
+        clamav_cache::update(
+            &mut rec,
+            &files,
+            &[
+                ("/w/a.php".into(), None),
+                ("/w/b.php".into(), Some("Php.X".into())),
+            ],
+            5000,
+        );
+        save_record(&state, &rec);
+        let path = dir.path().join(SCANNED_RECORD);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(load_record(&state), rec);
+        // A symlink planted in its place is not followed.
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", &path).unwrap();
+        assert!(load_record(&state).is_empty());
     }
 }

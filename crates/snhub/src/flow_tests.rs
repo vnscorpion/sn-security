@@ -370,7 +370,7 @@ async fn a_server_clock_minutes_off_is_learned_at_enrolment_and_followed_at_sign
         )
         .await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.location());
-    assert!(r.body.contains("lệch khoảng"), "the admin is told");
+    assert!(r.body.contains("chậm hơn giờ thật"), "the admin is told");
     let t = h.st.db.lock().unwrap().totp().unwrap();
     assert!(t.enabled);
     assert!((3..=5).contains(&t.offset), "offset {}", t.offset);
@@ -407,4 +407,76 @@ async fn the_reset_command_has_the_documented_name() {
     assert!(names.contains(&"reset-2fa"), "{names:?}");
     assert!(names.contains(&"totp-now"));
     assert!(names.contains(&"set-admin-password"));
+}
+
+#[tokio::test]
+async fn a_server_clock_hours_off_is_recognised_from_the_browser_clock() {
+    let h = hub();
+    let cookie = h.sign_in().await;
+    h.post("/security/totp/start", &cookie, &pw_form()).await;
+    // The page tells the browser this server's time, to compare with its own.
+    let page = h.get("/security", &cookie).await;
+    assert!(page.body.contains("clock-skew") && page.body.contains("client-ts"));
+
+    // This server runs 107 minutes slow: the phone's code is 214 steps ahead.
+    let ahead = 214;
+    let code = h.code_at(ahead);
+    // Without the browser's time the code fits nowhere near this server's clock.
+    let r = h
+        .post("/security/totp/confirm", &cookie, &format!("code={code}"))
+        .await;
+    assert!(
+        r.location().starts_with("/security?totp=1&msg="),
+        "{}",
+        r.location()
+    );
+    assert!(!h.enrolled());
+    // With it, the hub finds the phone's time, enables and keeps the offset.
+    let browser = now() + ahead * 30;
+    let r = h
+        .post(
+            "/security/totp/confirm",
+            &cookie,
+            &format!("code={code}&client_ts={browser}"),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.location());
+    assert!(r.body.contains("chậm hơn giờ thật"), "{}", r.body);
+    let t = h.st.db.lock().unwrap().totp().unwrap();
+    assert!(
+        t.enabled && (ahead - 1..=ahead + 1).contains(&t.offset),
+        "{}",
+        t.offset
+    );
+
+    // Signing in with the phone's next code works despite this server's clock.
+    let r = h.post("/login", "", &pw_form()).await;
+    let pending = format!("snhub_2fa={}", r.set_cookie("snhub_2fa").unwrap());
+    let r = h
+        .post(
+            "/login/2fa",
+            &pending,
+            &format!("kind=totp&code={}", h.code_at(ahead + 1)),
+        )
+        .await;
+    assert_eq!(r.location(), "/", "{}", r.body);
+}
+
+#[tokio::test]
+async fn a_browser_clock_that_is_wildly_off_is_not_trusted() {
+    let h = hub();
+    let cookie = h.sign_in().await;
+    h.post("/security/totp/start", &cookie, &pw_form()).await;
+    // Three days ahead: beyond what is believable; refused.
+    let ahead = 3 * 2880;
+    let browser = now() + ahead * 30;
+    let r = h
+        .post(
+            "/security/totp/confirm",
+            &cookie,
+            &format!("code={}&client_ts={browser}", h.code_at(ahead)),
+        )
+        .await;
+    assert!(r.location().starts_with("/security?totp=1&msg="));
+    assert!(!h.enrolled());
 }

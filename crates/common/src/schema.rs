@@ -157,9 +157,15 @@ pub struct HuntSummary {
     /// Which ClamAV engine scanned the files (`clamscan` / `clamdscan`), or empty.
     #[serde(default)]
     pub clamav_engine: String,
-    /// Files ClamAV was asked to scan.
+    /// Files ClamAV finished in this run.
     #[serde(default)]
     pub clamav_scanned: u64,
+    /// Unchanged files ClamAV had already scanned recently, skipped this run.
+    #[serde(default)]
+    pub clamav_up_to_date: u64,
+    /// Files still waiting for ClamAV (it ran out of time); the next run goes on.
+    #[serde(default)]
+    pub clamav_pending: u64,
     /// Why ClamAV did not run, or a problem it hit, or empty.
     #[serde(default)]
     pub clamav_note: String,

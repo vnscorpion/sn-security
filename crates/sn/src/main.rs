@@ -6,6 +6,7 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod clamav;
+mod clamav_cache;
 mod clamav_run;
 mod clean;
 mod config;

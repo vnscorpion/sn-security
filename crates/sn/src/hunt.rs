@@ -48,7 +48,7 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<Vec<Finding>> 
     let mut findings = Vec::new();
     let mut scanned = 0u64;
     // The files the heuristic opened, handed to ClamAV afterwards as well.
-    let mut clam_files: Vec<String> = Vec::new();
+    let mut clam_files: Vec<crate::clamav_cache::FileInfo> = Vec::new();
     let mut clam_skipped = 0u64;
 
     for root in &roots {
@@ -107,7 +107,15 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<Vec<Finding>> 
             // go in its text list, and the list is capped: both are counted so
             // the summary can say the second engine saw fewer files.
             match path.to_str() {
-                Some(p) if clam_files.len() < MAX_CLAM_FILES => clam_files.push(p.to_string()),
+                Some(p) if clam_files.len() < MAX_CLAM_FILES => {
+                    use std::os::unix::fs::MetadataExt;
+                    clam_files.push(crate::clamav_cache::FileInfo {
+                        path: p.to_string(),
+                        size: meta.size(),
+                        mtime: meta.mtime(),
+                        ctime: meta.ctime(),
+                    });
+                }
                 _ => clam_skipped += 1,
             }
             let score = heuristic::score_php(&bytes, is_upload, is_image && !is_php);
@@ -177,6 +185,8 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<Vec<Finding>> 
         );
         summary.clamav_engine = clam.engine.clone();
         summary.clamav_scanned = clam.scanned;
+        summary.clamav_up_to_date = clam.up_to_date;
+        summary.clamav_pending = clam.pending;
         summary.clamav_note = clam.note.clone();
     }
     store_results(state, &findings, &summary)?;

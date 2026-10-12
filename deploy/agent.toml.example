@@ -41,6 +41,9 @@ max_file_mb = 5
 clamav = "auto"
 clamav_min_ram_mb = 1536         # clamscan loads a >1 GB database: skipped below this much free RAM
 clamav_timeout_secs = 1200
+# Unchanged files are scanned by ClamAV again after this many days; new and
+# changed files every time. A run that runs out of time continues next time.
+clamav_rescan_days = 7
 
 [remote]
 # The hub decides what this agent does (bans, mode, scans, undo, evidence, ClamAV,

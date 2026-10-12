@@ -326,7 +326,16 @@ fn clamav_block(agent_id: &str, r: &ReportBody, flash: &str, install_pending: bo
             }
             @if let Some(h) = &r.hunt {
                 @if !h.clamav_engine.is_empty() {
-                    p class="help" style="margin:8px 0 0" { "Lần quét cuối: ClamAV (" (h.clamav_engine) ") đã đối chiếu " b { (h.clamav_scanned) } " file." }
+                    p class="help" style="margin:8px 0 0" {
+                        "Lần quét cuối: ClamAV (" (h.clamav_engine) ") đã đối chiếu " b { (h.clamav_scanned) } " file"
+                        @if h.clamav_up_to_date > 0 {
+                            "; " (h.clamav_up_to_date) " file không đổi đã được quét gần đây nên bỏ qua"
+                        }
+                        @if h.clamav_pending > 0 {
+                            "; " b { (h.clamav_pending) } " file chờ quét ở các lần sau"
+                        }
+                        "."
+                    }
                 }
                 @if !h.clamav_note.is_empty() {
                     p class="help" style="margin:8px 0 0;color:var(--warn)" { "ClamAV: " (h.clamav_note) }

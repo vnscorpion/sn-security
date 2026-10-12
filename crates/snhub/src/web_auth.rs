@@ -549,15 +549,24 @@ pub async fn login_2fa_post(
             .and_then(|d| d.totp())
             .filter(|t| t.enabled);
         let now_secs = at.max(0) as u64;
-        let step = totp_state
-            .and_then(|t| totp::verify_at(&t.secret, &f.code, now_secs, t.offset, t.last_step));
+        // Around the learned offset, and around this server's own clock: once a
+        // server clock that was off gets corrected, the old offset is wrong but the
+        // plain window matches, and the offset follows (below).
+        let step = totp_state.and_then(|t| {
+            totp::verify_at(&t.secret, &f.code, now_secs, t.offset, t.last_step).or_else(|| {
+                (t.offset != 0)
+                    .then(|| totp::verify_at(&t.secret, &f.code, now_secs, 0, t.last_step))
+                    .flatten()
+            })
+        });
         // The compare-and-set is what makes a code single-use: of two requests
         // carrying the same code, only one gets to move the stored step forward.
         let claimed = step.is_some_and(|s| {
             st.db.lock().is_ok_and(|d| {
                 let won = d.claim_totp_step(s);
                 if won {
-                    // Follow slow drift of either clock (RFC 6238 §6).
+                    // Follow drift of either clock (RFC 6238 §6); a large offset
+                    // learned from the browser at enrolment is kept as it is.
                     let drift = s as i64 - (now_secs / totp::STEP_SECS) as i64;
                     if drift.abs() <= totp::ENROL_SEARCH_STEPS {
                         let _ = d.set_totp_offset(drift);
@@ -857,8 +866,30 @@ pub async fn security_page(
                         p style="margin:6px 0" {
                             "Hub đang tính (giờ máy chủ, lúc tải trang): "
                             code style="font-size:20px;letter-spacing:3px" { (cur) }
-                            span class="mut" { " — còn " (left) " giây; 30 giây trước " (prev) ", 30 giây sau " (next) }
+                            span class="mut" id="totp-left" { " — còn " (left) " giây" }
+                            span class="mut" { "; 30 giây trước " (prev) ", 30 giây sau " (next) }
                         }
+                        p id="clock-skew" style="display:none;color:var(--warn);margin:6px 0" {}
+                        // Count down for real, say when the shown codes are stale, and
+                        // compare this server's clock with the browser's: a server
+                        // clock that is minutes or hours off is the usual reason an
+                        // authenticator's codes never match.
+                        script { (PreEscaped(format!(
+                            "(function(){{var srv={srv},t0=Date.now(),left={left};\
+                             var el=document.getElementById('totp-left');\
+                             var tick=function(){{var l=left-Math.floor((Date.now()-t0)/1000);\
+                             el.textContent=l>0?' — còn '+l+' giây':' — mã này đã cũ, tải lại trang để xem mã mới';\
+                             if(l>0)setTimeout(tick,1000);}};tick();\
+                             var skew=Math.round(t0/1000)-srv;\
+                             if(Math.abs(skew)>30){{var w=document.getElementById('clock-skew');w.style.display='block';\
+                             var m=Math.round(Math.abs(skew)/60);\
+                             w.textContent='Đồng hồ máy chủ '+(skew>0?'chậm':'nhanh')+' hơn máy bạn khoảng '+(m>=1?m+' phút':Math.abs(skew)+' giây')+\
+                             '. Mã trong ứng dụng sẽ không khớp mã hub tính theo giờ máy chủ. Hãy sửa giờ máy chủ (NTP); hub vẫn cho bật bằng cách dựa vào giờ máy bạn và tự bù.';}}\
+                             var f=document.getElementById('totp-confirm');if(f){{f.addEventListener('submit',function(){{\
+                             document.getElementById('client-ts').value=Math.floor(Date.now()/1000);}});}}}})();",
+                            srv = now(),
+                            left = left
+                        ))) }
                         p class="help" {
                             "Mã trong mục SN Secure (admin-" (totp_label(&t.secret).trim_start_matches("admin-")) ") của ứng dụng phải trùng một trong các mã này "
                             "(tải lại trang để lấy mã mới). Khác hẳn: ứng dụng đang giữ khoá khác, xoá mục cũ rồi quét lại. "
@@ -867,7 +898,8 @@ pub async fn security_page(
                     }
                 }
                 p { "2. Nhập mã 6 số ứng dụng đang hiện để xác nhận." }
-                form method="post" action="/security/totp/confirm" {
+                form method="post" action="/security/totp/confirm" id="totp-confirm" {
+                    input type="hidden" name="client_ts" id="client-ts" value="";
                     div class="ctrls" {
                         label class="f" { span class="t" { "Mã 6 số" } input type="text" name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="8" required; }
                         button type="submit" { "Bật" }
@@ -1116,7 +1148,16 @@ pub async fn totp_start(
 #[derive(Deserialize)]
 pub struct CodeForm {
     code: String,
+    /// The browser's clock (Unix seconds) when the form was sent, set by the page's
+    /// script. Only used at enrolment, to recognise a server clock that is far off.
+    #[serde(default)]
+    client_ts: String,
 }
+
+/// How far from this server's clock a browser's clock may be and still be used to
+/// find the authenticator's time at enrolment (a server whose clock is a day off
+/// has bigger problems than 2FA).
+const MAX_BROWSER_SKEW_SECS: i64 = 24 * 3600;
 
 pub async fn totp_confirm(
     State(st): State<Arc<AppState>>,
@@ -1134,7 +1175,29 @@ pub async fn totp_confirm(
     // Search a few minutes either way: it tells a wrong clock (the code fits at
     // some offset) from a wrong key (it fits nowhere), and a clock that is merely
     // off is learned and compensated instead of locking the admin out.
+    // If that fails and the browser's clock is far from this server's, search
+    // around the browser's time too: a server clock that is hours off (seen on
+    // VPSes whose NTP cannot correct the host clock) otherwise makes every code
+    // "wrong". The offset learned is then relative to this server's clock.
+    let server_step = (now_secs / totp::STEP_SECS) as i64;
+    let via_browser = || -> Option<i64> {
+        let client = f.client_ts.trim().parse::<i64>().ok()?;
+        let skew = client - at;
+        if skew.abs() <= totp::ENROL_SEARCH_STEPS * totp::STEP_SECS as i64
+            || skew.abs() > MAX_BROWSER_SKEW_SECS
+        {
+            return None;
+        }
+        let k = totp::find_offset(
+            &t.secret,
+            &f.code,
+            client.max(0) as u64,
+            totp::ENROL_SEARCH_STEPS,
+        )?;
+        Some(client.max(0) / totp::STEP_SECS as i64 + k - server_step)
+    };
     let Some(offset) = totp::find_offset(&t.secret, &f.code, now_secs, totp::ENROL_SEARCH_STEPS)
+        .or_else(via_browser)
     else {
         let tail: String = t
             .secret
@@ -1218,9 +1281,15 @@ pub async fn totp_confirm(
     }
     st.sessions.remove_all_except(&tok);
     let skew = if offset.abs() > 1 {
+        let secs = offset.abs() * totp::STEP_SECS as i64;
+        let how = if secs >= 120 {
+            format!("{} phút", secs / 60)
+        } else {
+            format!("{secs} giây")
+        };
         format!(
-            " Lưu ý: đồng hồ máy chủ lệch khoảng {} giây so với điện thoại; hub đã tự bù, nhưng nên bật đồng bộ giờ (NTP) trên máy chủ.",
-            offset.abs() * totp::STEP_SECS as i64
+            " Lưu ý: đồng hồ máy chủ {} hơn giờ thật khoảng {how}; hub đã tự bù để mã của bạn dùng được, nhưng hãy sửa giờ máy chủ (timedatectl set-ntp true, hoặc nhờ nhà cung cấp VPS). Sau khi sửa, mã vẫn được chấp nhận.",
+            if offset > 0 { "chậm" } else { "nhanh" }
         )
     } else {
         String::new()
