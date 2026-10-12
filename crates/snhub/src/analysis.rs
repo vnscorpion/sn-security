@@ -421,7 +421,7 @@ fn auto_order(db: &Db, agent_id: &str, proposal: &ProposalRow, autonomy: &str, a
 /// A proposal that was waiting for the job slot gets another try. Called with each
 /// report from the VPS, which is when the slot frees up.
 pub fn retry_waiting(db: &Db, agent_id: &str, at: i64) {
-    let Ok(Some(p)) = db.latest_proposal(agent_id) else {
+    let Ok(Some(p)) = db.latest_ai_proposal(agent_id) else {
         return;
     };
     // Only a proposal that was waiting, for a couple of hours: evidence ages out.

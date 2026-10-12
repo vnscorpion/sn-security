@@ -106,8 +106,8 @@ fn render(st: &AppState, msg: &str, fresh: Option<(&str, &str, &str)>) -> Respon
                     label class="f" { span class="t" { "Quyền" }
                         select name="scope" {
                             option value=(SCOPE_READ) { "Chỉ xem" }
-                            option value=(SCOPE_PROPOSE) { "Xem + đề xuất (admin duyệt)" }
-                            option value=(SCOPE_ACT) selected { "Toàn quyền xử lý" }
+                            option value=(SCOPE_PROPOSE) selected { "Xem + đề xuất (admin duyệt)" }
+                            option value=(SCOPE_ACT) { "Toàn quyền xử lý" }
                         }
                     }
                     label class="f" { span class="t" { "Mật khẩu hiện tại" } input type="password" name="password" required autocomplete="current-password"; }
@@ -119,7 +119,9 @@ fn render(st: &AppState, msg: &str, fresh: Option<(&str, &str, &str)>) -> Respon
                 li { b { "Xem + đề xuất" } ": thêm yêu cầu VPS thu thập bằng chứng và gửi kế hoạch xử lý; kế hoạch chờ bạn duyệt trên trang VPS như đề xuất của AI tích hợp." }
                 li { b { "Toàn quyền xử lý" } ": thêm thực hiện kế hoạch ngay, chặn/bỏ chặn IP, đổi chế độ, quét mã độc, cài ClamAV. "
                     "Vẫn chỉ trong danh sách hành động cố định, mỗi hành động được hub đối chiếu với bằng chứng của VPS và agent kiểm lại trước khi làm; "
-                    "không có lệnh tuỳ ý nào chạy trên VPS." }
+                    "không có lệnh tuỳ ý nào chạy trên VPS. Hub còn giới hạn thêm: chỉ chặn IP công khai, tối đa 500 lệnh chặn mỗi VPS, "
+                    "60 thao tác thay đổi mỗi giờ mỗi token, chỉ gỡ được lệnh chặn do hub đặt, chỉ bật chứ không tắt chế độ tự chặn. "
+                    "Muốn Hermes tự xử lý cấp cứu không cần bạn bấm thì chọn mức này." }
             }
             p class="help" { "Mọi thao tác qua token được ghi vào Nhật ký với tên " code { "mcp:<tên token>" } ". Giữ token như mật khẩu (trong ~/.hermes/.env, quyền 600); lộ thì thu hồi ở đây." }
         }
@@ -134,7 +136,7 @@ fn render(st: &AppState, msg: &str, fresh: Option<(&str, &str, &str)>) -> Respon
 fn config_snippet(url: &str, token: Option<&str>) -> Markup {
     let env_line = format!("SNSEC_MCP_TOKEN={}", token.unwrap_or("snmcp_…"));
     let yaml = format!(
-        "mcp_servers:\n  snsec:\n    url: \"{url}\"\n    headers:\n      Authorization: \"Bearer ${{SNSEC_MCP_TOKEN}}\"\n    timeout: 120\n    connect_timeout: 30"
+        "mcp_servers:\n  snsec:\n    url: \"{url}\"\n    headers:\n      Authorization: \"Bearer ${{SNSEC_MCP_TOKEN}}\"\n    timeout: 120\n    connect_timeout: 30\n    # Bỏ dấu # dòng dưới để Hermes hỏi bạn trước mỗi công cụ không chỉ-đọc:\n    # trust: untrusted"
     );
     html! {
         p { "1. Thêm vào " code { "~/.hermes/.env" } ":" }
@@ -144,7 +146,9 @@ fn config_snippet(url: &str, token: Option<&str>) -> Markup {
         p { "3. Kiểm tra: " code { "hermes mcp test snsec" } " (hoặc " code { "/reload-mcp" } " trong phiên đang chạy). Công cụ hiện ra dạng " code { "mcp__snsec__list_vps" } ", " code { "mcp__snsec__get_vps_status" } "…" }
         p class="help" {
             "Hermes chạy trên chính máy hub thì có thể dùng " code { "http://127.0.0.1:8099/mcp" } " (không qua Internet). "
-            "Trong cấu hình Hermes có thể đặt " code { "trust: untrusted" } " để mọi công cụ không chỉ-đọc đều hỏi bạn trước khi chạy."
+            "Đặt " code { "trust: untrusted" } " nếu muốn Hermes hỏi bạn trước mọi công cụ không chỉ-đọc (bỏ đi nếu muốn Hermes tự xử lý, kể cả trong cron). "
+            "Nếu reverse proxy (Caddy) của hub có giới hạn IP cho giao diện quản trị, hãy cho đường dẫn " code { "/mcp" } " đi qua riêng (xem deploy/examples/Caddyfile), "
+            "nếu không Hermes chỉ nhận được 403."
         }
     }
 }
@@ -170,6 +174,10 @@ pub async fn create_post(
         Recheck::Wait(w) => return back(&format!("Thử quá nhiều lần, chờ {w} giây.")),
     }
     let at = now();
+    // Each token has its own name, so the log says which one did what.
+    if st.db.lock().is_ok_and(|d| d.mcp_name_taken(&f.name)) {
+        return back("Tên này đã có token khác dùng: đặt tên khác (ví dụ theo máy chạy Hermes).");
+    }
     let made = st
         .db
         .lock()

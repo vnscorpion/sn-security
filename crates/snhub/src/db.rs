@@ -370,6 +370,7 @@ impl Db {
         }
         edit(&mut body);
         warn_dropped(agent_id, &keep_valid_orders(&mut body));
+        bound_orders(&mut body);
         let json = serde_json::to_string(&body)?;
         self.conn.execute(
             "INSERT INTO desired (agent_id, epoch, version, body_json, updated, updated_by) \
@@ -527,6 +528,24 @@ fn canonical_v6_64(input: &str) -> Option<String> {
 /// agent writes it into an nftables script as root, so free text never goes in.
 pub(crate) fn ban_target(input: &str) -> Option<String> {
     one_address(input).or_else(|| canonical_v6_64(input))
+}
+
+/// Hub bans and unbans a VPS keeps, at most. Every desired-state carries them and
+/// the agent reads it whole: an unbounded list (a looping client, a leaked token)
+/// would one day be too big to read, and the VPS would stop taking hub orders.
+pub(crate) const MAX_HUB_BANS: usize = 1_000;
+pub(crate) const MAX_UNBANS: usize = 500;
+
+/// Keep the newest bans and the most recent unbans within those limits.
+fn bound_orders(body: &mut DesiredBody) {
+    if body.bans.len() > MAX_HUB_BANS {
+        body.bans.sort_by_key(|b| std::cmp::Reverse(b.created_at));
+        body.bans.truncate(MAX_HUB_BANS);
+    }
+    if body.unbans.len() > MAX_UNBANS {
+        let extra = body.unbans.len() - MAX_UNBANS;
+        body.unbans.drain(..extra);
+    }
 }
 
 /// Rewrite every ban and unban of `body` in its canonical form and drop the

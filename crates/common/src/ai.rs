@@ -308,7 +308,16 @@ pub fn parse_plan(text: &str, ev: &Evidence) -> Result<Plan, String> {
         diagnosis: cut(diagnosis, 2_000),
         ..Plan::default()
     };
-    for raw in actions {
+    // Only so many entries are looked at, valid or not: a list of a million junk
+    // items must not turn into a million "rejected" lines stored and shown.
+    let looked_at = actions.len().min(MAX_ACTIONS * 2);
+    if actions.len() > looked_at {
+        plan.rejected.push(format!(
+            "bỏ qua {} mục sau {looked_at} mục đầu (tối đa {MAX_ACTIONS} hành động)",
+            actions.len() - looked_at
+        ));
+    }
+    for raw in &actions[..looked_at] {
         let reason = cut(raw.get("reason").and_then(Value::as_str).unwrap_or(""), 300);
         let action: Action = match serde_json::from_value(raw.clone()) {
             Ok(a) => a,
@@ -1607,6 +1616,17 @@ mod tests {
         let p = parse_plan(&reply, &ev2).unwrap();
         assert_eq!(p.proposed.len(), MAX_ACTIONS);
         assert!(!p.rejected.is_empty());
+
+        // A million junk entries cost what a few dozen do.
+        let junk = vec!["0"; 1_000_000].join(",");
+        let reply = format!("{{\"diagnosis\":\"d\",\"actions\":[{junk}]}}");
+        let p = parse_plan(&reply, &ev).unwrap();
+        assert!(p.proposed.is_empty());
+        assert!(
+            p.rejected.len() <= MAX_ACTIONS * 2 + 1,
+            "{}",
+            p.rejected.len()
+        );
     }
 
     #[test]

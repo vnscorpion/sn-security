@@ -18,6 +18,16 @@ sec.sgd.ovh {
 		reverse_proxy 127.0.0.1:8099
 	}
 
+	# --- MCP for an outside agent such as Hermes (bearer token from the hub's
+	# Hermes page). Kept apart from the admin UI so an IP allow-list there does
+	# not shut Hermes out; restrict it to the Hermes host if it has a fixed IP:
+	#   @notHermes not remote_ip 192.0.2.50
+	#   respond @notHermes "Forbidden" 403
+	@mcp path /mcp
+	handle @mcp {
+		reverse_proxy 127.0.0.1:8099
+	}
+
 	# --- Admin UI: everything else ---
 	# The hub already requires an admin password, but restricting the UI to
 	# your admin IP(s) is strongly recommended (defense in depth). Put your
@@ -30,13 +40,15 @@ sec.sgd.ovh {
 		}
 	}
 
-	# Security headers. The hub UI uses inline <style> and no JavaScript.
+	# Security headers. The hub UI uses inline <style> and small inline scripts
+	# (passkeys, the 2FA code countdown and clock check), so scripts from the page
+	# itself must be allowed: `script-src 'none'` breaks those pages silently.
 	header {
 		Strict-Transport-Security "max-age=31536000; includeSubDomains"
 		X-Content-Type-Options "nosniff"
 		X-Frame-Options "DENY"
 		Referrer-Policy "no-referrer"
-		Content-Security-Policy "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'none'; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+		Content-Security-Policy "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
 		-Server
 	}
 

@@ -97,6 +97,8 @@ enum Cmd {
     /// Print this server's time and the authenticator-app codes it expects right
     /// now, to compare with the phone when a code is refused.
     TotpNow,
+    /// Revoke every Hermes (MCP) token at once (a token may have leaked).
+    McpRevokeAll,
 }
 
 fn now() -> i64 {
@@ -129,6 +131,20 @@ fn real_main() -> Result<()> {
         Cmd::SetAdminPassword { password } => cmd_set_password(&cli.config, password),
         Cmd::Reset2fa => cmd_reset_2fa(&cli.config),
         Cmd::TotpNow => cmd_totp_now(&cli.config),
+        Cmd::McpRevokeAll => {
+            let cfg = HubConfig::load(&cli.config)?;
+            let db = Db::open(&cfg.data_path().join("snhub.sqlite"))?;
+            let n = db.revoke_all_mcp_tokens()?;
+            db.log_login(
+                now(),
+                "console",
+                true,
+                "thu hồi token Hermes",
+                &format!("{n} token"),
+            );
+            println!("Revoked {n} Hermes (MCP) token(s).");
+            Ok(())
+        }
     }
 }
 
@@ -234,6 +250,7 @@ fn cmd_set_password(config_path: &Path, password: Option<String>) -> Result<()> 
     let at = now();
     db.set_admin_pw_hash(&hash, at)?;
     db.revoke_sessions(at)?;
+    let tokens = db.revoke_all_mcp_tokens()?;
     db.log_login(
         at,
         "console",
@@ -242,6 +259,7 @@ fn cmd_set_password(config_path: &Path, password: Option<String>) -> Result<()> 
         "bằng dòng lệnh trên máy chủ, đăng xuất mọi phiên",
     );
     println!("admin password set (Argon2id).");
+    println!("Hermes (MCP) tokens revoked: {tokens} (make new ones on the Hermes page).");
     println!(
         "Every web session is signed out, and a pause of the second sign-in step after too many \
          wrong codes is lifted (the running hub notices within a few seconds)."
@@ -255,6 +273,7 @@ fn cmd_reset_2fa(config_path: &Path) -> Result<()> {
     let at = now();
     db.reset_2fa()?;
     db.revoke_sessions(at)?;
+    let tokens = db.revoke_all_mcp_tokens()?;
     db.log_login(
         at,
         "console",
@@ -266,6 +285,7 @@ fn cmd_reset_2fa(config_path: &Path) -> Result<()> {
         "Two-factor sign-in removed (app, passkeys, recovery codes). The password is unchanged."
     );
     println!("Every web session is signed out (the running hub notices within a few seconds).");
+    println!("Hermes (MCP) tokens revoked: {tokens} (make new ones on the Hermes page).");
     println!(
         "If password re-checks are paused after too many wrong answers, the password may be \
          known to someone else: set a new one with `snhub set-admin-password`, which lifts the pause."
@@ -371,6 +391,8 @@ fn cmd_serve(config_path: &Path) -> Result<()> {
 /// so a lower limit would silence it until the oversized report ages out of its
 /// queue. Lower it only once the agents in the field cap that list.
 const AGENT_BODY_LIMIT: usize = 2 * 1024 * 1024;
+/// Largest MCP request (one JSON-RPC message; a plan is a few kilobytes).
+const MCP_BODY_LIMIT: usize = 64 * 1024;
 /// An enrollment request is a token, a name and a public key.
 const ENROLL_BODY_LIMIT: usize = 16 * 1024;
 
@@ -424,7 +446,11 @@ fn router(state: Arc<AppState>) -> Router {
         // MCP (Streamable HTTP) for an outside agent such as Hermes; bearer token.
         .route(
             "/mcp",
-            get(mcp::mcp_get).post(mcp::mcp_post).delete(mcp::mcp_get),
+            get(mcp::mcp_get)
+                .post(mcp::mcp_post)
+                .delete(mcp::mcp_get)
+                // A JSON-RPC message is small; a big body is only work for the hub.
+                .layer(DefaultBodyLimit::max(MCP_BODY_LIMIT)),
         )
         .route("/settings/provider", post(web_ai::provider_save_post))
         .route(

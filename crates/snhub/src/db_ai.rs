@@ -450,6 +450,38 @@ impl Db {
             .optional()?)
     }
 
+    /// The newest proposal from the built-in AI or the admin (not one an outside
+    /// agent sent through MCP): this is what decides whether an incident is still
+    /// being dealt with and what an unattended order retries.
+    pub fn latest_ai_proposal(&self, agent_id: &str) -> Result<Option<ProposalRow>> {
+        Ok(self
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT {PROPOSAL_COLS} FROM proposals WHERE agent_id = ?1 \
+                     AND provider NOT LIKE 'mcp:%' ORDER BY id DESC LIMIT 1"
+                ),
+                params![agent_id],
+                proposal_row,
+            )
+            .optional()?)
+    }
+
+    /// The newest proposal an outside agent sent through MCP.
+    pub fn latest_mcp_proposal(&self, agent_id: &str) -> Result<Option<ProposalRow>> {
+        Ok(self
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT {PROPOSAL_COLS} FROM proposals WHERE agent_id = ?1 \
+                     AND provider LIKE 'mcp:%' ORDER BY id DESC LIMIT 1"
+                ),
+                params![agent_id],
+                proposal_row,
+            )
+            .optional()?)
+    }
+
     /// The `n` newest proposals for a VPS, newest first.
     pub fn recent_proposals(&self, agent_id: &str, n: i64) -> Result<Vec<ProposalRow>> {
         let mut stmt = self.conn.prepare(&format!(

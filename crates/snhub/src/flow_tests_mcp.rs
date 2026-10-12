@@ -218,7 +218,7 @@ async fn mcp_tools_follow_the_token_scope() {
         .call(
             &read,
             "ban_ip",
-            json!({ "vps": "web-01", "ip": "203.0.113.9" }),
+            json!({ "vps": "web-01", "ip": "45.133.1.10" }),
         )
         .await;
     assert_eq!(res["isError"], true, "{res}");
@@ -279,7 +279,7 @@ async fn mcp_reads_the_fleet_and_bans_only_real_addresses() {
         .call(
             &act,
             "ban_ip",
-            json!({ "vps": "all", "ip": "203.0.113.9", "ttl_secs": 999_999 }),
+            json!({ "vps": "all", "ip": "45.133.1.10", "ttl_secs": 999_999 }),
         )
         .await;
     assert_eq!(ok["isError"], false, "{ok}");
@@ -288,12 +288,16 @@ async fn mcp_reads_the_fleet_and_bans_only_real_addresses() {
         "capped at a day"
     );
     let (_, _, d) = h.st.db.lock().unwrap().get_desired(&id).unwrap().unwrap();
-    assert_eq!(d.bans[0].ip, "203.0.113.9");
+    assert_eq!(d.bans[0].ip, "45.133.1.10");
     // The decisions log names the token.
     let log = h
         .call(&act, "get_activity_log", json!({ "vps": "web-01" }))
         .await;
-    assert_eq!(log["structuredContent"]["entries"][0]["who"], "mcp:hermes");
+    let who = log["structuredContent"]["entries"][0]["who"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(who.starts_with("mcp:hermes#"), "{who}");
 }
 
 #[tokio::test]
@@ -335,10 +339,11 @@ async fn mcp_plans_are_checked_against_the_evidence_and_ordered_only_with_act() 
     let props = h
         .call(&act, "get_proposals", json!({ "vps": "web-01" }))
         .await;
-    assert_eq!(
-        props["structuredContent"]["proposals"][0]["by"],
-        "mcp:hermes"
-    );
+    let by = props["structuredContent"]["proposals"][0]["by"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(by.starts_with("mcp:hermes#"), "{by}");
 }
 
 #[tokio::test]
@@ -384,5 +389,186 @@ async fn the_hermes_page_makes_and_revokes_tokens_with_the_password() {
         )
         .await;
     assert!(r.location().contains("msg="));
+    assert_eq!(h.mcp(&tok, &ping).await.status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn waiting_states_are_answers_not_errors() {
+    // Hermes stops calling a server after three errors in a row: "not yet" must
+    // not look like one.
+    let h = hub();
+    let act = h.token("act");
+    {
+        let db = h.st.db.lock().unwrap();
+        db.enroll_agent("bare", "ed25519:y", now()).unwrap();
+    }
+    let ev = h.call(&act, "get_evidence", json!({ "vps": "bare" })).await;
+    assert_eq!(ev["isError"], false, "{ev}");
+    assert_eq!(ev["structuredContent"]["status"], "none");
+    let plan = json!({ "vps": "bare", "diagnosis": "d", "actions": [] });
+    let r = h.call(&act, "submit_plan", plan).await;
+    assert_eq!(r["isError"], false, "{r}");
+    assert_eq!(r["structuredContent"]["status"], "need_evidence");
+    // A busy VPS: the order is not sent, and says so plainly.
+    let id = h.vps(&["evidence", "remediate", "clamav"]);
+    let first = h
+        .call(&act, "run_malware_scan", json!({ "vps": "web-01" }))
+        .await;
+    assert_eq!(first["structuredContent"]["queued"], true, "{first}");
+    let second = h
+        .call(&act, "install_clamav", json!({ "vps": "web-01" }))
+        .await;
+    assert_eq!(second["isError"], false, "{second}");
+    assert_eq!(second["structuredContent"]["busy"], true);
+    // Evidence that is still fresh is not asked for again.
+    let r = h
+        .call(&act, "request_evidence", json!({ "vps": "web-01" }))
+        .await;
+    assert_eq!(r["structuredContent"]["fresh"], true, "{r}");
+    let _ = id;
+}
+
+#[tokio::test]
+async fn an_outside_agent_cannot_free_an_attacker_or_switch_protection_off() {
+    let h = hub();
+    let id = h.vps(&["evidence", "remediate"]);
+    let act = h.token("act");
+    // Only the admin turns automatic blocking off.
+    let r = h
+        .call(
+            &act,
+            "set_mode",
+            json!({ "vps": "web-01", "mode": "observe" }),
+        )
+        .await;
+    assert_eq!(r["isError"], true);
+    let r = h
+        .call(
+            &act,
+            "set_mode",
+            json!({ "vps": "web-01", "mode": "enforce" }),
+        )
+        .await;
+    assert_eq!(r["structuredContent"]["mode"], "enforce", "{r}");
+    // Unban lifts only what the hub ordered; nothing goes on the VPS's own
+    // unban list.
+    h.call(
+        &act,
+        "ban_ip",
+        json!({ "vps": "web-01", "ip": "45.133.1.10" }),
+    )
+    .await;
+    let r = h
+        .call(
+            &act,
+            "unban_ip",
+            json!({ "vps": "web-01", "ip": "45.133.1.10" }),
+        )
+        .await;
+    assert_eq!(r["structuredContent"]["lifted_on"][0], "web-01", "{r}");
+    let r = h
+        .call(
+            &act,
+            "unban_ip",
+            json!({ "vps": "web-01", "ip": "91.92.93.94" }),
+        )
+        .await;
+    assert_eq!(r["structuredContent"]["no_hub_ban_on"][0], "web-01", "{r}");
+    let (_, _, d) = h.st.db.lock().unwrap().get_desired(&id).unwrap().unwrap();
+    assert!(
+        d.bans.is_empty() && d.unbans.is_empty(),
+        "{:?} {:?}",
+        d.bans,
+        d.unbans
+    );
+    // Private networks are not for an outside agent to block.
+    let r = h
+        .call(&act, "ban_ip", json!({ "vps": "all", "ip": "10.0.0.1" }))
+        .await;
+    assert_eq!(r["isError"], true);
+}
+
+#[tokio::test]
+async fn a_plan_from_hermes_does_not_hide_the_built_in_ai() {
+    let h = hub();
+    let id = h.vps(&["evidence", "remediate"]);
+    let propose = h.token("propose");
+    {
+        let db = h.st.db.lock().unwrap();
+        db.create_proposal(
+            now(),
+            &crate::db_ai::NewProposal {
+                agent_id: &id,
+                provider: "AI tích hợp",
+                status: "proposed",
+                plan: &snsec_common::ai::Plan::default(),
+                note: "",
+                auto: false,
+            },
+        )
+        .unwrap();
+    }
+    let plan = json!({ "vps": "web-01", "diagnosis": "d", "actions": [] });
+    h.call(&propose, "submit_plan", plan).await;
+    let db = h.st.db.lock().unwrap();
+    assert_eq!(
+        db.latest_ai_proposal(&id).unwrap().unwrap().provider,
+        "AI tích hợp"
+    );
+    assert!(
+        db.latest_mcp_proposal(&id)
+            .unwrap()
+            .unwrap()
+            .provider
+            .starts_with("mcp:")
+    );
+}
+
+#[tokio::test]
+async fn a_huge_plan_is_refused_before_it_costs_anything() {
+    let h = hub();
+    h.vps(&["evidence", "remediate"]);
+    let propose = h.token("propose");
+    let junk: Vec<Value> = (0..5_000).map(|_| json!(0)).collect();
+    let r = h
+        .call(
+            &propose,
+            "submit_plan",
+            json!({ "vps": "web-01", "diagnosis": "d", "actions": junk }),
+        )
+        .await;
+    assert_eq!(r["isError"], true);
+    // And a body over the endpoint's limit never reaches the parser.
+    let big = "x".repeat(200 * 1024);
+    let r = h
+        .mcp(
+            &propose,
+            &json!({ "jsonrpc": "2.0", "id": 1, "method": "ping", "params": { "pad": big } }),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn a_new_password_revokes_every_hermes_token() {
+    let h = hub();
+    let cookie = h.sign_in().await;
+    let tok = h.token("act");
+    let ping = json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" });
+    assert_eq!(h.mcp(&tok, &ping).await.status, StatusCode::OK);
+    let new_pw = "another long passphrase";
+    let r = h
+        .post(
+            "/security/password",
+            &cookie,
+            &format!(
+                "{}&new={}&confirm={}",
+                pw_form().replace("password=", "current="),
+                web::urlenc(new_pw),
+                web::urlenc(new_pw)
+            ),
+        )
+        .await;
+    assert!(r.location().contains("msg="), "{}", r.location());
     assert_eq!(h.mcp(&tok, &ping).await.status, StatusCode::UNAUTHORIZED);
 }

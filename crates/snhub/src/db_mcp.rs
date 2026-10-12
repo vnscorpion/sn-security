@@ -170,6 +170,29 @@ impl Db {
         .unwrap_or_default()
     }
 
+    /// Revoke every live token; returns how many. Done whenever the admin's
+    /// credentials are reset: whoever had the old password could have made one.
+    ///
+    /// # Errors
+    /// A database error.
+    pub fn revoke_all_mcp_tokens(&self) -> Result<usize> {
+        Ok(self
+            .conn
+            .execute("UPDATE mcp_tokens SET revoked = 1 WHERE revoked = 0", [])?)
+    }
+
+    /// Is a name already used by a live token?
+    #[must_use]
+    pub fn mcp_name_taken(&self, name: &str) -> bool {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM mcp_tokens WHERE revoked = 0 AND name = ?1",
+                params![clean_name(name)],
+                |r| r.get::<_, i64>(0),
+            )
+            .is_ok_and(|n| n > 0)
+    }
+
     /// Revoke a token; `true` if one was live.
     ///
     /// # Errors

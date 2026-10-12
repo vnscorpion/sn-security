@@ -132,6 +132,8 @@ fn back(id: &str, msg: &str) -> Response {
 pub struct AiCardData {
     pub state: AiState,
     pub proposal: Option<ProposalRow>,
+    /// The newest plan an outside agent (Hermes, through MCP) sent, shown apart.
+    pub mcp_proposal: Option<ProposalRow>,
     pub evidence: Option<Evidence>,
     pub has_provider: bool,
     pub provider_name: String,
@@ -203,6 +205,9 @@ pub fn ai_card(agent_id: &str, report: Option<&ReportBody>, d: &AiCardData, msg:
             }
 
             @if let Some(p) = &d.proposal {
+                (proposal_block(agent_id, p, d.evidence.as_ref(), can_remediate))
+            }
+            @if let Some(p) = &d.mcp_proposal {
                 (proposal_block(agent_id, p, d.evidence.as_ref(), can_remediate))
             }
         }
@@ -318,7 +323,8 @@ pub fn card_data(st: &AppState, agent_id: &str) -> AiCardData {
     let db = st.db.lock().expect("db");
     AiCardData {
         state: db.ai_state(agent_id).unwrap_or_default(),
-        proposal: db.latest_proposal(agent_id).ok().flatten(),
+        proposal: db.latest_ai_proposal(agent_id).ok().flatten(),
+        mcp_proposal: db.latest_mcp_proposal(agent_id).ok().flatten(),
         evidence: db.latest_evidence(agent_id).ok().flatten(),
         has_provider: db.default_provider().ok().flatten().is_some(),
         provider_name: db
@@ -774,6 +780,7 @@ mod tests {
         AiCardData {
             state: AiState::default(),
             proposal,
+            mcp_proposal: None,
             evidence: ev,
             has_provider: true,
             provider_name: "Hermes".into(),

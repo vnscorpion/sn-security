@@ -95,7 +95,7 @@ pub async fn post_report(State(st): State<Arc<AppState>>, body: String) -> impl 
         // analysis has not been dealt with: asking the model again about the same
         // incident would only repeat itself and cost money.
         let open_proposal = db
-            .latest_proposal(&agent_id)
+            .latest_ai_proposal(&agent_id)
             .ok()
             .flatten()
             .is_some_and(|p| {

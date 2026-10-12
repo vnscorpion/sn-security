@@ -1091,12 +1091,19 @@ pub async fn security_page(
                             span class="mut" { "; 30 giây trước " (prev) ", 30 giây sau " (next) }
                         }
                         p id="clock-skew" style="display:none;color:var(--warn);margin:6px 0" {}
+                        // Hidden by the script below; still shown means scripts are
+                        // blocked (often a reverse proxy's Content-Security-Policy).
+                        p id="js-off" style="color:var(--warn);margin:6px 0" {
+                            "Trình duyệt đang chặn JavaScript trên trang này (thường do Content-Security-Policy của reverse proxy, ví dụ "
+                            code { "script-src 'none'" } "): đồng hồ đếm ngược, kiểm tra giờ và passkey không chạy. Xem deploy/examples/Caddyfile."
+                        }
                         // Count down for real, say when the shown codes are stale, and
                         // compare this server's clock with the browser's: a server
                         // clock that is minutes or hours off is the usual reason an
                         // authenticator's codes never match.
                         script { (PreEscaped(format!(
-                            "(function(){{var srv={srv},t0=Date.now(),left={left};\
+                            "(function(){{var off=document.getElementById('js-off');if(off)off.style.display='none';\
+                             var srv={srv},t0=Date.now(),left={left};\
                              var el=document.getElementById('totp-left');\
                              var tick=function(){{var l=left-Math.floor((Date.now()-t0)/1000);\
                              el.textContent=l>0?' — còn '+l+' giây':' — mã này đã cũ, tải lại trang để xem mã mới';\
@@ -1292,17 +1299,24 @@ pub async fn change_password(
         return back("Không lưu được mật khẩu mới.");
     }
     let ended = st.sessions.remove_all_except(&tok);
+    // Whoever knew the old password could have made a Hermes token with it.
+    let tokens = st
+        .db
+        .lock()
+        .ok()
+        .and_then(|d| d.revoke_all_mcp_tokens().ok())
+        .unwrap_or(0);
     if let Ok(db) = st.db.lock() {
         db.log_login(
             at,
             &auth::client_ip(&headers),
             true,
             "đổi mật khẩu",
-            &format!("đăng xuất {ended} phiên khác"),
+            &format!("đăng xuất {ended} phiên khác, thu hồi {tokens} token Hermes"),
         );
     }
     back(&format!(
-        "Đã đổi mật khẩu; đã đăng xuất {ended} phiên khác."
+        "Đã đổi mật khẩu; đã đăng xuất {ended} phiên khác và thu hồi {tokens} token Hermes (tạo lại ở trang Hermes)."
     ))
 }
 
