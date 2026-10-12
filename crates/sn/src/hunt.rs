@@ -21,7 +21,7 @@ const PHP_EXTS: &[&str] = &[
 ];
 const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "gif", "webp", "bmp", "ico", "svg"];
 /// Files handed to ClamAV in one hunt.
-const MAX_CLAM_FILES: usize = 200_000;
+const MAX_CLAM_FILES: usize = crate::clamav_cache::MAX_ENTRIES;
 /// What a hunt may use in total, a little under the 30 minutes the systemd unit
 /// allows. ClamAV only gets what the file walk leaves.
 const HUNT_BUDGET_SECS: u64 = 28 * 60;
@@ -35,11 +35,23 @@ pub struct Options {
 }
 
 pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<Vec<Finding>> {
-    let roots = if opts.roots.is_empty() {
+    let given = if opts.roots.is_empty() {
         cfg.hunt.allowed_roots.clone()
     } else {
         opts.roots.clone()
     };
+    // Walk the real paths: ClamAV prints every file under its resolved name, and
+    // a root reached through a symlink (/var/www -> /srv/www) would otherwise
+    // never match. Interior links are not followed by the walk.
+    let mut roots: Vec<String> = Vec::new();
+    for r in &given {
+        if let Ok(c) = std::fs::canonicalize(r)
+            && let Some(s) = c.to_str()
+            && !roots.iter().any(|x| x == s)
+        {
+            roots.push(s.to_string());
+        }
+    }
     let max_bytes = opts.max_file_mb.max(1) * 1024 * 1024;
     let window = opts.days as i64 * 86_400;
     let now = util::now_secs();
@@ -111,9 +123,15 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<Vec<Finding>> 
                     use std::os::unix::fs::MetadataExt;
                     clam_files.push(crate::clamav_cache::FileInfo {
                         path: p.to_string(),
-                        size: meta.size(),
-                        mtime: meta.mtime(),
-                        ctime: meta.ctime(),
+                        stamp: crate::clamav_cache::Stamp {
+                            dev: meta.dev(),
+                            ino: meta.ino(),
+                            size: meta.size(),
+                            mtime: meta.mtime(),
+                            mtime_nsec: meta.mtime_nsec(),
+                            ctime: meta.ctime(),
+                            ctime_nsec: meta.ctime_nsec(),
+                        },
                     });
                 }
                 _ => clam_skipped += 1,
@@ -162,6 +180,7 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<Vec<Finding>> 
     let clam = crate::clamav_run::scan(
         cfg,
         state,
+        &roots,
         &clam_files,
         clam_skipped,
         opts.max_file_mb,
