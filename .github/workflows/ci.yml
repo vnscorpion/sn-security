@@ -64,7 +64,9 @@ jobs:
         run: ls -la target/${{ matrix.arch }}-unknown-linux-musl/release/sn target/${{ matrix.arch }}-unknown-linux-musl/release/snhub
 
   # Runs the real install/update scripts as root on the runner against a local
-  # "release" (this build of snhub, a stand-in sn) and checks what they leave.
+  # "release" (this build of snhub, a stand-in sn, the dist/ installer) and checks
+  # what they leave. Hubs serve dist/, not deploy/: the scripts download
+  # dist/install.sh and the dist/ binaries, so those are what is checked here.
   deploy:
     name: deploy scripts (hub install + update, agent installer)
     runs-on: ubuntu-latest
@@ -84,6 +86,22 @@ jobs:
               *) dash -n "$f" ;;
             esac
           done
+      - name: dist/ holds this tree's installer and verified checksums
+        run: |
+          cmp deploy/install.sh dist/install.sh || {
+            echo "::error::dist/install.sh is not deploy/install.sh: hubs would keep serving the old installer. Copy it and regenerate dist/SHA256SUMS."
+            exit 1
+          }
+          (cd dist && sha256sum --strict -c SHA256SUMS)
+          # Text-mode lines ("<sha256>  <name>"), one for every file in dist/.
+          for f in dist/*; do
+            n="${f#dist/}"
+            case "$n" in SHA256SUMS|SHA256SUMS.minisig) continue;; esac
+            grep -E '^[0-9a-f]{64}  ' dist/SHA256SUMS | cut -c67- | grep -qxF -- "$n" || {
+              echo "::error::dist/SHA256SUMS has no text-mode line for $n"
+              exit 1
+            }
+          done
       - name: build snhub
         run: cargo build -p snhub --locked
       - name: stage a release and serve it
@@ -91,7 +109,9 @@ jobs:
           rel="$RUNNER_TEMP/rel"
           mkdir -p "$rel/dist" "$rel/deploy/systemd"
           cp target/debug/snhub "$rel/dist/snhub-x86_64"
-          # Stand-in agent: records how install.sh calls `sn enroll`. With
+          # Stand-in agent: records how install.sh calls `sn enroll`, and every
+          # command line on the machine that holds the token at that moment (the
+          # installer's sh, sudo, script: all still running). With
           # /run/sn-ci-old-agent present it behaves like an sn that only takes --token.
           cat > "$rel/dist/sn-x86_64" <<'EOF'
           #!/bin/sh
@@ -99,6 +119,14 @@ jobs:
             *" --version "*) echo "sn 0.0.0-ci"; exit 0;;
             *" enroll "*)
               printf 'argv:%s\nenv:%s\n' "$*" "${SN_ENROLL_TOKEN:-}" >> /run/sn-ci-enroll.log
+              tok="${SN_ENROLL_TOKEN:-}"
+              if [ -n "$tok" ]; then
+                # tr and case keep the token off this probe's own command lines.
+                for f in /proc/[0-9]*/cmdline; do
+                  c="$(tr '\0' ' ' < "$f" 2>/dev/null)" || continue
+                  case "$c" in *"$tok"*) printf 'leak:%s %s\n' "$f" "$c" >> /run/sn-ci-enroll.log;; esac
+                done
+              fi
               if [ -e /run/sn-ci-old-agent ]; then
                 case " $* " in
                   *" --token "*) ;;
@@ -111,7 +139,7 @@ jobs:
           EOF
           cp "$rel/dist/sn-x86_64" "$rel/dist/sn-aarch64"
           chmod 0755 "$rel/dist/sn-x86_64" "$rel/dist/sn-aarch64"
-          cp deploy/install.sh "$rel/dist/install.sh"
+          cp dist/install.sh "$rel/dist/install.sh"
           (cd "$rel/dist" && sha256sum snhub-x86_64 sn-x86_64 sn-aarch64 install.sh > SHA256SUMS)
           cp deploy/systemd/snhub.service "$rel/deploy/systemd/"
           nohup python3 -m http.server 8765 --bind 127.0.0.1 --directory "$rel" >/dev/null 2>&1 &
@@ -132,12 +160,16 @@ jobs:
             want_mode /var/lib/snhub/public/sn-x86_64 "755 root:root"
             want_mode /var/lib/snhub/public/install.sh "644 root:root"
             want_mode /var/lib/snhub/public/SHA256SUMS "644 root:root"
+            # Exactly what the scripts put there, and no temporary copy left over.
+            got="$(sudo ls -A /var/lib/snhub/public | LC_ALL=C sort | tr '\n' ' ')"
+            [ "$got" = "SHA256SUMS install.sh sn-aarch64 sn-x86_64 " ] || fail "public/ holds: $got"
+            [ -z "$(sudo find /var/lib/snhub -maxdepth 1 -name '.public.*')" ] || fail "a temporary public/ was left behind"
             want_mode /etc/snhub "750 snhub:snhub"
             want_mode /etc/snhub/snhub.toml "640 snhub:snhub"
             [ "$(systemctl show -p UMask --value snhub)" = 0077 ] || fail "snhub.service UMask is not 0077"
             # The hub still serves what VPSes download.
             for _ in $(seq 30); do curl -fsS -o /dev/null http://127.0.0.1:8099/healthz && break; sleep 1; done
-            curl -fsS http://127.0.0.1:8099/install.sh | cmp - deploy/install.sh
+            curl -fsS http://127.0.0.1:8099/install.sh | cmp - dist/install.sh
             curl -fsS http://127.0.0.1:8099/sn/sn-x86_64 | cmp - "$RUNNER_TEMP/rel/dist/sn-x86_64"
             sums="$(curl -fsS http://127.0.0.1:8099/sn/SHA256SUMS)"
             grep -q ' sn-x86_64$' <<<"$sums" || fail "/sn/SHA256SUMS lacks sn-x86_64"
@@ -155,6 +187,16 @@ jobs:
           }
           no_token_in_argv() {
             if sudo grep '^argv:.*--token' /run/sn-ci-enroll.log; then fail "the token reached sn's arguments"; fi
+          }
+          token_on_no_command_line() {
+            if sudo grep '^leak:' /run/sn-ci-enroll.log; then fail "the token was on a command line while the installer ran"; fi
+          }
+          # The install command and the token `snhub add-vps` prints for a new VPS.
+          add_vps() {
+            out="$(sudo -u snhub /usr/local/bin/snhub --config /etc/snhub/snhub.toml add-vps --name "$1")"
+            cmd="$(printf '%s\n' "$out" | grep -m1 '^curl ' || true)"
+            tok="$(printf '%s\n' "$out" | sed -n -e 's/^Token: *//p' -e 's/.* --token \([A-Za-z0-9_-]*\).*/\1/p' | head -n 1)"
+            [ -n "$cmd" ] && [ -n "$tok" ] || fail "no install command and token in: $out"
           }
           EOF
       - name: install-hub.sh
@@ -175,13 +217,20 @@ jobs:
           sudo sed -i '/^UMask=/d; /^ReadOnlyPaths=.*\/var\/lib\/snhub\//d' /etc/systemd/system/snhub.service
           sudo systemctl daemon-reload
           sudo systemctl start snhub
-          # A link the hub's user left in public/: root must replace it, not write through it.
+          # What the hub's user could leave in public/: a link where a file goes
+          # (root must replace it, not write through it), a directory where a file
+          # goes, and an extra file that /sn/<file> would serve.
           echo decoy | sudo tee /opt/sn-ci-decoy >/dev/null
           sudo -u snhub ln -sfn /opt/sn-ci-decoy /var/lib/snhub/public/SHA256SUMS
+          sudo -u snhub rm -f /var/lib/snhub/public/install.sh
+          sudo -u snhub mkdir -p /var/lib/snhub/public/install.sh/sub
+          echo planted | sudo -u snhub tee /var/lib/snhub/public/extra >/dev/null
           sudo bash deploy/update-hub.sh --repo-raw http://127.0.0.1:8765
           [ "$(sudo cat /opt/sn-ci-decoy)" = decoy ] || fail "update-hub.sh wrote through a link in public/"
           sudo test -f /etc/systemd/system/snhub.service.d/10-hardening.conf || fail "no hardening drop-in"
           hub_checks
+          code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8099/sn/extra)"
+          [ "$code" = 404 ] || fail "the hub still serves a file planted in public/ ($code)"
           # public/ itself swapped for a link (possible while the hub's user could
           # rename it): the next update builds a real directory again.
           sudo mkdir -p /opt/sn-ci-decoy-dir
@@ -192,48 +241,112 @@ jobs:
           sudo test ! -L /var/lib/snhub/public || fail "public/ is still a link"
           sudo rm -rf /var/lib/snhub/public.old
           hub_checks
-      - name: install.sh keeps the enrollment token out of argument lists
+      - name: a failed install-hub.sh or update-hub.sh run leaves the hub running
+        run: |
+          . "$RUNNER_TEMP/check.sh"
+          # A data dir under /proc fails once the scripts have stopped the hub.
+          if sudo bash deploy/install-hub.sh --repo-raw http://127.0.0.1:8765 --public-url http://127.0.0.1:8099 --data-dir /proc/sn-ci; then
+            fail "install-hub.sh succeeded with an unusable data dir"
+          fi
+          systemctl is-active --quiet snhub || fail "a failed install-hub.sh left the hub down"
+          if sudo bash deploy/update-hub.sh --repo-raw http://127.0.0.1:8765 --data-dir /proc/sn-ci; then
+            fail "update-hub.sh succeeded with an unusable data dir"
+          fi
+          systemctl is-active --quiet snhub || fail "a failed update-hub.sh left the hub down"
+          hub_checks
+      # Every run goes through the hub, as on a VPS: what it serves is dist/install.sh.
+      - name: install.sh keeps the enrollment token off every command line
         run: |
           . "$RUNNER_TEMP/check.sh"
           hub=http://127.0.0.1:8099
           # Installed here, without a terminal, so the runs below never meet an apt prompt.
           command -v nft >/dev/null || sudo apt-get install -y -qq nftables
-          # No token and no terminal: stop before changing anything.
-          if cat deploy/install.sh | sudo sh -s -- --hub "$hub" --name ci-01 2>"$RUNNER_TEMP/err"; then
+          # No token and no terminal: stop before changing anything, and say how
+          # to pass it without a command line.
+          if curl -fsSL "$hub/install.sh" | sudo sh -s -- --hub "$hub" --name ci-01 2>"$RUNNER_TEMP/err"; then
             fail "install.sh ran without a token"
           fi
-          grep -q SN_ENROLL_TOKEN "$RUNNER_TEMP/err" || fail "no hint about SN_ENROLL_TOKEN"
+          grep -q -- '--preserve-env=SN_ENROLL_TOKEN' "$RUNNER_TEMP/err" || fail "no hint about SN_ENROLL_TOKEN"
           [ ! -e /usr/local/bin/sn ] || fail "installed before it had a token"
           # The token typed on the terminal, as under `curl | sudo sh`. An earlier
           # `sn triage` from a umask-022 root shell left /var/lib/sn 0755.
           sudo mkdir -p /var/lib/sn
           sudo chmod 0755 /var/lib/sn
-          printf 'tok-tty-1\n' | sudo script -qec "cat deploy/install.sh | sh -s -- --hub $hub --name ci-01" /dev/null
+          printf 'tok-tty-1\n' | sudo script -qec "curl -fsSL $hub/install.sh | sh -s -- --hub $hub --name ci-01" /dev/null
           enrolled_has 'env:tok-tty-1'
           enrolled_has "argv:--config /etc/sn/agent.toml enroll --url $hub --name ci-01"
           no_token_in_argv
+          token_on_no_command_line
           want_mode /var/lib/sn "700 root:root"
-          # The old --token form still works, with a warning, and still uses the environment.
+          # The old --token form still works, with a warning, and still hands sn
+          # the token in the environment. Its own command line holds the token,
+          # which the probe must see.
           sudo rm -f /run/sn-ci-enroll.log
-          cat deploy/install.sh | sudo sh -s -- --hub "$hub" --name ci-02 --token tok-arg-1 2>"$RUNNER_TEMP/err"
-          grep -q -- '--token puts the token' "$RUNNER_TEMP/err" || fail "no warning for --token"
+          curl -fsSL "$hub/install.sh" | sudo sh -s -- --hub "$hub" --name ci-02 --token tok-arg-1 2>"$RUNNER_TEMP/err"
+          grep -q -- '--token: every local user' "$RUNNER_TEMP/err" || fail "no warning for --token"
           enrolled_has 'env:tok-arg-1'
           no_token_in_argv
-          # Automation without a terminal: the token in the environment.
+          sudo grep -q '^leak:' /run/sn-ci-enroll.log || fail "the probe missed the token on the --token command line"
+          # Automation without a terminal, through sudo: exported, then preserved.
           sudo rm -f /run/sn-ci-enroll.log
-          cat deploy/install.sh | sudo env SN_ENROLL_TOKEN=tok-env-1 sh -s -- --hub "$hub" --name ci-03
+          export SN_ENROLL_TOKEN=tok-env-1
+          curl -fsSL "$hub/install.sh" | sudo --preserve-env=SN_ENROLL_TOKEN sh -s -- --hub "$hub" --name ci-03
+          unset SN_ENROLL_TOKEN
           enrolled_has 'env:tok-env-1'
           no_token_in_argv
+          token_on_no_command_line
+          # Automation without a terminal, as root: exported in the root shell.
+          sudo rm -f /run/sn-ci-enroll.log
+          sudo bash -s <<EOF
+          export SN_ENROLL_TOKEN=tok-root-1
+          curl -fsSL $hub/install.sh | sh -s -- --hub $hub --name ci-05
+          EOF
+          enrolled_has 'env:tok-root-1'
+          no_token_in_argv
+          token_on_no_command_line
           # An sn that only takes --token gets it that way.
           sudo rm -f /run/sn-ci-enroll.log
           sudo touch /run/sn-ci-old-agent
-          cat deploy/install.sh | sudo env SN_ENROLL_TOKEN=tok-old-1 sh -s -- --hub "$hub" --name ci-04
+          export SN_ENROLL_TOKEN=tok-old-1
+          curl -fsSL "$hub/install.sh" | sudo --preserve-env=SN_ENROLL_TOKEN sh -s -- --hub "$hub" --name ci-04
+          unset SN_ENROLL_TOKEN
           enrolled_has "argv:--config /etc/sn/agent.toml enroll --url $hub --name ci-04 --token tok-old-1"
           sudo rm -f /run/sn-ci-old-agent
           # --upgrade tightens a loose /var/lib/sn too.
           sudo chmod 0755 /var/lib/sn
-          cat deploy/install.sh | sudo sh -s -- --hub "$hub" --upgrade
+          curl -fsSL "$hub/install.sh" | sudo sh -s -- --hub "$hub" --upgrade
           want_mode /var/lib/sn "700 root:root"
+      # The command the hub gives for a new VPS is the main way in: the token is
+      # shown apart from it and typed when the installer asks.
+      - name: the install command the hub prints carries no token
+        run: |
+          . "$RUNNER_TEMP/check.sh"
+          hub=http://127.0.0.1:8099
+          add_vps ci-06
+          case "$cmd" in *--token*|*"$tok"*) fail "the install command carries the token: $cmd";; esac
+          [ "$cmd" = "curl -fsSL $hub/install.sh | sudo sh -s -- --hub $hub --name ci-06" ] || fail "unexpected install command: $cmd"
+          # Run as an admin would, typing the token when asked (as root inside a
+          # terminal, which is what the command's `sudo sh` gives).
+          sudo rm -f /run/sn-ci-enroll.log
+          printf '%s\n' "$tok" | sudo script -qec "${cmd/| sudo sh/| sh}" /dev/null
+          enrolled_has "env:$tok"
+          enrolled_has "argv:--config /etc/sn/agent.toml enroll --url $hub --name ci-06"
+          no_token_in_argv
+          token_on_no_command_line
+      # The installer hands the token over in the environment; an agent built
+      # before that only takes --token, and enrolling then puts it in its argv.
+      # Run even after a failure above, so a stale dist/ is reported too.
+      - name: the agent in dist/ enrolls with the token in its environment
+        if: ${{ !cancelled() }}
+        run: |
+          . "$RUNNER_TEMP/check.sh"
+          add_vps ci-dist
+          install -m 0755 dist/sn-x86_64 "$RUNNER_TEMP/sn-dist"
+          rc=0
+          SN_ENROLL_TOKEN="$tok" "$RUNNER_TEMP/sn-dist" --config "$RUNNER_TEMP/agent.toml" \
+            enroll --url http://127.0.0.1:8099 --name ci-dist || rc=$?
+          [ "$rc" -ne 2 ] || fail "dist/sn-x86_64 takes the token only as an argument: rebuild dist/ from this tree"
+          [ "$rc" -eq 0 ] || fail "dist/sn-x86_64 could not enroll (exit $rc)"
 
   audit:
     name: cargo audit + deny (advisory)

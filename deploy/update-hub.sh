@@ -8,6 +8,12 @@
 # the new agent. Data, keys, config and the admin password are left untouched.
 # All downloads are sha256-verified before anything is replaced. File permissions
 # are brought in line with a fresh install (see lock_down below).
+#
+# The sha256 check catches a damaged or mixed download, not a malicious one:
+# SHA256SUMS comes from the same branch as the binaries, so whoever can push there
+# decides what the hub and every VPS run (signed releases: SEC-5, docs/REVIEW.md).
+# To install only a commit you have reviewed, fetch this script from that commit
+# and pass --repo-raw https://raw.githubusercontent.com/vnscorpion/sn-security/COMMIT
 set -eu
 
 REPO_RAW="https://raw.githubusercontent.com/vnscorpion/sn-security/main"
@@ -32,10 +38,13 @@ esac
 
 TMP="$(mktemp -d)"
 STOPPED=0
+NEWPUB=""
 cleanup() {
   rm -rf "$TMP"
+  [ -z "$NEWPUB" ] || rm -rf -- "$NEWPUB"
   # A failure between stop and start must not leave the hub down.
   if [ "$STOPPED" = 1 ] && ! systemctl is-active --quiet snhub; then
+    echo "!! update failed; starting snhub again" >&2
     systemctl start snhub || true
   fi
 }
@@ -57,20 +66,21 @@ echo ">> verifying checksums"
   done )
 
 # The agent binaries, install.sh and SHA256SUMS that every VPS runs as root are
-# written by root only. Older versions let the hub's user own public/, so a link
-# left in its place must not redirect root's writes.
+# root's alone. Older versions let the hub's user own public/, so it is built anew
+# in a root-made directory and swapped in whole: no link, directory or extra file
+# left there (/sn/<file> serves anything in it) survives or redirects root's writes.
 refresh_public() {
   pub="$DATA_DIR/public"
-  if [ -L "$pub" ] || { [ -e "$pub" ] && [ ! -d "$pub" ]; }; then rm -f "$pub"; fi
-  mkdir -p "$pub"
-  for f in sn-x86_64 sn-aarch64 install.sh SHA256SUMS; do rm -f "$pub/$f"; done
-  install -m 0755 "$1/sn-x86_64" "$pub/sn-x86_64"
-  install -m 0755 "$1/sn-aarch64" "$pub/sn-aarch64"
-  install -m 0644 "$1/install.sh" "$pub/install.sh"
-  grep -E ' (sn-x86_64|sn-aarch64|install.sh)$' "$1/SHA256SUMS" > "$TMP/SHA256SUMS.public"
-  install -m 0644 "$TMP/SHA256SUMS.public" "$pub/SHA256SUMS"
-  chown -R root:root "$pub"
-  chmod 0755 "$pub"
+  NEWPUB="$(mktemp -d "$DATA_DIR/.public.XXXXXX")"
+  install -m 0755 "$1/sn-x86_64" "$NEWPUB/sn-x86_64"
+  install -m 0755 "$1/sn-aarch64" "$NEWPUB/sn-aarch64"
+  install -m 0644 "$1/install.sh" "$NEWPUB/install.sh"
+  grep -E ' (sn-x86_64|sn-aarch64|install.sh)$' "$1/SHA256SUMS" > "$NEWPUB/SHA256SUMS"
+  chmod 0644 "$NEWPUB/SHA256SUMS"
+  chmod 0755 "$NEWPUB"
+  rm -rf -- "$pub"
+  mv -T -- "$NEWPUB" "$pub"
+  NEWPUB=""
 }
 
 # Only the hub's user may enter the data dir: the database holds the AI API keys,
@@ -97,8 +107,8 @@ STOPPED=1
 cp -f /usr/local/bin/snhub /usr/local/bin/snhub.bak
 install -m 0755 "$TMP/snhub-$ARCH" /usr/local/bin/snhub
 
-echo ">> refreshing the agent files served to VPSes"
-refresh_public "$TMP"
+# Permissions and the service hardening come before public/: if anything below
+# fails, the hub that cleanup() starts again already runs locked down.
 lock_down
 
 # An installed snhub.service may predate these settings; a drop-in adds them
@@ -113,6 +123,9 @@ ReadOnlyPaths=-$DATA_DIR/hub.key
 EOF
 chmod 0644 /etc/systemd/system/snhub.service.d/10-hardening.conf
 systemctl daemon-reload
+
+echo ">> refreshing the agent files served to VPSes"
+refresh_public "$TMP"
 
 echo ">> starting snhub"
 systemctl start snhub

@@ -3,9 +3,10 @@
 #
 #   curl -fsSL https://HUB/install.sh | sudo sh -s -- --hub https://HUB --name web-01
 #
-# It then asks on the terminal for the one-time enrollment token shown next to the
-# command, so the token never sits in the process list or the sudo log. With no
-# terminal (automation), pass it in the SN_ENROLL_TOKEN environment variable.
+# It then asks on the terminal for the one-time enrollment token the hub shows
+# below the command, so the token is on no command line: not in the process list,
+# not in the sudo log. With no terminal (automation), give it in SN_ENROLL_TOKEN,
+# set with `export` and never on a command line (see no_tty_help below).
 # `--token TOKEN` still works but every local user can read it while this runs.
 #
 # Downloads the sn binary from the hub (sha256-verified), detects the web server
@@ -28,8 +29,8 @@ while [ $# -gt 0 ]; do
     --name) NAME="$2"; shift 2;;
     --token)
       TOKEN="$2"; shift 2
-      echo "!! --token puts the token in the process list and the sudo log, readable by every local user." >&2
-      echo "   Leave it out next time: the installer asks for it." >&2
+      echo "!! --token: every local user can read the token in the process list while this runs," >&2
+      echo "   and sudo keeps it in its log. Without --token the installer asks for it." >&2
       ;;
     --arch) ARCH="$2"; shift 2;;
     --upgrade) UPGRADE=1; shift;;
@@ -40,18 +41,34 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# Ways to give the token without a terminal that keep it off every command line.
+# `sudo VAR=...` and `sudo env VAR=...` do not: sudo's own arguments hold it for
+# the whole install, and its log keeps it.
+no_tty_help() {
+  cat >&2 <<EOF
+no terminal to ask for the enrollment token. Run the command in an interactive shell, or
+\`export SN_ENROLL_TOKEN=<token>\` in the shell or script that runs the installer (never
+put the token on a command line), then:
+  as root (root shell, cloud-init):
+    curl -fsSL $HUB/install.sh | sh -s -- --hub $HUB --name $NAME
+  through sudo (sudo writes the value to its own log, readable by root and adm only):
+    curl -fsSL $HUB/install.sh | sudo --preserve-env=SN_ENROLL_TOKEN sh -s -- --hub $HUB --name $NAME
+\`sudo SN_ENROLL_TOKEN=...\` and \`sudo env SN_ENROLL_TOKEN=...\` show it to every local user.
+EOF
+}
+
 [ "$(id -u)" -eq 0 ] || { echo "run as root (sudo)"; exit 1; }
 [ -n "$HUB" ] || { echo "--hub is required"; exit 1; }
+HUB="${HUB%/}"
 if [ "$UPGRADE" -ne 1 ]; then
   [ -n "$NAME" ] || { echo "--name is required"; exit 1; }
   if [ -z "$TOKEN" ]; then
     # Under `curl | sh` stdin is the script itself: ask on the terminal.
     if ! (: </dev/tty) 2>/dev/null; then
-      echo "no terminal to ask for the enrollment token: run the command in an interactive shell," >&2
-      echo "or pass the token in the SN_ENROLL_TOKEN environment variable" >&2
+      no_tty_help
       exit 1
     fi
-    printf 'Enrollment token (shown on the hub next to this command): ' >/dev/tty
+    printf 'Enrollment token (shown on the hub below the install command): ' >/dev/tty
     read -r TOKEN </dev/tty || true
   fi
   TOKEN="$(printf '%s' "$TOKEN" | tr -d '[:space:]')"
@@ -60,7 +77,6 @@ if [ "$UPGRADE" -ne 1 ]; then
     *[!A-Za-z0-9_-]*) echo "that is not an enrollment token (paste only the token the hub shows)" >&2; exit 1;;
   esac
 fi
-HUB="${HUB%/}"
 
 if [ -z "$ARCH" ]; then
   m="$(uname -m)"

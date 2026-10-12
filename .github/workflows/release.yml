@@ -70,7 +70,8 @@ jobs:
       # Signs when the MINISIGN_SECRET secret holds a minisign secret key (plus
       # MINISIGN_PASSWORD if the key has one). The step tests the secret itself:
       # an `if:` cannot read secrets, and a job-level env would hand the key to the
-      # release action below as well.
+      # release action below as well. No release key exists yet (SEC-5); once one
+      # does and the install scripts check it, a missing secret must fail here.
       - name: sign SHA256SUMS
         env:
           MINISIGN_SECRET: ${{ secrets.MINISIGN_SECRET }}

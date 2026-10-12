@@ -12,6 +12,11 @@
 #
 # Installs the snhub binary + systemd service, seeds the agent installer/binaries
 # the hub serves to VPSes, generates keys, and prints the next steps.
+#
+# Downloads are checked against SHA256SUMS from the same branch: that catches a
+# damaged download, not a malicious one (signed releases: SEC-5, docs/REVIEW.md).
+# To install only a commit you have reviewed, fetch this script from that commit
+# and pass --repo-raw https://raw.githubusercontent.com/vnscorpion/sn-security/COMMIT
 set -eu
 
 REPO_RAW="https://raw.githubusercontent.com/vnscorpion/sn-security/main"
@@ -49,7 +54,18 @@ if command -v apt-get >/dev/null 2>&1; then
 fi
 
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+STOPPED=0
+NEWPUB=""
+cleanup() {
+  rm -rf "$TMP"
+  [ -z "$NEWPUB" ] || rm -rf -- "$NEWPUB"
+  # A re-run that fails after stopping the hub must not leave it down.
+  if [ "$STOPPED" = 1 ] && ! systemctl is-active --quiet snhub; then
+    echo "!! install failed; starting snhub again" >&2
+    systemctl start snhub || true
+  fi
+}
+trap cleanup EXIT
 
 # STAGE holds the artifacts to install; SYSTEMD_SRC holds the unit file.
 if [ "$LOCAL" = 1 ]; then
@@ -90,20 +106,21 @@ echo ">> verifying checksums"
   done )
 
 # The agent binaries, install.sh and SHA256SUMS that every VPS runs as root are
-# written by root only. Older versions let the hub's user own public/, so a link
-# left in its place must not redirect root's writes.
+# root's alone. Older versions let the hub's user own public/, so it is built anew
+# in a root-made directory and swapped in whole: no link, directory or extra file
+# left there (/sn/<file> serves anything in it) survives or redirects root's writes.
 refresh_public() {
   pub="$DATA_DIR/public"
-  if [ -L "$pub" ] || { [ -e "$pub" ] && [ ! -d "$pub" ]; }; then rm -f "$pub"; fi
-  mkdir -p "$pub"
-  for f in sn-x86_64 sn-aarch64 install.sh SHA256SUMS; do rm -f "$pub/$f"; done
-  install -m 0755 "$1/sn-x86_64" "$pub/sn-x86_64"
-  install -m 0755 "$1/sn-aarch64" "$pub/sn-aarch64"
-  install -m 0644 "$1/install.sh" "$pub/install.sh"
-  grep -E ' (sn-x86_64|sn-aarch64|install.sh)$' "$1/SHA256SUMS" > "$TMP/SHA256SUMS.public"
-  install -m 0644 "$TMP/SHA256SUMS.public" "$pub/SHA256SUMS"
-  chown -R root:root "$pub"
-  chmod 0755 "$pub"
+  NEWPUB="$(mktemp -d "$DATA_DIR/.public.XXXXXX")"
+  install -m 0755 "$1/sn-x86_64" "$NEWPUB/sn-x86_64"
+  install -m 0755 "$1/sn-aarch64" "$NEWPUB/sn-aarch64"
+  install -m 0644 "$1/install.sh" "$NEWPUB/install.sh"
+  grep -E ' (sn-x86_64|sn-aarch64|install.sh)$' "$1/SHA256SUMS" > "$NEWPUB/SHA256SUMS"
+  chmod 0644 "$NEWPUB/SHA256SUMS"
+  chmod 0755 "$NEWPUB"
+  rm -rf -- "$pub"
+  mv -T -- "$NEWPUB" "$pub"
+  NEWPUB=""
 }
 
 # Only the hub's user may enter the data dir: the database holds the AI API keys,
@@ -124,7 +141,10 @@ lock_down() {
 echo ">> installing snhub"
 # On a re-run, stop the running hub: nothing may change the files below meanwhile,
 # and `enable --now` then starts the new binary.
-systemctl stop snhub.service 2>/dev/null || true
+if systemctl is-active --quiet snhub.service; then
+  systemctl stop snhub.service
+  STOPPED=1
+fi
 install -m 0755 "$STAGE/snhub-$ARCH" /usr/local/bin/snhub
 
 if ! id snhub >/dev/null 2>&1; then
