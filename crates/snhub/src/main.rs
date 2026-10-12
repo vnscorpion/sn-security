@@ -243,12 +243,10 @@ fn cmd_serve(config_path: &Path) -> Result<()> {
     rt.block_on(async move { serve(cfg, state).await })
 }
 
-async fn serve(cfg: HubConfig, state: Arc<AppState>) -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()))
-        .init();
-
-    let app = Router::new()
+/// Every route, with the browser guard in front. Separate from `serve` so tests can
+/// drive the whole app without a socket.
+fn router(state: Arc<AppState>) -> Router {
+    Router::new()
         // agent API
         .route("/v1/report", post(api::post_report))
         .route("/v1/desired", get(api::get_desired))
@@ -332,7 +330,15 @@ async fn serve(cfg: HubConfig, state: Arc<AppState>) -> Result<()> {
             state.clone(),
             web_auth::browser_guard,
         ))
-        .with_state(state);
+        .with_state(state)
+}
+
+async fn serve(cfg: HubConfig, state: Arc<AppState>) -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()))
+        .init();
+
+    let app = router(state);
 
     let listener = tokio::net::TcpListener::bind(&cfg.bind)
         .await
@@ -380,3 +386,6 @@ async fn serve_file(path: &Path, content_type: &str) -> Response {
         Err(_) => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
 }
+
+#[cfg(test)]
+mod flow_tests;

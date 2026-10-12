@@ -739,9 +739,6 @@ if(j.codes&&j.codes.length){document.getElementById('pk-codes').textContent=j.co
 pub struct SecurityQuery {
     #[serde(default)]
     msg: String,
-    /// `1` while a new authenticator-app secret is waiting to be confirmed.
-    #[serde(default)]
-    totp: String,
 }
 
 pub async fn security_page(
@@ -766,8 +763,9 @@ pub async fn security_page(
     let passkey_ok = rp(&st).is_some();
     let sessions = st.sessions.list(at);
     let totp_on = totp_state.as_ref().is_some_and(|t| t.enabled);
-    // A secret that was shown but not yet confirmed: show it again with its QR.
-    let pending_totp = totp_state.as_ref().filter(|t| !t.enabled && q.totp == "1");
+    // A secret that was shown but not yet confirmed stays on screen (same QR) until it
+    // is confirmed or replaced, even after a reload or a visit to another page.
+    let pending_totp = totp_state.as_ref().filter(|t| !t.enabled);
     let qr = pending_totp
         .and_then(|t| totp::qr_svg(&totp::otpauth_uri("SN Secure", "admin", &t.secret)));
     let enrolled = totp_on || !passkeys.is_empty();
@@ -775,7 +773,9 @@ pub async fn security_page(
     let body = html! {
         h1 { "Bảo mật đăng nhập" }
         p class="sub" { "Mật khẩu, xác thực hai bước (ứng dụng hoặc passkey), mã khôi phục và các phiên đang mở." }
-        @if !q.msg.is_empty() { div class="note" { (q.msg) } }
+        // While a new authenticator secret is on screen the message belongs next to
+        // its form (the page jumps there), not at the top where it would be scrolled away.
+        @if !q.msg.is_empty() && pending_totp.is_none() { div class="note" { (q.msg) } }
 
         div class="card" {
             h2 { "Trạng thái" }
@@ -792,6 +792,7 @@ pub async fn security_page(
         div class="card" id="totp" {
             h2 { "Ứng dụng xác thực (Google Authenticator, Authy, 1Password…)" }
             @if let Some(t) = pending_totp {
+                @if !q.msg.is_empty() { div class="note" style="border-left-color:var(--bad);color:var(--fg)" { (q.msg) } }
                 p { "1. Quét mã QR bằng ứng dụng, hoặc nhập tay khoá bên dưới." }
                 @if let Some(svg) = &qr { div style="background:#fff;display:inline-block;padding:6px;border-radius:8px" { (PreEscaped(svg.clone())) } }
                 p { "Khoá: " code style="user-select:all;letter-spacing:2px" { (t.secret) } }
@@ -800,6 +801,16 @@ pub async fn security_page(
                     div class="ctrls" {
                         label class="f" { span class="t" { "Mã 6 số" } input type="text" name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="8" required; }
                         button type="submit" { "Bật" }
+                    }
+                }
+                details style="margin-top:12px" {
+                    summary class="mut" { "Quét nhầm hoặc mã luôn sai? Tạo khoá mới" }
+                    p class="help" { "Khoá mới thay khoá cũ: xoá mục SN Secure cũ trong ứng dụng rồi quét lại." }
+                    form method="post" action="/security/totp/start" {
+                        div class="ctrls" {
+                            label class="f" { span class="t" { "Mật khẩu hiện tại" } input type="password" name="password" required autocomplete="current-password"; }
+                            button class="ghost" type="submit" { "Tạo khoá mới" }
+                        }
                     }
                 }
             } @else if totp_on {
@@ -1051,7 +1062,13 @@ pub async fn totp_confirm(
     let Some(step) = totp::verify(&t.secret, &f.code, at.max(0) as u64, 0) else {
         return Redirect::to(&format!(
             "/security?totp=1&msg={}#totp",
-            urlenc("Mã không đúng. Kiểm tra giờ trên điện thoại rồi thử mã mới.")
+            urlenc(&format!(
+                "Mã không đúng. Hãy nhập mã mới nhất đang hiện trong ứng dụng (đúng mục SN Secure vừa thêm). \
+                 Giờ máy chủ lúc này: {:02}:{:02}:{:02} UTC; đồng hồ điện thoại lệch quá 30 giây so với giờ này thì mã sẽ sai.",
+                at.rem_euclid(86_400) / 3600,
+                at.rem_euclid(3600) / 60,
+                at.rem_euclid(60)
+            ))
         ))
         .into_response();
     };
