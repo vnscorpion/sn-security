@@ -210,6 +210,8 @@ fn finish_login(st: &AppState, headers: &HeaderMap, method: &str, note: &str) ->
 }
 
 fn log_fail(st: &AppState, ip: &str, method: &str, note: &str) {
+    // One stable line per wrong guess, for fail2ban (journal of snhub.service).
+    tracing::warn!("snhub-auth login-failed ip={ip} method={method}");
     if let Ok(db) = st.db.lock() {
         db.log_login(now(), ip, false, method, note);
     }
@@ -369,7 +371,11 @@ pub async fn login_post(
         return redirect_with("/login?err=pw", &[]);
     }
     // Cannot tell whether a second factor is required? Then do not let anyone in.
-    let Ok(enrolled) = st.db.lock().map(|d| d.second_factor_enrolled()) else {
+    let Ok(enrolled) = st
+        .db
+        .lock()
+        .map(|d| st.cfg.two_factor && d.second_factor_enrolled())
+    else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "Hub đang lỗi, thử lại sau.",
@@ -761,6 +767,7 @@ pub async fn security_page(
         )
     };
     let passkey_ok = rp(&st).is_some();
+    let two_factor_on = st.cfg.two_factor;
     let sessions = st.sessions.list(at);
     let totp_on = totp_state.as_ref().is_some_and(|t| t.enabled);
     // A secret that was shown but not yet confirmed stays on screen (same QR) until it
@@ -790,6 +797,13 @@ pub async fn security_page(
         // While a new authenticator secret is on screen the message belongs next to
         // its form (the page jumps there), not at the top where it would be scrolled away.
         @if !q.msg.is_empty() && pending_totp.is_none() { div class="note" { (q.msg) } }
+
+        @if !two_factor_on {
+            div class="note" {
+                b { "Xác thực hai bước đang tắt." } " Hub chỉ dùng mật khẩu (được băm Argon2id, có chống dò và phiên đăng nhập có hạn). Bật lại bằng "
+                code { "two_factor = true" } " trong " code { "/etc/snhub/snhub.toml" } " rồi khởi động lại hub."
+            }
+        } @else {
 
         div class="card" {
             h2 { "Trạng thái" }
@@ -889,6 +903,7 @@ pub async fn security_page(
                 }
             }
             p class="help" { "Mất hết cả mã? Trên máy chủ hub, bằng root: " code { "sudo -u snhub snhub reset-2fa" } " (xoá mọi cách xác thực thứ hai; mật khẩu giữ nguyên)." }
+        }
         }
 
         div class="card" id="password" {

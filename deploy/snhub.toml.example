@@ -14,12 +14,14 @@ public_url = "https://a.example.net"
 root_pubkey = "ed25519:..."
 
 # Admin login — set via `snhub set-admin-password`. Two-factor sign-in (app,
-# passkeys) is set up in the web UI under "Bảo mật"; passkeys need https:// above.
+# passkeys) is set up in the web UI under "Bảo mật" once you set two_factor = true
+# (off by default); passkeys need https:// above.
 # Argon2id hash of the password (set by `snhub set-admin-password`); older
 # installs may still have the salted SHA-256 pair below, which keeps working.
 admin_password_hash = ""
 admin_salt = ""
 admin_password_sha256 = ""
+two_factor = false
 
 # Optional Telegram alerting.
 # [telegram]

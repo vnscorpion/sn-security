@@ -100,12 +100,21 @@ sudo systemctl restart snhub
 
 Hub điều khiển được mọi VPS, nên đăng nhập hub được bảo vệ nhiều lớp. Mở **Bảo mật** trên thanh menu:
 
+- **Trạng thái hiện tại:** xác thực hai bước đang **tắt mặc định** (chưa ổn định); muốn thử thì đặt `two_factor = true` trong `/etc/snhub/snhub.toml` rồi khởi động lại hub. Khi tắt, đăng nhập chỉ cần mật khẩu (vẫn Argon2id, chống dò, phiên có hạn), nên nên cài thêm **fail2ban** (bên dưới).
 - **Xác thực hai bước**: ứng dụng xác thực (Google Authenticator, Authy, 1Password… quét mã QR) và/hoặc **passkey** (vân tay, khuôn mặt, khoá bảo mật). Đã bật thì mật khẩu đúng vẫn chưa vào được hub: phải qua bước hai (5 phút, tối đa 5 lần thử). Mã ứng dụng dùng một lần (không dùng lại được trong cùng 30 giây).
 - **Mã khôi phục** (8 mã dạng `xxxxx-xxxxx-xxxxx`, mỗi mã một lần, chỉ hiện đúng một lần) cho lúc mất điện thoại. Mất cả mã: trên máy chủ chạy `sudo -u snhub snhub --config /etc/snhub/snhub.toml reset-2fa` (xoá mọi cách xác thực thứ hai, giữ mật khẩu).
 - **Passkey cần HTTPS**: đặt `public_url = "https://..."` trong `/etc/snhub/snhub.toml` (đúng tên miền bạn mở hub). Chỉ hỗ trợ khoá ES256 (hầu hết thiết bị hiện nay), không đòi chứng thực thiết bị.
 - **Mật khẩu**: băm Argon2id; tối thiểu 10 ký tự; đổi ngay trong trang Bảo mật (đăng xuất mọi phiên khác). Mọi thay đổi (đổi mật khẩu, thêm/xoá passkey, bật/tắt 2FA, mã khôi phục mới) đều hỏi lại mật khẩu hiện tại.
 - **Chống dò mật khẩu**: sai quá 5 lần (tính ngay khi nhận yêu cầu, kể cả gửi song song) thì khoá theo địa chỉ IP 30 giây, tăng gấp đôi mỗi lần sai tiếp (tối đa 15 phút); nếu bị dò từ nhiều nơi cùng lúc, hub tạm dừng mọi đăng nhập vài phút. Hub lấy IP khách từ mục cuối của `X-Forwarded-For` (mục do reverse proxy của bạn thêm; IPv6 gộp theo /64), nên chỉ để hub sau đúng một proxy tin cậy (Caddy/Nginx), đừng mở cổng hub thẳng ra internet. Nếu bị dò từ nhiều nơi cùng lúc, bước nhập mật khẩu tạm dừng vài phút, còn bước hai của người đã đúng mật khẩu vẫn vào được.
 - **Phiên đăng nhập** hết hạn sau 24 giờ (hoặc 8 giờ không hoạt động), cookie `HttpOnly`, `SameSite=Strict`, thêm `Secure` khi `public_url` là HTTPS; trang Bảo mật liệt kê các phiên đang mở và nhật ký đăng nhập gần đây để đăng xuất từng phiên. Các yêu cầu ghi từ trình duyệt phải cùng nguồn (trình duyệt tự khai `Sec-Fetch-Site`, hoặc so `Origin` với `Host`/`X-Forwarded-Host`/`public_url`).
+
+**fail2ban cho hub** (chặn IP đoán sai mật khẩu ở cổng 80/443, không đụng SSH): hub ghi một dòng `snhub-auth login-failed ip=...` mỗi lần đoán sai vào nhật ký của `snhub.service`, và script này cài fail2ban với bộ lọc tương ứng:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/vnscorpion/sn-security/COMMIT/deploy/install-fail2ban.sh | sudo bash -s -- --ignoreip IP_CỦA_BẠN
+```
+
+Mặc định 8 lần sai trong 10 phút thì chặn 1 giờ (`--maxretry`, `--findtime`, `--bantime`); luôn đặt IP của chính bạn vào `--ignoreip`. Gỡ: thêm `--uninstall`. Nếu hub nằm sau Cloudflare thì IP hub thấy là của Cloudflare, nên fail2ban sẽ chặn nhầm: dùng rate limit của Cloudflare thay thế.
 
 Hub cập nhật từ bản trước: mật khẩu cũ vẫn dùng được (kể cả kiểu băm cũ); đặt lại bằng `set-admin-password` sẽ chuyển sang Argon2id.
 

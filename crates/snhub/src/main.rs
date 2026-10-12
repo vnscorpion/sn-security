@@ -246,7 +246,7 @@ fn cmd_serve(config_path: &Path) -> Result<()> {
 /// Every route, with the browser guard in front. Separate from `serve` so tests can
 /// drive the whole app without a socket.
 fn router(state: Arc<AppState>) -> Router {
-    Router::new()
+    let base = Router::new()
         // agent API
         .route("/v1/report", post(api::post_report))
         .route("/v1/desired", get(api::get_desired))
@@ -257,37 +257,9 @@ fn router(state: Arc<AppState>) -> Router {
             "/login",
             get(web_auth::login_page).post(web_auth::login_post),
         )
-        .route(
-            "/login/2fa",
-            get(web_auth::login_2fa_page).post(web_auth::login_2fa_post),
-        )
-        .route(
-            "/login/passkey/options",
-            post(web_auth::login_passkey_options),
-        )
-        .route(
-            "/login/passkey/verify",
-            post(web_auth::login_passkey_verify),
-        )
         .route("/logout", get(web_auth::logout))
         .route("/security", get(web_auth::security_page))
         .route("/security/password", post(web_auth::change_password))
-        .route("/security/totp/start", post(web_auth::totp_start))
-        .route("/security/totp/confirm", post(web_auth::totp_confirm))
-        .route("/security/totp/disable", post(web_auth::totp_disable))
-        .route("/security/recovery/new", post(web_auth::recovery_new))
-        .route(
-            "/security/passkey/options",
-            post(web_auth::passkey_register_options),
-        )
-        .route(
-            "/security/passkey/register",
-            post(web_auth::passkey_register),
-        )
-        .route(
-            "/security/passkey/{id}/delete",
-            post(web_auth::passkey_delete),
-        )
         .route("/security/session/{id}/end", post(web_auth::session_end))
         .route(
             "/security/sessions/others",
@@ -325,12 +297,53 @@ fn router(state: Arc<AppState>) -> Router {
         // static distribution of the installer + agent binary
         .route("/install.sh", get(serve_install))
         .route("/sn/{file}", get(serve_sn))
-        .route("/healthz", get(|| async { "ok" }))
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            web_auth::browser_guard,
-        ))
-        .with_state(state)
+        .route("/healthz", get(|| async { "ok" }));
+    // Two-factor sign-in is off unless `two_factor = true` in the config: its pages
+    // and endpoints do not exist at all otherwise.
+    let app = if state.cfg.two_factor {
+        base.merge(two_factor_routes())
+    } else {
+        base
+    };
+    app.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        web_auth::browser_guard,
+    ))
+    .with_state(state)
+}
+
+/// The second-factor pages and endpoints (authenticator app, passkeys, recovery
+/// codes). Registered only when `two_factor` is on.
+fn two_factor_routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route(
+            "/login/2fa",
+            get(web_auth::login_2fa_page).post(web_auth::login_2fa_post),
+        )
+        .route(
+            "/login/passkey/options",
+            post(web_auth::login_passkey_options),
+        )
+        .route(
+            "/login/passkey/verify",
+            post(web_auth::login_passkey_verify),
+        )
+        .route("/security/totp/start", post(web_auth::totp_start))
+        .route("/security/totp/confirm", post(web_auth::totp_confirm))
+        .route("/security/totp/disable", post(web_auth::totp_disable))
+        .route("/security/recovery/new", post(web_auth::recovery_new))
+        .route(
+            "/security/passkey/options",
+            post(web_auth::passkey_register_options),
+        )
+        .route(
+            "/security/passkey/register",
+            post(web_auth::passkey_register),
+        )
+        .route(
+            "/security/passkey/{id}/delete",
+            post(web_auth::passkey_delete),
+        )
 }
 
 async fn serve(cfg: HubConfig, state: Arc<AppState>) -> Result<()> {

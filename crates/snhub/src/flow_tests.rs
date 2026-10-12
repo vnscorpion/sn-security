@@ -41,6 +41,10 @@ impl Reply {
 }
 
 fn hub() -> Hub {
+    hub_with(true)
+}
+
+fn hub_with(two_factor: bool) -> Hub {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(&dir.path().join("t.sqlite")).unwrap();
     let hubkey = HubKey::load_or_create(dir.path()).unwrap();
@@ -50,6 +54,7 @@ fn hub() -> Hub {
         .unwrap();
     let cfg = HubConfig {
         public_url: "https://sec.example.test".into(),
+        two_factor,
         ..Default::default()
     };
     let st = Arc::new(AppState {
@@ -291,4 +296,38 @@ async fn a_recovery_code_signs_in_once_and_2fa_can_be_switched_off() {
         0,
         "no factor left, no recovery codes left"
     );
+}
+
+#[tokio::test]
+async fn with_two_factor_switched_off_sign_in_is_the_password_and_its_pages_do_not_exist() {
+    let h = hub_with(false);
+    // Even a factor left over in the database is not asked for.
+    {
+        let db = h.st.db.lock().unwrap();
+        db.start_totp("L4LWBK3GKX772VX3UCR7SHY5OCFJUFKN").unwrap();
+        db.enable_totp(1).unwrap();
+        assert!(db.second_factor_enrolled());
+    }
+    let cookie = h.sign_in().await; // straight in: password only
+    let page = h.get("/security", &cookie).await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(page.body.contains("Xác thực hai bước đang tắt"));
+    assert!(!page.body.contains("Quét mã QR"));
+    // The rest of the page is there: password, sessions, sign-in log.
+    assert!(page.body.contains("Đổi mật khẩu") && page.body.contains("Phiên đang mở"));
+    // No nudge on the overview.
+    let home = h.get("/", &cookie).await;
+    assert!(!home.body.contains("mới chỉ có mật khẩu"));
+    // The 2FA endpoints are not routed at all.
+    for (method, uri) in [
+        (Method::GET, "/login/2fa"),
+        (Method::POST, "/security/totp/start"),
+        (Method::POST, "/security/totp/confirm"),
+        (Method::POST, "/security/recovery/new"),
+        (Method::POST, "/login/passkey/options"),
+        (Method::POST, "/security/passkey/register"),
+    ] {
+        let r = h.send(method, uri, &cookie, "password=x").await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND, "{uri}");
+    }
 }

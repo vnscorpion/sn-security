@@ -677,7 +677,8 @@ pub async fn overview(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Re
             }
         })
         .collect();
-    let two_factor = db.second_factor_enrolled();
+    // No nudge when two-factor sign-in is switched off.
+    let two_factor = !st.cfg.two_factor || db.second_factor_enrolled();
     drop(db);
 
     let total = rows.len();

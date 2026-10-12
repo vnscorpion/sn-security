@@ -29,6 +29,10 @@ pub struct HubConfig {
     /// SHA-256 pair above, and itself overridden by a password changed in the UI.
     #[serde(default)]
     pub admin_password_hash: String,
+    /// Offer two-factor sign-in (authenticator app, passkeys, recovery codes). Off by
+    /// default; when off, those pages do not exist and sign-in is the password only.
+    #[serde(default)]
+    pub two_factor: bool,
     /// Optional Telegram alerting.
     #[serde(default)]
     pub telegram: Option<Telegram>,
@@ -57,6 +61,7 @@ impl Default for HubConfig {
             admin_salt: String::new(),
             admin_password_sha256: String::new(),
             admin_password_hash: String::new(),
+            two_factor: false,
             telegram: None,
         }
     }
