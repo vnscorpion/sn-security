@@ -320,13 +320,15 @@ fn run() -> Result<()> {
             for (src, files) in &sources {
                 println!("  {} [{}] -> {} file(s)", src.glob, src.format, files.len());
                 for f in files.iter().take(5) {
-                    let size = std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
-                    let readable = std::fs::File::open(f).is_ok();
-                    println!(
-                        "    - {} ({size} bytes, {})",
-                        f.display(),
-                        if readable { "readable" } else { "NOT readable" }
-                    );
+                    // The same checks the watcher applies, so a refused log says why.
+                    let (size, how) = match watch::tail::open_log(f) {
+                        Ok(file) => (
+                            file.metadata().map(|m| m.len()).unwrap_or(0),
+                            "readable".to_string(),
+                        ),
+                        Err(e) => (0, format!("NOT read: {e}")),
+                    };
+                    println!("    - {} ({size} bytes, {how})", f.display());
                 }
                 if files.len() > 5 {
                     println!("    ... and {} more", files.len() - 5);

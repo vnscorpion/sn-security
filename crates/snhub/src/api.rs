@@ -35,7 +35,8 @@ pub async fn post_report(State(st): State<Arc<AppState>>, body: String) -> impl 
         let db = st.db.lock().expect("db mutex");
         let pubkey = match db.agent_pubkey(&signed.key_id) {
             Ok(Some(pk)) => pk,
-            _ => return (StatusCode::UNAUTHORIZED, "unknown agent").into_response(),
+            // The same answer as a bad signature: no oracle for which ids exist.
+            _ => return (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
         };
         (pubkey, db.last_report_seq(&signed.key_id).unwrap_or(0))
     };
@@ -46,7 +47,7 @@ pub async fn post_report(State(st): State<Arc<AppState>>, body: String) -> impl 
 
     let env: Envelope<ReportBody> = match crypto::open(&[vk], &signed, now()) {
         Ok(e) => e,
-        Err(_) => return (StatusCode::UNAUTHORIZED, "signature/verify failed").into_response(),
+        Err(_) => return (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
     };
     if env.agent_id != signed.key_id {
         return (StatusCode::BAD_REQUEST, "agent_id mismatch").into_response();

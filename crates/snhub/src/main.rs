@@ -327,10 +327,15 @@ fn cmd_add_vps(config_path: &Path, name: &str) -> Result<()> {
     } else {
         cfg.public_url.trim_end_matches('/').to_string()
     };
-    println!("Install command (token valid 15 minutes):\n");
+    // The token is kept off the command line: on the VPS every local user can read
+    // a running command's arguments. The installer asks for it instead.
+    println!("Install command (run on the VPS as root; it asks for the token):\n");
     println!(
-        "curl -fsSL {base}/install.sh | sudo sh -s -- --hub {base} --name {name} --token {token}"
+        "curl -fsSL {base}/install.sh | sudo sh -s -- --hub {base} --name {}",
+        web::sh_quote(name)
     );
+    println!("\nToken: {token}");
+    println!("\n(single use, valid 15 minutes; type it when the installer asks)");
     Ok(())
 }
 

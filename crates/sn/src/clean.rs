@@ -57,11 +57,23 @@ pub fn clean(state: &State, roots: &[String], yes: bool) -> Result<usize> {
         println!("no findings to clean (run `sn hunt` first).");
         return Ok(0);
     }
+    // `sn hunt` walks the real paths of its roots (a root reached through a
+    // symlink is resolved first), so the findings name real paths: compare them
+    // with the real roots too.
+    let mut real_roots: Vec<String> = roots.to_vec();
+    for r in roots {
+        if let Ok(c) = std::fs::canonicalize(r)
+            && let Some(s) = c.to_str()
+            && !real_roots.iter().any(|x| x == s)
+        {
+            real_roots.push(s.to_string());
+        }
+    }
     let mut n = 0;
     let mut failed = 0;
     let mut quarantined: Vec<String> = Vec::new();
     for f in findings.iter().filter(|f| f.verdict == "malicious") {
-        match clean_one(state, roots, f) {
+        match clean_one(state, &real_roots, f) {
             Ok(id) => {
                 println!("quarantined {} -> {id}", f.path);
                 quarantined.push(f.path.clone());

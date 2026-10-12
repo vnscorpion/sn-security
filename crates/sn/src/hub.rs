@@ -646,8 +646,18 @@ fn flush_reports(cfg: &Config, state: &State, sk: &SigningKey, epoch: u64) -> Re
     let url = format!("{}/v1/report", cfg.hub.url.trim_end_matches('/'));
     let now = util::now_secs();
     for (path, seq) in state.queued().into_iter().take(MAX_FLUSH_PER_CYCLE) {
-        let body_json = std::fs::read(&path)?;
-        let body: ReportBody = serde_json::from_slice(&body_json)?;
+        // A queued report that cannot be read back would block every later one.
+        let body: ReportBody = match std::fs::read(&path)
+            .map_err(anyhow::Error::from)
+            .and_then(|b| serde_json::from_slice(&b).map_err(anyhow::Error::from))
+        {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("hub: dropping unreadable queued report seq {seq}: {e}");
+                state.drop_queued(&path);
+                continue;
+            }
+        };
         let env = Envelope {
             schema_version: SCHEMA_VERSION,
             agent_id: cfg.hub.agent_id.clone(),
@@ -665,6 +675,14 @@ fn flush_reports(cfg: &Config, state: &State, sk: &SigningKey, epoch: u64) -> Re
             .send_string(&payload)
         {
             Ok(_) => state.drop_queued(&path),
+            // Refused for good (malformed, or larger than the hub accepts): sending
+            // it again would only block every later report behind it.
+            Err(ureq::Error::Status(code @ (400 | 413 | 422), _)) => {
+                eprintln!("hub: dropping queued report seq {seq}: the hub refused it ({code})");
+                state.drop_queued(&path);
+            }
+            // Too soon after the last one: the next cycle sends it.
+            Err(ureq::Error::Status(429, _)) => return Ok(()),
             Err(e) => {
                 anyhow::bail!("posting report seq {seq}: {e}");
             }

@@ -253,6 +253,12 @@ fn alert_kind_vi(k: &str) -> &str {
         "bot_shape" => "Nhiều IP khác nhau cùng gửi một kiểu request (nghi bot phân tán)",
         "malware_found" => "Phát hiện file mã độc",
         "malware_suspect" => "Có file nghi ngờ cần xem",
+        "log_refused" => {
+            "Có file log bị bỏ qua vì không an toàn (symlink, không phải file thường, sai chủ sở hữu hoặc ai cũng ghi được)"
+        }
+        "report_cap" => {
+            "Quá nhiều IP khớp quy tắc trong một lần quét; báo cáo chỉ liệt kê các IP truy cập nhiều nhất"
+        }
         _ => k,
     }
 }
@@ -506,6 +512,20 @@ fn page_bounds(total: usize, page: usize, size: usize) -> (usize, usize, usize, 
 }
 
 /// Percent-encode a query-string value (everything but unreserved characters).
+/// A word for a POSIX shell command line: as it is when it is plainly safe
+/// (letters, digits, `._-`), otherwise in single quotes. The VPS name an admin
+/// typed ends up in a command they paste as root.
+pub(crate) fn sh_quote(s: &str) -> String {
+    if !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        && !s.starts_with('-')
+    {
+        return s.to_string();
+    }
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
 pub(crate) fn urlenc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -1444,7 +1464,7 @@ pub async fn add_vps_page(State(st): State<Arc<AppState>>, headers: HeaderMap) -
                         }
                         p { button type="submit" { "Tạo lệnh cài" } }
                     }
-                    p class="help" { "Lệnh cài kèm một mã dùng một lần, hết hạn sau 15 phút. VPS mới sẽ ở chế độ “Chỉ theo dõi”." }
+                    p class="help" { "Hub tạo lệnh cài và một mã dùng một lần (hết hạn sau 15 phút); bộ cài sẽ hỏi mã. VPS mới sẽ ở chế độ “Chỉ theo dõi”." }
                 }
             },
         )
@@ -1474,9 +1494,11 @@ pub async fn add_vps_post(
     drop(db);
 
     let base = hub_base(&st);
+    // The token is not in the command: on the VPS every local user can read a
+    // running command's arguments. The installer asks for it.
     let install = format!(
-        "curl -fsSL {base}/install.sh | sudo sh -s -- --hub {base} --name {name} --token {token}",
-        name = f.name.trim(),
+        "curl -fsSL {base}/install.sh | sudo sh -s -- --hub {base} --name {}",
+        sh_quote(f.name.trim()),
     );
     Html(
         shell(
@@ -1485,9 +1507,11 @@ pub async fn add_vps_post(
                 p { a href="/add-vps" { "← Thêm VPS khác" } }
                 h1 { "Lệnh cài cho “" (f.name) "”" }
                 div class="card" {
-                    p { "Đăng nhập VPS bằng " b { "root" } " và dán nguyên dòng dưới đây:" }
+                    p { "1. Đăng nhập VPS bằng " b { "root" } " và dán nguyên dòng dưới đây:" }
                     pre { (install) }
-                    p class="help" { "Mã cài hết hạn sau 15 phút. Cài xong, VPS sẽ hiện ở Tổng quan sau vài phút (chế độ “Chỉ theo dõi”)." }
+                    p { "2. Khi bộ cài hỏi " code { "Enroll token" } ", dán mã này:" }
+                    pre style="user-select:all;font-size:16px" { (token) }
+                    p class="help" { "Mã dùng một lần, hết hạn sau 15 phút. Mã không nằm trong lệnh để người dùng khác trên VPS không đọc được từ danh sách tiến trình. Cài xong, VPS sẽ hiện ở Tổng quan sau vài phút (chế độ “Chỉ theo dõi”)." }
                 }
                 p { a href="/" { "Về Tổng quan" } }
             },

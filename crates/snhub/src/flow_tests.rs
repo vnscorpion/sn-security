@@ -1051,3 +1051,47 @@ fn the_database_and_its_directory_are_private() {
     lock_data_dir(&shared);
     assert_eq!(mode(&shared), 0o755);
 }
+
+#[tokio::test]
+async fn the_install_command_for_a_new_vps_carries_no_token() {
+    let h = hub();
+    let cookie = h.sign_in().await;
+    let r = h.post("/add-vps", &cookie, "name=web-01").await;
+    assert_eq!(r.status, StatusCode::OK);
+    let cmd = r
+        .body
+        .split("<pre>")
+        .nth(1)
+        .and_then(|s| s.split("</pre>").next())
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        cmd,
+        "curl -fsSL https://sec.example.test/install.sh | sudo sh -s -- --hub https://sec.example.test --name web-01"
+    );
+    // The token is on the page, apart from the command.
+    let token = r
+        .body
+        .split("user-select:all;font-size:16px\">")
+        .nth(1)
+        .and_then(|s| s.split("</pre>").next())
+        .unwrap();
+    assert!(token.len() >= 32 && !cmd.contains(token));
+    // A name that is not a plain word is quoted for the shell.
+    let r = h.post("/add-vps", &cookie, "name=a%3B+rm+-rf+%2F").await;
+    assert!(
+        r.body.contains("--name &#39;a; rm -rf /&#39;") || r.body.contains("--name 'a; rm -rf /'"),
+        "{}",
+        r.body
+    );
+}
+
+#[test]
+fn shell_words_are_quoted_only_when_needed() {
+    assert_eq!(web::sh_quote("web-01.example"), "web-01.example");
+    assert_eq!(web::sh_quote("a b"), "'a b'");
+    assert_eq!(web::sh_quote("it's"), r"'it'\''s'");
+    assert_eq!(web::sh_quote("$(id)"), "'$(id)'");
+    assert_eq!(web::sh_quote("-x"), "'-x'");
+    assert_eq!(web::sh_quote(""), "''");
+}

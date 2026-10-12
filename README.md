@@ -331,7 +331,7 @@ Mọi thay đổi đều hoàn tác được (`sn undo`) và ghi vào `/var/lib/
 | `clean --yes` / `quarantine <path>` / `restore <id>` / `list-quarantine` | Cách ly / phục hồi file |
 | `undo` | Đảo ngược mọi hành động đã ghi |
 | `watch [--replay FILE]` | Một chu kỳ theo dõi (tail log, đếm, ban/observe, báo hub) |
-| `enroll --url --name --token` | Đăng ký với hub |
+| `enroll --url --name` | Đăng ký với hub (token lấy từ biến môi trường `SN_ENROLL_TOKEN`; `--token` vẫn nhận nhưng lộ trên danh sách tiến trình) |
 | `report` | In báo cáo gần nhất (JSON) |
 | `env` | Phiên bản, cgroup, nftables, whitelist, **log đang theo dõi và web server đã dò ra** |
 | `disable` | Kill switch: gỡ table `inet sn`, thả jail |
