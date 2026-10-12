@@ -486,6 +486,89 @@ async fn wrong_codes_from_many_addresses_pause_the_second_step_for_everyone() {
     assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
 }
 
+/// Someone with the password guesses second factors until that step is paused.
+async fn trip_factor_pause(h: &Hub) {
+    let wrong = format!("kind=totp&code={}", h.wrong_code());
+    let mut n = 0;
+    for _ in 0..2 {
+        let r = h.post("/login", "", &pw_form()).await;
+        let pending = format!("snhub_2fa={}", r.set_cookie("snhub_2fa").unwrap());
+        for _ in 0..5 {
+            n += 1;
+            let ip = format!("198.51.100.{n}");
+            h.send_from(&ip, Method::POST, "/login/2fa", &pending, &wrong)
+                .await;
+        }
+    }
+    assert!(h.st.limiter.factor_paused(now()).is_some());
+}
+
+#[tokio::test]
+async fn a_new_password_from_the_command_line_lifts_the_second_step_pause() {
+    let h = hub();
+    let cookie = h.sign_in().await;
+    enrol_totp(&h, &cookie).await;
+    trip_factor_pause(&h).await;
+    // The admin, with the right password, is told the way out.
+    let r = h.post("/login", "", &pw_form()).await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(r.body.contains("snhub set-admin-password"), "{}", r.body);
+
+    // What `snhub set-admin-password` writes, from another process.
+    const NEW: &str = "a new and longer passphrase";
+    let at = now() - 1;
+    {
+        let db = h.st.db.lock().unwrap();
+        db.set_admin_pw_hash(&auth::hash_password_argon2(NEW), at)
+            .unwrap();
+        db.revoke_sessions(at).unwrap();
+    }
+    h.st.sessions.recheck_revocation();
+    let r = h
+        .post("/login", "", &format!("password={}", web::urlenc(NEW)))
+        .await;
+    assert_eq!(r.location(), "/login/2fa", "{}", r.body);
+    assert_eq!(h.st.limiter.factor_paused(now()), None);
+    let pending = format!("snhub_2fa={}", r.set_cookie("snhub_2fa").unwrap());
+    let r = h
+        .post(
+            "/login/2fa",
+            &pending,
+            &format!("kind=totp&code={}", h.code_at(1)),
+        )
+        .await;
+    assert_eq!(r.location(), "/", "{}", r.body);
+    // The old password is worth nothing now.
+    assert_eq!(
+        h.post("/login", "", &pw_form()).await.location(),
+        "/login?err=pw"
+    );
+}
+
+#[tokio::test]
+async fn a_2fa_reset_alone_leaves_the_pause_behind_the_password() {
+    let h = hub();
+    let cookie = h.sign_in().await;
+    enrol_totp(&h, &cookie).await;
+    trip_factor_pause(&h).await;
+    // What `snhub reset-2fa` writes: the password, set long ago, stays.
+    let at = now() - 1;
+    {
+        let db = h.st.db.lock().unwrap();
+        let hash = db.admin_pw_hash().unwrap();
+        db.set_admin_pw_hash(&hash, 1).unwrap();
+        db.reset_2fa().unwrap();
+        db.revoke_sessions(at).unwrap();
+    }
+    h.st.sessions.recheck_revocation();
+    // No second factor is left, so the password signs in...
+    let cookie = h.sign_in().await;
+    // ...but whoever made those guesses may know it: what needs it again waits.
+    assert!(h.st.limiter.factor_paused(now()).is_some());
+    let r = h.post("/security/recovery/new", &cookie, &pw_form()).await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+}
+
 #[tokio::test]
 async fn a_browser_that_signed_in_before_is_not_locked_out_by_a_flood() {
     let h = hub_with(false);
@@ -543,6 +626,23 @@ fn agent_key(h: &Hub) -> (String, ed25519_dalek::SigningKey) {
 }
 
 fn signed_report(id: &str, sk: &ed25519_dalek::SigningKey, seq: u64) -> String {
+    signed_report_with(id, sk, seq, serde_json::json!({}))
+}
+
+/// A signed report whose body has `extra`'s fields on top of the bare minimum.
+fn signed_report_with(
+    id: &str,
+    sk: &ed25519_dalek::SigningKey,
+    seq: u64,
+    extra: serde_json::Value,
+) -> String {
+    let mut body = serde_json::json!({
+        "agent_version": "t",
+        "cycle": snsec_common::schema::CycleStats::default(),
+    });
+    if let (Some(b), Some(e)) = (body.as_object_mut(), extra.as_object()) {
+        b.extend(e.clone());
+    }
     let env = snsec_common::schema::Envelope {
         schema_version: snsec_common::SCHEMA_VERSION,
         agent_id: id.to_string(),
@@ -550,10 +650,7 @@ fn signed_report(id: &str, sk: &ed25519_dalek::SigningKey, seq: u64) -> String {
         seq,
         issued_at: now(),
         expires_at: now() + 3600,
-        body: serde_json::json!({
-            "agent_version": "t",
-            "cycle": snsec_common::schema::CycleStats::default(),
-        }),
+        body,
     };
     serde_json::to_string(&snsec_common::crypto::sign(sk, id, &env).unwrap()).unwrap()
 }
@@ -605,12 +702,35 @@ async fn reports_are_bounded_in_size_rate_and_history() {
         assert_eq!(kept, 10);
     }
     // A body over the limit is refused before anything reads it.
-    let r = h.post_report("x".repeat(1_100_000)).await;
+    let r = h.post_report("x".repeat(AGENT_BODY_LIMIT + 1)).await;
     assert_eq!(r.status, StatusCode::PAYLOAD_TOO_LARGE);
     // A report signed by another key is refused as before.
     let (_, other) = agent_key(&h);
     let r = h.post_report(signed_report(&id, &other, 62)).await;
     assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_report_from_an_agent_watching_a_botnet_wave_still_gets_in() {
+    let h = hub_with(false);
+    let (id, sk) = agent_key(&h);
+    // Agents deployed so far list every would-be ban of a cycle: in observe mode
+    // a wave of some 12,000 addresses makes a report past 1 MiB.
+    let would: Vec<serde_json::Value> = (0..12_000u32)
+        .map(|n| {
+            serde_json::json!({
+                "ip": format!("198.{}.{}.{}", 18 + n / 65_536, (n / 256) % 256, n % 256),
+                "reason": "rate", "ttl_secs": 3600, "strike": 1, "layer": "l3",
+            })
+        })
+        .collect();
+    let report = signed_report_with(&id, &sk, 1, serde_json::json!({ "would_ban": would }));
+    assert!(report.len() > 1024 * 1024, "{}", report.len());
+    assert!(report.len() < AGENT_BODY_LIMIT, "{}", report.len());
+    let r = h.post_report(report).await;
+    assert_eq!((r.status, r.body.as_str()), (StatusCode::OK, "ok"));
+    let stored = h.st.db.lock().unwrap().latest_report(&id).unwrap().unwrap();
+    assert_eq!(stored.would_ban.len(), 12_000);
 }
 
 #[tokio::test]
@@ -663,6 +783,96 @@ async fn a_ban_order_holds_one_address_or_nothing() {
             vec!["2001:db8:1:2::/64".to_string()]
         )
     );
+}
+
+#[tokio::test]
+async fn an_ipv6_top_talker_is_banned_by_the_64_the_vps_lists_it_under() {
+    let h = hub_with(false);
+    let cookie = h.sign_in().await;
+    let (id, sk) = agent_key(&h);
+    let cycle = snsec_common::schema::CycleStats {
+        top_ips: vec![snsec_common::schema::IpCount {
+            ip: "2001:db8:1:2::/64".into(),
+            requests: 9_000,
+            err4xx: 0,
+            sensitive_posts: 0,
+        }],
+        ..Default::default()
+    };
+    let r = h
+        .post_report(signed_report_with(
+            &id,
+            &sk,
+            1,
+            serde_json::json!({ "cycle": cycle }),
+        ))
+        .await;
+    assert_eq!(r.status, StatusCode::OK);
+    // The "Chặn" button next to it posts the /64...
+    let page = h.get(&format!("/agent/{id}"), &cookie).await;
+    assert!(
+        page.body.contains(r#"name="ip" value="2001:db8:1:2::/64""#),
+        "{}",
+        page.body
+    );
+    // ...and the order stores it.
+    let r = h
+        .post(
+            &format!("/agent/{id}/ban"),
+            &cookie,
+            &format!("ip={}&ttl=3600", web::urlenc("2001:db8:1:2::/64")),
+        )
+        .await;
+    assert_eq!(r.location(), format!("/agent/{id}"));
+    let d = h.st.db.lock().unwrap().get_desired(&id).unwrap().unwrap().2;
+    let bans: Vec<&str> = d.bans.iter().map(|b| b.ip.as_str()).collect();
+    assert_eq!(bans, ["2001:db8:1:2::/64"]);
+    assert_eq!(d.bans[0].ttl_secs, 3600);
+}
+
+#[tokio::test]
+async fn free_text_stored_by_an_older_hub_never_reaches_an_agent() {
+    let h = hub_with(false);
+    let cookie = h.sign_in().await;
+    let (id, _) = agent_key(&h);
+    let junk = "1.2.3.4 }; flush ruleset";
+    let body = serde_json::json!({
+        "mode": "observe",
+        "bans": [
+            { "ip": junk, "ttl_secs": 3600, "reason": "admin", "created_at": now() },
+            { "ip": "203.0.113.9", "ttl_secs": 3600, "reason": "admin", "created_at": now() },
+        ],
+        "unbans": [junk, "2001:db8:1:2::/64"],
+    });
+    h.st.db
+        .lock()
+        .unwrap()
+        .conn
+        .execute(
+            "UPDATE desired SET body_json = ?1 WHERE agent_id = ?2",
+            [body.to_string(), id.clone()],
+        )
+        .unwrap();
+    let r = h.get(&format!("/v1/desired?agent_id={id}"), "").await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert!(!r.body.contains("flush ruleset"), "{}", r.body);
+    assert!(r.body.contains("203.0.113.9") && r.body.contains("2001:db8:1:2::/64"));
+    // The next order is written without it, so later versions cannot carry it.
+    h.post(&format!("/agent/{id}/mode"), &cookie, "mode=enforce")
+        .await;
+    let json: String =
+        h.st.db
+            .lock()
+            .unwrap()
+            .conn
+            .query_row(
+                "SELECT body_json FROM desired WHERE agent_id = ?1",
+                [&id],
+                |r| r.get(0),
+            )
+            .unwrap();
+    assert!(!json.contains("flush ruleset"), "{json}");
+    assert!(json.contains("enforce") && json.contains("203.0.113.9"));
 }
 
 #[tokio::test]

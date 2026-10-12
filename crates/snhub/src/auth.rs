@@ -384,6 +384,13 @@ impl Sessions {
             .is_ok()
     }
 
+    /// Read the sign-out time again on the next request (tests that cannot
+    /// wait [`REVOKED_REFRESH_SECS`]).
+    #[cfg(test)]
+    pub fn recheck_revocation(&self) {
+        self.revoked_read.store(0, Ordering::SeqCst);
+    }
+
     pub fn remove(&self, token: &str) {
         if let Ok(mut m) = self.live.lock() {
             m.remove(token);
@@ -770,6 +777,23 @@ impl Limiter {
         (i.factor_locked_until > now).then(|| i.factor_locked_until - now)
     }
 
+    /// A new admin password was set from the command line: whatever the guesser
+    /// knew is worthless, so lift the pause behind the password, its counts and
+    /// the per-address locks of those steps. The trip count stays, so guessing
+    /// again with the new password pauses for longer. Returns whether a pause
+    /// was on.
+    pub fn clear_factor_pause(&self, now: i64) -> bool {
+        let Ok(mut i) = self.inner.lock() else {
+            return false;
+        };
+        let was = i.factor_locked_until > now;
+        i.factor.clear();
+        i.factor_locked_until = 0;
+        i.pending_starts.clear();
+        i.keys.retain(|k, _| !behind_password(k));
+        was
+    }
+
     /// May a password-correct sign-in start waiting for its second factor? Not
     /// while that step is paused, and not more than `PENDING_PER_HOUR` an hour:
     /// someone who has the password cannot stockpile half-finished logins.
@@ -1060,6 +1084,42 @@ mod tests {
             assert_eq!(l.wrong_factor(t3), None);
         }
         assert_eq!(l.wrong_factor(t3), Some(FACTOR_LOCK_SECS));
+    }
+
+    #[test]
+    fn a_new_password_lifts_the_pause_behind_it_but_a_new_trip_still_doubles() {
+        let l = Limiter::default();
+        let t = 10_000;
+        for _ in 0..PENDING_PER_HOUR {
+            assert!(l.begin_pending(t).is_ok());
+        }
+        for n in 0..FREE_FAILS {
+            assert!(l.begin("2fa:198.51.100.1", t + i64::from(n)).is_ok());
+        }
+        assert!(l.begin("ip:203.0.113.1", t).is_ok());
+        for _ in 0..FACTOR_FAILS {
+            l.wrong_factor(t);
+        }
+        assert!(l.factor_paused(t + 1).is_some());
+        assert!(l.clear_factor_pause(t + 1), "it was on");
+        assert_eq!(l.factor_paused(t + 1), None);
+        assert!(
+            l.begin_pending(t + 1).is_ok(),
+            "the hourly count starts over"
+        );
+        assert!(
+            l.begin("2fa:198.51.100.1", t + 1).is_ok(),
+            "its own lock too"
+        );
+        assert!(l.begin("pw:198.51.100.1", t + 1).is_ok());
+        assert!(!l.clear_factor_pause(t + 1), "nothing left to lift");
+        // The password step's own counts are not touched.
+        assert!(l.inner.lock().unwrap().keys.contains_key("ip:203.0.113.1"));
+        // Guessing on: the next trip pauses twice as long as the first.
+        for _ in 0..FACTOR_FAILS - 1 {
+            assert_eq!(l.wrong_factor(t + 2), None);
+        }
+        assert_eq!(l.wrong_factor(t + 2), Some(2 * FACTOR_LOCK_SECS));
     }
 
     #[test]

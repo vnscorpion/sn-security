@@ -3,6 +3,8 @@
 //! handlers without awaiting while locked. A connection pool / `spawn_blocking`
 //! is a v1.1 upgrade if the fleet grows.
 
+use std::net::{IpAddr, Ipv6Addr};
+
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use snsec_common::schema::{DesiredBody, ReportBody};
@@ -80,6 +82,17 @@ pub struct AgentRow {
     pub mode: String,
 }
 
+/// This process's effective uid, from `/proc/self/status` (the owner of
+/// `/proc/self` reads as root for a process that is not dumpable). `None` where
+/// there is no procfs.
+#[cfg(unix)]
+fn effective_uid() -> Option<u32> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find_map(|l| l.strip_prefix("Uid:"))?;
+    // Real, effective, saved, filesystem.
+    line.split_whitespace().nth(1)?.parse().ok()
+}
+
 /// The database holds AI API keys, the TOTP secret and enrollment tokens: create
 /// it readable by its owner only (SQLite gives its `-wal`/`-shm` files the same
 /// mode), and tighten one that an older version left readable, if it is ours.
@@ -92,8 +105,7 @@ fn private_db_file(path: &std::path::Path) -> Result<()> {
         .mode(0o600)
         .open(path)
         .with_context(|| format!("creating db {}", path.display()))?;
-    // Owner of /proc/self is this process's effective uid.
-    let me = std::fs::metadata("/proc/self").map(|m| m.uid()).ok();
+    let me = effective_uid();
     let mut files = vec![path.to_path_buf()];
     for suffix in ["-wal", "-shm", "-journal"] {
         let mut p = path.as_os_str().to_owned();
@@ -125,6 +137,10 @@ impl Db {
         conn.execute_batch(crate::db_auth::SCHEMA_AUTH)
             .context("applying auth schema")?;
         crate::db_auth::migrate_auth(&conn).context("migrating auth schema")?;
+        // Not fatal: `get_desired` leaves such entries out anyway.
+        if let Err(e) = scrub_desired(&conn) {
+            tracing::error!("checking stored ban orders: {e:#}");
+        }
         Ok(Db {
             conn,
             report_budget: std::cell::RefCell::default(),
@@ -303,6 +319,9 @@ impl Db {
 
     // ---- desired ----------------------------------------------------------
 
+    /// The desired state as it is signed for the agent and edited by the hub.
+    /// Ban and unban entries that are not one address (or an IPv6 /64) are left
+    /// out, whoever wrote them: the agent puts them into a root nftables script.
     pub fn get_desired(&self, agent_id: &str) -> Result<Option<(u64, u64, DesiredBody)>> {
         let row: Option<(i64, i64, String)> = self
             .conn
@@ -313,9 +332,9 @@ impl Db {
             )
             .optional()?;
         Ok(row.and_then(|(e, v, j)| {
-            serde_json::from_str(&j)
-                .ok()
-                .map(|b| (e as u64, v as u64, b))
+            let mut body: DesiredBody = serde_json::from_str(&j).ok()?;
+            warn_dropped(agent_id, &keep_valid_orders(&mut body));
+            Some((e as u64, v as u64, body))
         }))
     }
 
@@ -348,6 +367,7 @@ impl Db {
             }
         }
         edit(&mut body);
+        warn_dropped(agent_id, &keep_valid_orders(&mut body));
         let json = serde_json::to_string(&body)?;
         self.conn.execute(
             "INSERT INTO desired (agent_id, epoch, version, body_json, updated, updated_by) \
@@ -468,6 +488,131 @@ fn job_already_applied(body: &DesiredBody, agent_applied_seq: u64) -> bool {
     body.jobs_seq > 0 && agent_applied_seq >= body.jobs_seq
 }
 
+// ---- what a ban order may name ---------------------------------------------
+
+/// One address a ban may name: not this machine, not "every address", not a
+/// group address.
+fn banable(ip: IpAddr) -> bool {
+    match snsec_common::net::normalize(ip) {
+        IpAddr::V4(v4) => {
+            !(v4.is_loopback() || v4.is_unspecified() || v4.is_multicast() || v4.is_broadcast())
+        }
+        IpAddr::V6(v6) => !(v6.is_loopback() || v6.is_unspecified() || v6.is_multicast()),
+    }
+}
+
+/// The canonical text of a single address, or `None`.
+fn one_address(input: &str) -> Option<String> {
+    let ip = snsec_common::net::normalize(input.trim().parse::<IpAddr>().ok()?);
+    banable(ip).then(|| ip.to_string())
+}
+
+/// An IPv6 /64, the form the VPS keys and reports its IPv6 clients and bans in
+/// (`net::ban_key`), rebuilt from the parsed network; `None` for anything else.
+fn canonical_v6_64(input: &str) -> Option<String> {
+    let (addr, len) = input.trim().split_once('/')?;
+    let v6 = addr.parse::<Ipv6Addr>().ok()?;
+    if len != "64" || v6.to_ipv4_mapped().is_some() {
+        return None;
+    }
+    let key = snsec_common::net::ban_key(IpAddr::V6(v6));
+    let net: Ipv6Addr = key.strip_suffix("/64")?.parse().ok()?;
+    banable(IpAddr::V6(net)).then_some(key)
+}
+
+/// What a ban or unban order may carry: the canonical text of one address, or
+/// of an IPv6 /64 (the agent turns a single IPv6 ban into its /64 anyway). The
+/// agent writes it into an nftables script as root, so free text never goes in.
+pub(crate) fn ban_target(input: &str) -> Option<String> {
+    one_address(input).or_else(|| canonical_v6_64(input))
+}
+
+/// Rewrite every ban and unban of `body` in its canonical form and drop the
+/// ones that name no single address or /64. Returns what was dropped.
+fn keep_valid_orders(body: &mut DesiredBody) -> Vec<String> {
+    let mut dropped = Vec::new();
+    body.bans.retain_mut(|b| match ban_target(&b.ip) {
+        Some(ip) => {
+            b.ip = ip;
+            true
+        }
+        None => {
+            dropped.push(std::mem::take(&mut b.ip));
+            false
+        }
+    });
+    body.unbans = std::mem::take(&mut body.unbans)
+        .into_iter()
+        .filter_map(|u| {
+            let ok = ban_target(&u);
+            if ok.is_none() {
+                dropped.push(u);
+            }
+            ok
+        })
+        .collect();
+    dropped
+}
+
+/// The dropped entries for a log line or the decisions log: escaped and short.
+fn shown(dropped: &[String]) -> String {
+    let all = format!("{dropped:?}");
+    if all.chars().count() > 300 {
+        all.chars().take(300).chain("…".chars()).collect()
+    } else {
+        all
+    }
+}
+
+fn warn_dropped(agent_id: &str, dropped: &[String]) {
+    if !dropped.is_empty() {
+        tracing::warn!(
+            "desired state of {agent_id}: left out {} ban/unban entr(ies) that are not an IP address: {}",
+            dropped.len(),
+            shown(dropped)
+        );
+    }
+}
+
+/// Once per open: take out of the stored desired states any ban or unban that
+/// is not an address (free text an older hub accepted), so it is neither sent
+/// to a VPS again nor kept forever among the unbans. The version stays: what a
+/// VPS may still need from the order is unchanged.
+fn scrub_desired(conn: &Connection) -> Result<()> {
+    let rows: Vec<(String, String)> = {
+        let mut stmt = conn.prepare("SELECT agent_id, body_json FROM desired")?;
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .filter_map(Result::ok)
+            .collect()
+    };
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    for (agent_id, json) in rows {
+        let Ok(mut body) = serde_json::from_str::<DesiredBody>(&json) else {
+            continue;
+        };
+        let dropped = keep_valid_orders(&mut body);
+        if dropped.is_empty() {
+            continue;
+        }
+        warn_dropped(&agent_id, &dropped);
+        conn.execute(
+            "UPDATE desired SET body_json = ?1 WHERE agent_id = ?2",
+            params![serde_json::to_string(&body)?, agent_id],
+        )?;
+        conn.execute(
+            "INSERT INTO decisions (agent_id, who, action, detail, ts) VALUES (?1, 'system', 'drop', ?2, ?3)",
+            params![
+                agent_id,
+                format!("lệnh chặn/gỡ chặn không phải địa chỉ IP: {}", shown(&dropped)),
+                at
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -521,5 +666,140 @@ mod tests {
         assert!(job_already_applied(&body(7), 9));
         // No job ever queued: nothing to drop.
         assert!(!job_already_applied(&body(0), 5));
+    }
+
+    #[test]
+    fn a_ban_order_carries_only_the_canonical_text_of_one_address_or_64() {
+        for (input, want) in [
+            (" 203.0.113.7 ", "203.0.113.7"),
+            ("2001:DB8:0:0:0:0:0:1", "2001:db8::1"),
+            ("::ffff:203.0.113.7", "203.0.113.7"),
+            // A private address is the admin's call; it is only flagged elsewhere.
+            ("10.0.0.5", "10.0.0.5"),
+            // The form the VPS lists its IPv6 clients and bans in.
+            ("2001:db8:1:2::/64", "2001:db8:1:2::/64"),
+            // Rebuilt from the parsed network, never passed through as typed.
+            (" 2001:DB8:1:2:aa::5/64 ", "2001:db8:1:2::/64"),
+        ] {
+            assert_eq!(ban_target(input).as_deref(), Some(want), "{input}");
+        }
+        for bad in [
+            "",
+            "hunt 1 ngày",
+            "1.2.3.4 }; flush ruleset; add element inet sn sn_ban4 { 5.6.7.8",
+            "1.2.3.4\n5.6.7.8",
+            "0.0.0.0/0",
+            "::/0",
+            "2001:db8::/32",
+            "2001:db8::/48",
+            "2001:db8::/0",
+            "203.0.113.0/24",
+            "203.0.113.0/64",
+            "::ffff:1.2.3.4/64",
+            "::/64",
+            "::1/64",
+            "ff02::/64",
+            "2001:db8::/64 ; flush ruleset",
+            "2001:db8::/064",
+            "x/64",
+            "127.0.0.1",
+            "::1",
+            "::ffff:127.0.0.1",
+            "0.0.0.0",
+            "::",
+            "255.255.255.255",
+            "224.0.0.1",
+            "ff02::1",
+        ] {
+            assert_eq!(ban_target(bad), None, "{bad}");
+        }
+    }
+
+    fn seed_desired(db: &Db, id: &str, json: &str) {
+        db.conn
+            .execute(
+                "UPDATE desired SET body_json = ?1 WHERE agent_id = ?2",
+                params![json, id],
+            )
+            .unwrap();
+    }
+
+    const JUNK: &str = r#"{"mode":"observe","k":5.0,
+        "bans":[{"ip":"1.2.3.4 }; flush ruleset","ttl_secs":60,"reason":"admin","created_at":1},
+                {"ip":"2001:DB8::9","ttl_secs":60,"reason":"admin","created_at":1}],
+        "unbans":["1.2.3.4 }; flush ruleset","203.0.113.7","2001:db8:1:2::/64"]}"#;
+
+    #[test]
+    fn stored_free_text_orders_are_never_handed_out_and_are_scrubbed_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let db = Db::open(&path).unwrap();
+        let id = db.enroll_agent("web", "pk", 1).unwrap();
+        seed_desired(&db, &id, JUNK);
+        let raw = |db: &Db| -> (i64, String) {
+            db.conn
+                .query_row(
+                    "SELECT version, body_json FROM desired WHERE agent_id = ?1",
+                    [&id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
+        };
+        // What is signed for the agent leaves it out, and keeps the rest canonical.
+        let (_, _, d) = db.get_desired(&id).unwrap().unwrap();
+        let bans: Vec<&str> = d.bans.iter().map(|b| b.ip.as_str()).collect();
+        assert_eq!(bans, ["2001:db8::9"]);
+        assert_eq!(d.unbans, ["203.0.113.7", "2001:db8:1:2::/64"]);
+        drop(db);
+        // The next open takes it out of the database, keeps the version, and says so.
+        let db = Db::open(&path).unwrap();
+        let (version, json) = raw(&db);
+        assert_eq!(version, 1);
+        assert!(!json.contains("flush"), "{json}");
+        assert!(json.contains("203.0.113.7") && json.contains("2001:db8::9"));
+        let log = db.recent_decisions(5).unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!((log[0].1.as_str(), log[0].2.as_str()), ("system", "drop"));
+        assert!(log[0].3.contains("flush ruleset"), "{}", log[0].3);
+        // Nothing left to drop: a later open logs nothing more.
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.recent_decisions(5).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_edit_cannot_store_an_order_that_is_not_an_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let id = db.enroll_agent("web", "pk", 1).unwrap();
+        db.update_desired(&id, 2, "admin", "unban", "x", |d| {
+            d.unbans.push("1.2.3.4 }; flush ruleset".into());
+            d.unbans.push("::ffff:198.51.100.4".into());
+        })
+        .unwrap();
+        let json: String = db
+            .conn
+            .query_row(
+                "SELECT body_json FROM desired WHERE agent_id = ?1",
+                [&id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!json.contains("flush"), "{json}");
+        assert_eq!(
+            db.get_desired(&id).unwrap().unwrap().2.unbans,
+            ["198.51.100.4"]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_effective_uid_is_the_owner_of_a_file_this_process_creates() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("mine");
+        std::fs::write(&f, b"x").unwrap();
+        let owner = std::fs::metadata(&f).unwrap().uid();
+        assert_eq!(effective_uid(), Some(owner));
     }
 }

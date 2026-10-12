@@ -174,6 +174,19 @@ impl Db {
         Ok(())
     }
 
+    /// When the admin password was last set, from the web or the command line
+    /// (0: never, only the config file's).
+    pub fn admin_pw_updated(&self) -> i64 {
+        self.conn
+            .query_row("SELECT pw_updated FROM admin_auth WHERE id = 1", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .optional()
+            .ok()
+            .flatten()
+            .unwrap_or(0)
+    }
+
     // ---- sign-out of every session -----------------------------------------
 
     /// End every web session opened at or before `now` (a reset from the command
@@ -530,9 +543,12 @@ mod tests {
         db.revoke_sessions(40).unwrap();
         assert_eq!(db.sessions_revoked_at(), 100);
         // Other writes to the row leave it alone.
+        assert_eq!(db.admin_pw_updated(), 0);
         db.set_admin_pw_hash("$argon2id$y", 200).unwrap();
         db.reset_2fa().unwrap();
         assert_eq!(db.sessions_revoked_at(), 100);
+        // A 2FA reset leaves the time the password was set as it was.
+        assert_eq!(db.admin_pw_updated(), 200);
     }
 
     #[test]

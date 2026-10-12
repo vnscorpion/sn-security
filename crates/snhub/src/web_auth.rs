@@ -193,12 +193,20 @@ fn known_device(st: &AppState, headers: &HeaderMap, at: i64) -> bool {
 /// Pick up a sign-out of every session ordered from the command line
 /// (`set-admin-password`, `reset-2fa` write the time to the database): read it
 /// at most every few seconds, then end every older session and half-finished
-/// login.
+/// login. When it came with a new password, also lift the pause behind the
+/// password: the admin who just set it must not wait out a pause that someone
+/// guessing with the old one caused. `reset-2fa` alone leaves the password, and
+/// so the pause, as they were.
 fn refresh_revocation(st: &AppState, at: i64) {
     if !st.sessions.revocation_due(at) {
         return;
     }
-    let Some(revoked) = st.db.lock().ok().map(|d| d.sessions_revoked_at()) else {
+    let Some((revoked, pw_set)) = st
+        .db
+        .lock()
+        .ok()
+        .map(|d| (d.sessions_revoked_at(), d.admin_pw_updated()))
+    else {
         return;
     };
     if revoked > st.sessions.revoked_at() {
@@ -207,6 +215,12 @@ fn refresh_revocation(st: &AppState, at: i64) {
         if ended > 0 {
             tracing::warn!(
                 "snhub-auth sessions-revoked: {ended} web session(s) ended by a password or 2FA reset from the command line"
+            );
+        }
+        if pw_set >= revoked && st.limiter.clear_factor_pause(at) {
+            tracing::warn!(
+                "snhub-auth second-factor-unpaused: a new admin password was set from the command line; \
+                 the pause after too many wrong second factors is lifted"
             );
         }
     }
@@ -229,7 +243,7 @@ fn factor_failed(st: &AppState, at: i64) {
             "snhub-auth second-factor-flood: too many wrong second factors or password re-checks; \
              those steps are paused for {secs} s and {dropped} half-finished login(s) dropped. \
              The admin password is likely known to someone else: set a new one with \
-             `snhub set-admin-password` (restarting snhub lifts the pause)."
+             `snhub set-admin-password`, which also lifts the pause within a few seconds."
         );
         if let Ok(db) = st.db.lock() {
             db.log_login(
@@ -312,6 +326,10 @@ fn login_card(title: &str, inner: Markup) -> Html<String> {
 }
 
 fn wait_page(secs: i64) -> Response {
+    wait_page_with(secs, html! {})
+}
+
+fn wait_page_with(secs: i64, extra: Markup) -> Response {
     (
         StatusCode::TOO_MANY_REQUESTS,
         login_card(
@@ -319,11 +337,29 @@ fn wait_page(secs: i64) -> Response {
             html! {
                 h1 { "Thử quá nhiều lần" }
                 p { "Vì an toàn, đăng nhập tạm khoá. Thử lại sau khoảng " b { (secs) } " giây." }
+                (extra)
                 p { a href="/login" { "← Quay lại" } }
             },
         ),
     )
         .into_response()
+}
+
+/// The password was right but the second step is paused (or too many logins
+/// are waiting for it): the way out for the admin, who cannot reach /security.
+fn second_step_wait_page(secs: i64) -> Response {
+    wait_page_with(
+        secs,
+        html! {
+            p class="help" {
+                "Bước xác thực thứ hai đang tạm khoá: có quá nhiều lần nhập sai sau bước mật khẩu, hoặc quá nhiều "
+                "lần đăng nhập đúng mật khẩu trong một giờ, nên nhiều khả năng mật khẩu quản trị đã lộ. "
+                "Nếu bạn là quản trị viên, trên máy chủ hub, bằng root: "
+                code { "sudo snhub set-admin-password --password '...'" }
+                " để đặt mật khẩu mới: khoá được gỡ sau vài giây, rồi đăng nhập bằng mật khẩu mới."
+            }
+        },
+    )
 }
 
 /// Open a session and send the admin to the overview.
@@ -559,7 +595,7 @@ pub async fn login_post(
         tracing::warn!(
             "snhub-auth second-factor-paused ip={ip}: right password, but the second step is paused or too many logins are waiting for it"
         );
-        return wait_page(wait);
+        return second_step_wait_page(wait);
     }
     let token = st.pending.create(&ip, &user_agent(&headers), at);
     redirect_with(
@@ -1003,7 +1039,7 @@ pub async fn security_page(
                 " Có quá nhiều lần nhập sai mã xác thực hoặc mật khẩu hiện tại, nên nhiều khả năng mật khẩu quản trị đã lộ. "
                 "Trong lúc khoá, không đăng nhập bằng bước hai và không đổi cài đặt cần mật khẩu được. Trên máy chủ hub, bằng root: "
                 code { "sudo snhub set-admin-password --password '...'" }
-                " (đặt mật khẩu mới và đăng xuất mọi phiên), rồi " code { "systemctl restart snhub" } " để gỡ khoá."
+                " để đặt mật khẩu mới: mọi phiên bị đăng xuất và khoá được gỡ sau vài giây."
             }
         }
         // While a new authenticator secret is on screen the message belongs next to

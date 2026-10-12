@@ -239,7 +239,10 @@ fn cmd_set_password(config_path: &Path, password: Option<String>) -> Result<()> 
         "bằng dòng lệnh trên máy chủ, đăng xuất mọi phiên",
     );
     println!("admin password set (Argon2id).");
-    println!("Every web session is signed out (the running hub notices within a few seconds).");
+    println!(
+        "Every web session is signed out, and a pause of the second sign-in step after too many \
+         wrong codes is lifted (the running hub notices within a few seconds)."
+    );
     Ok(())
 }
 
@@ -260,6 +263,10 @@ fn cmd_reset_2fa(config_path: &Path) -> Result<()> {
         "Two-factor sign-in removed (app, passkeys, recovery codes). The password is unchanged."
     );
     println!("Every web session is signed out (the running hub notices within a few seconds).");
+    println!(
+        "If password re-checks are paused after too many wrong answers, the password may be \
+         known to someone else: set a new one with `snhub set-admin-password`, which lifts the pause."
+    );
     Ok(())
 }
 
@@ -349,10 +356,13 @@ fn cmd_serve(config_path: &Path) -> Result<()> {
     rt.block_on(async move { serve(cfg, state).await })
 }
 
-/// Largest signed report accepted. A real one (at most 500 listed bans, 100
-/// findings, a capped evidence snapshot) stays well under it; the 2 MB default
-/// only gave a hostile VPS more to make the hub verify and store.
-const AGENT_BODY_LIMIT: usize = 1024 * 1024;
+/// Largest signed report accepted: axum's 2 MiB default, stated here. Agents
+/// deployed so far list every would-be ban of a cycle (`would_ban` has no cap),
+/// so a botnet wave seen in observe mode makes reports past 1 MiB; such an
+/// agent sends its queue oldest first and stops at the first refused report,
+/// so a lower limit would silence it until the oversized report ages out of its
+/// queue. Lower it only once the agents in the field cap that list.
+const AGENT_BODY_LIMIT: usize = 2 * 1024 * 1024;
 /// An enrollment request is a token, a name and a public key.
 const ENROLL_BODY_LIMIT: usize = 16 * 1024;
 
