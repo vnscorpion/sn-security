@@ -766,8 +766,22 @@ pub async fn security_page(
     // A secret that was shown but not yet confirmed stays on screen (same QR) until it
     // is confirmed or replaced, even after a reload or a visit to another page.
     let pending_totp = totp_state.as_ref().filter(|t| !t.enabled);
-    let qr = pending_totp
-        .and_then(|t| totp::qr_svg(&totp::otpauth_uri("SN Secure", "admin", &t.secret)));
+    // The entry in the app is named after the key's last characters, so a new key is
+    // a new, recognisable entry and an old one cannot be mistaken for it.
+    let totp_label = |secret: &str| {
+        let n = secret.chars().count();
+        format!(
+            "admin-{}",
+            secret.chars().skip(n.saturating_sub(4)).collect::<String>()
+        )
+    };
+    let qr = pending_totp.and_then(|t| {
+        totp::qr_svg(&totp::otpauth_uri(
+            "SN Secure",
+            &totp_label(&t.secret),
+            &t.secret,
+        ))
+    });
     let enrolled = totp_on || !passkeys.is_empty();
 
     let body = html! {
@@ -793,7 +807,7 @@ pub async fn security_page(
             h2 { "Ứng dụng xác thực (Google Authenticator, Authy, 1Password…)" }
             @if let Some(t) = pending_totp {
                 @if !q.msg.is_empty() { div class="note" style="border-left-color:var(--bad);color:var(--fg)" { (q.msg) } }
-                p { "1. Quét mã QR bằng ứng dụng, hoặc nhập tay khoá bên dưới." }
+                p { "1. Quét mã QR bằng ứng dụng, hoặc nhập tay khoá bên dưới. Mục mới trong ứng dụng tên " b { "SN Secure (" (totp_label(&t.secret)) ")" } "; hãy đọc mã từ đúng mục này." }
                 @if let Some(svg) = &qr { div style="background:#fff;display:inline-block;padding:6px;border-radius:8px" { (PreEscaped(svg.clone())) } }
                 p { "Khoá: " code style="user-select:all;letter-spacing:2px" { (t.secret) } }
                 p { "2. Nhập mã 6 số ứng dụng đang hiện để xác nhận." }
@@ -1060,14 +1074,26 @@ pub async fn totp_confirm(
         return back("Chưa có khoá nào đang chờ xác nhận.");
     };
     let Some(step) = totp::verify(&t.secret, &f.code, at.max(0) as u64, 0) else {
+        // Two digits of the right code, to tell a wrong key from a wrong clock. This is
+        // an already signed-in admin who is looking at the key on this very page.
+        let expected_now = totp::base32_decode(&t.secret)
+            .map(|k| totp::code_for_step(&k, at.max(0) as u64 / 30))
+            .unwrap_or_default();
         return Redirect::to(&format!(
             "/security?totp=1&msg={}#totp",
             urlenc(&format!(
                 "Mã không đúng. Hãy nhập mã mới nhất đang hiện trong ứng dụng (đúng mục SN Secure vừa thêm). \
-                 Giờ máy chủ lúc này: {:02}:{:02}:{:02} UTC; đồng hồ điện thoại lệch quá 30 giây so với giờ này thì mã sẽ sai.",
+                 Giờ máy chủ lúc này: {:02}:{:02}:{:02} UTC; đồng hồ điện thoại lệch quá 30 giây so với giờ này thì mã sẽ sai. \
+                 Để dò lỗi: khoá hub đang chờ kết thúc bằng \"{}\", và mã đúng lúc này kết thúc bằng \"{}\" \
+                 (nếu mã trong ứng dụng kết thúc khác, ứng dụng đang giữ khoá cũ hoặc nhầm mục: xoá hết mục SN Secure trong ứng dụng, bấm \"Tạo khoá mới\" rồi quét lại).",
                 at.rem_euclid(86_400) / 3600,
                 at.rem_euclid(3600) / 60,
-                at.rem_euclid(60)
+                at.rem_euclid(60),
+                t.secret
+                    .chars()
+                    .skip(t.secret.chars().count().saturating_sub(4))
+                    .collect::<String>(),
+                expected_now.chars().skip(4).collect::<String>()
             ))
         ))
         .into_response();
