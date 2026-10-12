@@ -8,13 +8,89 @@
 //! report-only if it is absent).
 
 use std::io::Write;
+use std::net::IpAddr;
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 
-/// True if a key is IPv6 (contains a colon). Both plain and `/prefix` forms.
-fn is_v6(key: &str) -> bool {
-    key.contains(':')
+/// What a set element may be.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// One address, or for IPv6 at most a /64 (what one host owns).
+    Ban,
+    /// Any range the admin configured.
+    White,
+}
+
+/// A set element rebuilt from its parsed value, and whether it is IPv6.
+///
+/// Every key passes here before it is written into an nft script, whoever
+/// produced it: only an address or a prefix comes out, never text nft would
+/// read as a statement of its own.
+fn element(key: &str, kind: Kind) -> Result<(String, bool)> {
+    let plain = !key.is_empty()
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() || matches!(b, b':' | b'.' | b'/'));
+    let parsed = if plain {
+        match key.split_once('/') {
+            None => key.parse::<IpAddr>().ok().map(|ip| (ip, None)),
+            Some((addr, len)) => addr
+                .parse::<IpAddr>()
+                .ok()
+                .zip(len.parse::<u8>().ok())
+                .map(|(ip, len)| (ip, Some(len))),
+        }
+    } else {
+        None
+    };
+    let Some((ip, len)) = parsed else {
+        bail!("refusing firewall key {key:?}: not an address or a prefix");
+    };
+    let max = if ip.is_ipv4() { 32 } else { 128 };
+    let min = match kind {
+        Kind::White => 0,
+        Kind::Ban if ip.is_ipv4() => 32,
+        Kind::Ban => 64,
+    };
+    match len {
+        Some(l) if l < min || l > max => bail!("refusing firewall key {key:?}: prefix /{l}"),
+        Some(l) if l < max => Ok((format!("{ip}/{l}"), ip.is_ipv6())),
+        _ => Ok((ip.to_string(), ip.is_ipv6())),
+    }
+}
+
+/// The nft lines for a batch of bans (with per-element timeouts) and of unbans.
+fn ban_lines(adds: &[(String, u64)], dels: &[String]) -> Result<(Vec<String>, Vec<String>)> {
+    let set = |v6: bool| if v6 { "sn_ban6" } else { "sn_ban4" };
+    let mut add_lines = Vec::with_capacity(adds.len());
+    for (key, ttl) in adds {
+        let (elem, v6) = element(key, Kind::Ban)?;
+        if *ttl == 0 {
+            // nft reads a 0 timeout as "never expires".
+            bail!("refusing a ban of {elem} with no timeout");
+        }
+        add_lines.push(format!(
+            "add element inet sn {} {{ {elem} timeout {ttl}s }}\n",
+            set(v6)
+        ));
+    }
+    let mut del_lines = Vec::with_capacity(dels.len());
+    for key in dels {
+        let (elem, v6) = element(key, Kind::Ban)?;
+        del_lines.push(format!("delete element inet sn {} {{ {elem} }}\n", set(v6)));
+    }
+    Ok((add_lines, del_lines))
+}
+
+fn whitelist_script(keys: &[String]) -> Result<String> {
+    let mut script = String::from("flush set inet sn sn_white4\nflush set inet sn sn_white6\n");
+    for key in keys {
+        let (elem, v6) = element(key, Kind::White)?;
+        let set = if v6 { "sn_white6" } else { "sn_white4" };
+        script.push_str(&format!("add element inet sn {set} {{ {elem} }}\n"));
+    }
+    Ok(script)
 }
 
 fn run_nft_script(script: &str) -> Result<()> {
@@ -103,32 +179,19 @@ pub fn apply_bans(adds: &[(String, u64)], dels: &[String]) -> Result<()> {
     if adds.is_empty() && dels.is_empty() {
         return Ok(());
     }
-    let mut script = String::new();
-    for (key, ttl) in adds {
-        let set = if is_v6(key) { "sn_ban6" } else { "sn_ban4" };
-        script.push_str(&format!(
-            "add element inet sn {set} {{ {key} timeout {ttl}s }}\n"
-        ));
-    }
-    for key in dels {
-        let set = if is_v6(key) { "sn_ban6" } else { "sn_ban4" };
-        // `delete element` errors if absent; guard each in its own best-effort
-        // line by tolerating failure at the caller — here we batch and ignore
-        // individual misses by issuing them separately.
-        script.push_str(&format!("delete element inet sn {set} {{ {key} }}\n"));
-    }
-    // Deletes of absent elements abort the whole transaction, so try the batch
-    // and, on failure, fall back to element-by-element best effort.
+    // Every key checked before anything is sent: one bad key stops the batch.
+    let (add_lines, del_lines) = ban_lines(adds, dels)?;
+    // `delete element` errors if absent, and that aborts the whole transaction,
+    // so try the batch and, on failure, fall back to element-by-element best
+    // effort.
+    let script: String = add_lines
+        .iter()
+        .chain(&del_lines)
+        .map(String::as_str)
+        .collect();
     if run_nft_script(&script).is_err() {
-        for (key, ttl) in adds {
-            let set = if is_v6(key) { "sn_ban6" } else { "sn_ban4" };
-            let _ = run_nft_script(&format!(
-                "add element inet sn {set} {{ {key} timeout {ttl}s }}\n"
-            ));
-        }
-        for key in dels {
-            let set = if is_v6(key) { "sn_ban6" } else { "sn_ban4" };
-            let _ = run_nft_script(&format!("delete element inet sn {set} {{ {key} }}\n"));
+        for line in add_lines.iter().chain(&del_lines) {
+            let _ = run_nft_script(line);
         }
     }
     Ok(())
@@ -136,12 +199,7 @@ pub fn apply_bans(adds: &[(String, u64)], dels: &[String]) -> Result<()> {
 
 /// Replace the whitelist sets with `keys` (CIDRs or plain addresses).
 pub fn set_whitelist(keys: &[String]) -> Result<()> {
-    let mut script = String::from("flush set inet sn sn_white4\nflush set inet sn sn_white6\n");
-    for key in keys {
-        let set = if is_v6(key) { "sn_white6" } else { "sn_white4" };
-        script.push_str(&format!("add element inet sn {set} {{ {key} }}\n"));
-    }
-    run_nft_script(&script)
+    run_nft_script(&whitelist_script(keys)?)
 }
 
 /// Read the current ban keys from both sets.
@@ -199,4 +257,84 @@ fn collect_elem_key(e: &serde_json::Value, out: &mut Vec<String>) {
 /// Remove the whole `inet sn` table (used by `sn disable` / kill switch).
 pub fn delete_table() -> Result<()> {
     run_nft_script("delete table inet sn\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bans(keys: &[&str]) -> Vec<(String, u64)> {
+        keys.iter().map(|k| ((*k).to_string(), 3600)).collect()
+    }
+
+    #[test]
+    fn ban_elements_are_rebuilt_from_the_parsed_address() {
+        let (adds, dels) = ban_lines(
+            &bans(&["203.0.113.7", "2001:DB8:1:2::/64", "203.0.113.8/32"]),
+            &["2001:db8:0:0:0:0:0:1".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            adds,
+            [
+                "add element inet sn sn_ban4 { 203.0.113.7 timeout 3600s }\n",
+                "add element inet sn sn_ban6 { 2001:db8:1:2::/64 timeout 3600s }\n",
+                "add element inet sn sn_ban4 { 203.0.113.8 timeout 3600s }\n",
+            ]
+        );
+        assert_eq!(dels, ["delete element inet sn sn_ban6 { 2001:db8::1 }\n"]);
+    }
+
+    #[test]
+    fn no_text_but_an_address_gets_into_the_nft_script() {
+        for key in [
+            "",
+            "1.2.3.4 }",
+            "1.2.3.4 } ; flush ruleset",
+            "1.2.3.4\nadd rule inet sn input accept",
+            "2001:db8::/64 }\ndelete table inet sn",
+            "1.2.3.4/",
+            "/24",
+            "1.2.3.4/33",
+            "::/129",
+            "1.2.3.4/+8",
+            "dead:beef::/64x",
+            "abc",
+        ] {
+            assert!(ban_lines(&bans(&[key]), &[]).is_err(), "add {key:?}");
+            assert!(ban_lines(&[], &[key.to_string()]).is_err(), "del {key:?}");
+            assert!(
+                whitelist_script(&[key.to_string()]).is_err(),
+                "white {key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_ban_is_one_host_never_a_range() {
+        for key in ["0.0.0.0/0", "203.0.113.0/24", "::/0", "2001:db8::/48"] {
+            assert!(ban_lines(&bans(&[key]), &[]).is_err(), "{key}");
+        }
+        // A ban with no timeout would never expire.
+        assert!(ban_lines(&[("203.0.113.7".to_string(), 0)], &[]).is_err());
+    }
+
+    #[test]
+    fn one_bad_key_stops_the_whole_batch() {
+        assert!(ban_lines(&bans(&["203.0.113.7", "x; flush ruleset"]), &[]).is_err());
+    }
+
+    #[test]
+    fn the_whitelist_keeps_its_ranges() {
+        let s = whitelist_script(&[
+            "10.0.0.0/8".to_string(),
+            "198.51.100.4".to_string(),
+            "2001:db8::/32".to_string(),
+        ])
+        .unwrap();
+        assert!(s.contains("add element inet sn sn_white4 { 10.0.0.0/8 }\n"));
+        assert!(s.contains("add element inet sn sn_white4 { 198.51.100.4 }\n"));
+        assert!(s.contains("add element inet sn sn_white6 { 2001:db8::/32 }\n"));
+        assert_eq!(s.lines().count(), 5);
+    }
 }

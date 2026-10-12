@@ -19,6 +19,7 @@ ProtectHome=read-only
 ReadWritePaths=/var/lib/sn
 ReadOnlyPaths=/etc/sn
 PrivateTmp=yes
+UMask=0077
 ProtectControlGroups=no
 ProtectKernelTunables=no
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK

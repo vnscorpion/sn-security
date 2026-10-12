@@ -20,6 +20,22 @@ ReadOnlyPaths=/etc/sn
 PrivateTmp=yes
 # Hunt only reads files; it needs to traverse all users' webroots.
 CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+UMask=0077
+# It runs ClamAV's parsers over files users control, as root: no way to ask
+# systemd for an unconfined unit, no network (clamd's unix socket still
+# works), no devices or kernel knobs. The hub-started scan (hub.rs
+# HUNT_SANDBOX) has the same lines; a test keeps them in step.
+InaccessiblePaths=-/run/dbus/system_bus_socket
+InaccessiblePaths=-/run/systemd/private
+PrivateNetwork=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+RestrictSUIDSGID=yes
 MemoryMax=2G
 
 [Install]

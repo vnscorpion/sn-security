@@ -121,11 +121,19 @@ pub struct DesiredQuery {
 
 /// GET /v1/desired?agent_id=..&epoch=..&seq=.. — returns a signed desired body,
 /// or 304 if the agent already has the current version.
+///
+/// The agent signs the pull with its own key (see [`pull_allowed`]). An unknown
+/// agent and a bad or missing signature get the same bare 404, so the answer
+/// does not tell a stranger which agent ids exist.
 pub async fn get_desired(
     State(st): State<Arc<AppState>>,
     Query(q): Query<DesiredQuery>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
     let db = st.db.lock().expect("db mutex");
+    if !pull_allowed(&db, &q, &headers, now()) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     let (epoch, version, body) = match db.get_desired(&q.agent_id) {
         Ok(Some(v)) => v,
         _ => return StatusCode::NOT_FOUND.into_response(),
@@ -148,6 +156,57 @@ pub async fn get_desired(
         .body(Body::from(json))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
+
+/// May this request read the agent's desired state?
+///
+/// A signed pull (both headers) must verify against the agent's key, signed
+/// within a day of the hub's clock. An unsigned one is still answered for an
+/// agent that predates signing, which is any agent whose latest report does not
+/// list `signed_desired` (no report yet, or an agent rolled back to an older
+/// binary): once a report lists it, only signed pulls are.
+fn pull_allowed(
+    db: &crate::db::Db,
+    q: &DesiredQuery,
+    headers: &axum::http::HeaderMap,
+    now: i64,
+) -> bool {
+    use snsec_common::schema::{CAP_SIGNED_DESIRED, HDR_PULL_SIG, HDR_PULL_TS};
+
+    let Ok(Some(pubkey)) = db.agent_pubkey(&q.agent_id) else {
+        return false;
+    };
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    match (header(HDR_PULL_TS), header(HDR_PULL_SIG)) {
+        (Some(ts), Some(sig)) => {
+            let (Ok(ts), Ok(vk)) = (ts.trim().parse::<i64>(), crypto::parse_pubkey(&pubkey)) else {
+                return false;
+            };
+            match crypto::verify_desired_pull(&vk, &q.agent_id, q.epoch, q.seq, ts, sig.trim(), now)
+            {
+                Ok(()) => true,
+                Err(crypto::CryptoError::OutOfWindow { .. }) => {
+                    // The agent's own key, so the clock is what is wrong: say so.
+                    tracing::warn!(
+                        "desired pull from {} refused: signed {}s away from the hub's clock (check the VPS clock)",
+                        q.agent_id,
+                        now.saturating_sub(ts)
+                    );
+                    false
+                }
+                Err(_) => false,
+            }
+        }
+        (None, None) => !db
+            .latest_report(&q.agent_id)
+            .ok()
+            .flatten()
+            .is_some_and(|r| r.capabilities.iter().any(|c| c == CAP_SIGNED_DESIRED)),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod desired_pull_tests;
 
 #[derive(Deserialize)]
 pub struct EnrollReq {
