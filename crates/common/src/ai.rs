@@ -330,14 +330,48 @@ pub fn is_genuine_service(comm: &str, exe: &str) -> bool {
     base == comm || base.starts_with(comm) || comm.starts_with(base)
 }
 
+/// Markers of a coin miner on a command line (the agent looks for the same).
+pub const MINER_HINTS: &[&str] = &[
+    "stratum",
+    "xmrig",
+    "--donate",
+    "randomx",
+    "cryptonight",
+    "nicehash",
+    "minerd",
+    "nanopool",
+    "supportxmr",
+    "hashvault",
+];
+
+/// Does a command line carry a miner marker?
+#[must_use]
+pub fn has_miner_marker(cmdline: &str) -> bool {
+    let l = cmdline.to_ascii_lowercase();
+    MINER_HINTS.iter().any(|h| l.contains(h))
+}
+
+/// Is a process's miner flag one to act on? A marker on its command line is. A
+/// connection to a pool port alone is only on a program that is neither the
+/// system's own nor serving here: older agents also counted connections a server
+/// accepted, whose remote port the client picks, so a client connecting from
+/// port 4444 could flag lshttpd, haproxy, sshd-session or a Node app.
+fn miner_shown(p: &crate::schema::EvProc, ev: &Evidence) -> bool {
+    let serves = ev
+        .listeners
+        .iter()
+        .any(|l| l.pid == p.pid || (!l.comm.is_empty() && l.comm == p.comm));
+    p.miner_hint && (has_miner_marker(&p.cmdline) || !(system_exe(&p.exe) || serves))
+}
+
 /// A sign on a process that is hard to fake and points at malware: a
 /// kernel-thread name on a real program, a miner marker, or a program run from a
 /// temp directory. A program in a hidden home folder is not one by itself: nvm,
 /// pyenv, bun, `~/.local/bin` and `~/.vscode-server` all live there, and other
 /// accounts on the box put text in the evidence that can steer a model towards a
 /// neighbour's tool.
-fn strong_sign(p: &crate::schema::EvProc) -> bool {
-    p.masquerade || p.miner_hint || is_temp_path(&p.exe)
+fn strong_sign(p: &crate::schema::EvProc, ev: &Evidence) -> bool {
+    p.masquerade || miner_shown(p, ev) || is_temp_path(&p.exe)
 }
 
 /// Whose file a persistence entry is: an account's own start-up file or crontab,
@@ -376,7 +410,7 @@ fn tied_to_incident(f: &crate::schema::EvFile, ev: &Evidence) -> bool {
     let runs_it = ev
         .processes
         .iter()
-        .any(|p| p.exe == f.path && p.user == f.owner && (p.masquerade || p.miner_hint));
+        .any(|p| p.exe == f.path && p.user == f.owner && (p.masquerade || miner_shown(p, ev)));
     let home = ev
         .shell_users
         .iter()
@@ -416,7 +450,7 @@ fn implicated(user: &str, ev: &Evidence) -> bool {
     let home_prefix = format!("/home/{user}/");
     ev.processes
         .iter()
-        .any(|p| p.user == user && strong_sign(p))
+        .any(|p| p.user == user && strong_sign(p, ev))
         || ev.persistence.iter().any(|p| {
             matches!(p.kind.as_str(), "shell_rc" | "cron" | "ld_preload")
                 && (p.user == user || p.path.starts_with(&home_prefix))
@@ -453,7 +487,7 @@ pub fn ground(a: &Action, ev: &Evidence) -> Result<&'static str, String> {
             // Strong signs only. A deleted executable alone is what every service
             // looks like after a package upgrade, and the heuristic score also
             // flags ordinary programs that live in a hidden directory.
-            if !strong_sign(p) {
+            if !strong_sign(p, ev) {
                 return Err(format!(
                     "kill_process {pid}: tiến trình {} không đủ dấu hiệu độc hại",
                     p.comm
@@ -470,7 +504,7 @@ pub fn ground(a: &Action, ev: &Evidence) -> Result<&'static str, String> {
             let hit = ev
                 .processes
                 .iter()
-                .find(|p| p.user == *user && p.exe == *exe && strong_sign(p));
+                .find(|p| p.user == *user && p.exe == *exe && strong_sign(p, ev));
             let Some(p) = hit else {
                 return Err(format!(
                     "kill_matching {user} {}: không có tiến trình đáng ngờ khớp trong bằng chứng",
@@ -1316,6 +1350,124 @@ mod tests {
             ..EvPersist::default()
         });
         assert!(ground(&q(uv), &ev).is_err());
+    }
+
+    #[test]
+    fn a_pool_port_alone_does_not_condemn_a_server_an_older_agent_flagged() {
+        // An agent from before outbound-only connections: a client connected from
+        // port 4444, and the server that accepted it was flagged as mining.
+        let flagged = |pid: i32, user: &str, comm: &str, exe: &str, cmdline: &str| EvProc {
+            pid,
+            starttime: 1,
+            user: user.into(),
+            comm: comm.into(),
+            exe: exe.into(),
+            cmdline: cmdline.into(),
+            out_conns: vec!["198.51.100.7:4444".into()],
+            miner_hint: true,
+            score: 40,
+            ..EvProc::default()
+        };
+        let nvm_node = "/home/bob/.nvm/versions/node/v20.11.0/bin/node";
+        let mut ev = evidence();
+        for (port, comm, pid) in [(443, "litespeed", 700), (3000, "node", 710)] {
+            ev.listeners.push(crate::schema::EvListener {
+                port,
+                addr: "0.0.0.0".into(),
+                comm: comm.into(),
+                pid,
+            });
+        }
+        ev.processes.extend([
+            // A worker of a listening server (the listener's pid is another).
+            flagged(
+                701,
+                "nobody",
+                "litespeed",
+                "/usr/local/lsws/bin/litespeed",
+                "litespeed (lshttpd - #01)",
+            ),
+            flagged(711, "bob", "node", nvm_node, "node /home/bob/app/server.js"),
+            // System programs that hold a connection sshd or a proxy accepted.
+            flagged(
+                720,
+                "bob",
+                "sshd-session",
+                "/usr/lib/openssh/sshd-session",
+                "sshd-session: bob@pts/0",
+            ),
+            flagged(
+                730,
+                "haproxy",
+                "haproxy",
+                "/usr/sbin/haproxy",
+                "haproxy -f /etc/h.cfg",
+            ),
+        ]);
+        ev.temp_files.push(EvFile {
+            path: nvm_node.into(),
+            owner: "bob".into(),
+            elf: true,
+            executable: true,
+            ..EvFile::default()
+        });
+        for p in &ev.processes[ev.processes.len() - 4..] {
+            let e = ground(
+                &Action::KillProcess {
+                    pid: p.pid,
+                    starttime: 1,
+                },
+                &ev,
+            )
+            .unwrap_err();
+            assert!(e.contains("không đủ dấu hiệu"), "{}: {e}", p.comm);
+            let k = Action::KillMatching {
+                user: p.user.clone(),
+                exe: p.exe.clone(),
+            };
+            assert!(ground(&k, &ev).is_err(), "{}", p.comm);
+        }
+        let e = ground(&Action::LockUserShell { user: "bob".into() }, &ev).unwrap_err();
+        assert!(e.contains("không có dấu hiệu"), "{e}");
+        let q = Action::QuarantineFile {
+            path: nvm_node.into(),
+        };
+        assert!(ground(&q, &ev).is_err());
+
+        // A miner marker on the command line stands, server or not.
+        let mut marked = ev.clone();
+        marked.processes.push(flagged(
+            712,
+            "bob",
+            "node",
+            nvm_node,
+            "node /home/bob/x.js --donate-level 1",
+        ));
+        let kill = Action::KillProcess {
+            pid: 712,
+            starttime: 1,
+        };
+        assert_eq!(ground(&kill, &marked), Ok("high"));
+        assert!(ground(&Action::LockUserShell { user: "bob".into() }, &marked).is_ok());
+        assert_eq!(ground(&q, &marked), Ok("low"));
+        // So does a pool connection from a program that serves nothing and is not
+        // the system's: one it opened itself.
+        let mut out = ev.clone();
+        out.processes.push(flagged(
+            740,
+            "bob",
+            "sys",
+            "/home/bob/.cache/sys",
+            "/home/bob/.cache/sys",
+        ));
+        let kill = Action::KillProcess {
+            pid: 740,
+            starttime: 1,
+        };
+        assert_eq!(ground(&kill, &out), Ok("high"));
+        assert!(ground(&Action::LockUserShell { user: "bob".into() }, &out).is_ok());
+        assert!(has_miner_marker("/tmp/x -o STRATUM+TCP://p:3333"));
+        assert!(!has_miner_marker("node /home/bob/app/server.js"));
     }
 
     #[test]

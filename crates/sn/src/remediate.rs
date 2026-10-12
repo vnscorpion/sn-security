@@ -202,8 +202,7 @@ fn live_disguise(pid: i32, st: &proc::ProcStat, exe: &str) -> Option<&'static st
     {
         return Some("chạy từ thư mục tạm");
     }
-    let cmd = proc::cmdline(pid).join(" ").to_ascii_lowercase();
-    if crate::triage::MINER_HINTS.iter().any(|h| cmd.contains(h)) {
+    if ai::has_miner_marker(&proc::cmdline(pid).join(" ")) {
         return Some("dấu hiệu đào coin trong dòng lệnh");
     }
     None
@@ -646,6 +645,59 @@ mod tests {
         let msg = kill_process(pid, start).unwrap();
         assert!(msg.contains("đào coin"), "{msg}");
         assert!(!miner.wait().unwrap().success());
+    }
+
+    #[test]
+    fn a_disguised_program_whose_name_is_not_utf8_is_still_found_by_owner() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::process::CommandExt;
+        // A process takes its name from the file it was started as: here one with
+        // a byte that is not UTF-8. A copy of its own, so no other test's process
+        // runs the same program.
+        let dir = tempfile::tempdir().unwrap();
+        let prog = dir.path().join(std::ffi::OsStr::from_bytes(b"\xffsl"));
+        std::fs::copy(util::find_bin("sleep").unwrap(), &prog).unwrap();
+        let mut child = None;
+        for _ in 0..50 {
+            // Another test forking while the copy was open makes it busy briefly.
+            match Command::new(&prog)
+                .arg("30")
+                .arg0("xmrig")
+                .stdin(Stdio::null())
+                .spawn()
+            {
+                Ok(c) => {
+                    child = Some(c);
+                    break;
+                }
+                Err(e) if e.raw_os_error() == Some(nix::libc::ETXTBSY) => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        let mut child = child.unwrap();
+        let pid = i32::try_from(child.id()).unwrap();
+        for _ in 0..200 {
+            if proc::cmdline(pid).first().map(String::as_str) == Some("xmrig") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let st = proc::read_stat(pid).unwrap();
+        assert!(st.comm.starts_with('\u{FFFD}'), "{}", st.comm);
+        let me = nix::unistd::geteuid();
+        assert_eq!(proc::uid(pid), Some(me.as_raw()));
+        let user = nix::unistd::User::from_uid(me).unwrap().unwrap().name;
+        let (exe, _) = proc::exe(pid);
+        if is_safe_username(&user) {
+            let msg = kill_matching(&user, &exe).unwrap();
+            assert!(msg.contains(&format!("pid {pid}")), "{msg}");
+            assert!(!child.wait().unwrap().success());
+        } else {
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
     }
 
     #[test]

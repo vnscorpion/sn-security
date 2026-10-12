@@ -166,7 +166,14 @@ fn sshd_message(line: &str) -> Option<&str> {
 /// whitelist both read logins through this, and nothing else.
 #[must_use]
 pub fn accepted_login(line: &str) -> Option<(&str, &str, IpAddr)> {
-    let tail = sshd_message(line)?.strip_prefix("Accepted ")?;
+    accepted_message(sshd_message(line)?)
+}
+
+/// [`accepted_login`] on sshd's message alone, as the journal keeps it (its
+/// `MESSAGE` field, without the syslog time stamp, host and tag).
+#[must_use]
+pub fn accepted_message(msg: &str) -> Option<(&str, &str, IpAddr)> {
+    let tail = msg.strip_prefix("Accepted ")?;
     let mut t = tail.splitn(7, ' ');
     let (method, for_, user, from, ip, port_kw, rest) = (
         t.next()?,
@@ -927,6 +934,47 @@ mod hardening_tests {
         ];
         for l in forged {
             assert!(accepted_login(l).is_none(), "{l}");
+        }
+        // The journal's message alone.
+        assert_eq!(
+            accepted_message(
+                "Accepted publickey for a from 1.2.3.4 port 22 ssh2: ED25519 SHA256:k"
+            ),
+            Some(("publickey", "a", "1.2.3.4".parse().unwrap()))
+        );
+        for m in [
+            "Invalid user Accepted from 6.6.6.6 port 1",
+            "Failed password for invalid user Accepted password for a from 6.6.6.6 port 1 ssh2 from 9.9.9.9 port 5 ssh2",
+            " Accepted password for a from 6.6.6.6 port 1 ssh2",
+            "Oct 12 02:11:40 host sshd[1]: Accepted password for a from 6.6.6.6 port 1 ssh2",
+        ] {
+            assert!(accepted_message(m).is_none(), "{m}");
+        }
+    }
+
+    #[test]
+    fn masking_twice_is_masking_once() {
+        // Triage masks a cron line, and the evidence masks (and hashes) its copy
+        // again: the text and the hash must not move.
+        for s in [
+            "mysql -u root -pHunter2 -e 'select 1'",
+            "curl -u admin:s3cret https://x/y",
+            "curl https://bob:pw123@host/path",
+            "app --password hunter2 --verbose",
+            "wget --user=a --password=S http://x/c.sh | sh",
+            "curl -H 'Authorization: Basic dXNlcjpwYXNz' https://x",
+            "curl -H X-Auth-Token:zzz999 https://x",
+            "curl -H 'Cookie: session=s3ss' https://x",
+            "sshpass -p1234 ssh root@h",
+            "redis-cli -h 10.0.0.2 -a r3dispw ping",
+            "openssl rsa -passin pass:keypw -in k.pem",
+            "lftp -u bob,ftppw ftp://h",
+            "curl https://api.telegram.org/bot123456:AAHsecretTok/sendMessage",
+            "app --password  spaced",
+        ] {
+            let once = redact(s);
+            assert_eq!(redact(&once), once, "{s}");
+            assert_eq!(redacted_line_sha(&once), redacted_line_sha(s), "{s}");
         }
     }
 

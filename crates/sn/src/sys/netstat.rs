@@ -152,16 +152,6 @@ pub fn listening_ports(conns: &[Conn]) -> Vec<u16> {
     p
 }
 
-/// Remote peers of ESTABLISHED connections whose local port is in `ports`
-/// (e.g. active SSH or panel sessions), normalized to plain IPs.
-pub fn established_peers_on(conns: &[Conn], ports: &[u16]) -> Vec<IpAddr> {
-    conns
-        .iter()
-        .filter(|c| c.state == ST_ESTABLISHED && ports.contains(&c.local_port))
-        .map(|c| snsec_common::net::normalize(c.remote))
-        .collect()
-}
-
 /// Count open connections per remote IP (slowloris / flood signal).
 pub fn conns_per_remote(conns: &[Conn]) -> HashMap<String, u32> {
     let mut m = HashMap::new();

@@ -113,13 +113,23 @@ pub fn cmdline(pid: i32) -> Vec<String> {
 
 /// Real UID from `/proc/<pid>/status` (the first value on the `Uid:` line).
 pub fn uid(pid: i32) -> Option<u32> {
-    let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-    for line in status.lines() {
-        if let Some(rest) = line.strip_prefix("Uid:") {
-            return rest.split_whitespace().next()?.parse().ok();
-        }
-    }
-    None
+    parse_uid(&fs::read(format!("/proc/{pid}/status")).ok()?)
+}
+
+/// The real UID in the bytes of `/proc/<pid>/status`. Read as bytes: the kernel
+/// escapes only `\n` and `\\` in the `Name:` line and prints every other byte of
+/// the name as it is, so a process naming itself with a byte that is not UTF-8
+/// must not lose its owner (and be shown as root, or be missed by a kill).
+pub fn parse_uid(raw: &[u8]) -> Option<u32> {
+    let rest = raw
+        .split(|&b| b == b'\n')
+        .find_map(|l| l.strip_prefix(b"Uid:"))?;
+    std::str::from_utf8(rest)
+        .ok()?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
 }
 
 pub fn username(uid: u32) -> String {
@@ -334,9 +344,16 @@ pub fn persistence_files() -> Vec<PathBuf> {
             }
         }
     }
-    for f in ["/etc/crontab", "/etc/rc.local", "/etc/ld.so.preload"] {
+    // On RHEL-family systems /etc/rc.local is a link to rc.d/rc.local: the file
+    // comes first, so a link to it is read once, under the file's own name.
+    for f in [
+        "/etc/crontab",
+        "/etc/rc.d/rc.local",
+        "/etc/rc.local",
+        "/etc/ld.so.preload",
+    ] {
         let p = PathBuf::from(f);
-        // Present even as a symlink: the reader refuses it and says so.
+        // Present even as a symlink: the reader decides whether to follow it.
         if fs::symlink_metadata(&p).is_ok() {
             out.push(p);
         }
@@ -407,6 +424,24 @@ mod tests {
         assert!(parse_stat(1, b"1 )x( S 0").is_none());
         assert!(parse_stat(1, b"1 (x) S 0 1").is_none());
         assert!(parse_stat(1, b"").is_none());
+    }
+
+    #[test]
+    fn the_owner_of_a_process_whose_name_is_not_utf8_is_still_read() {
+        let mut raw = b"Name:\t\xff)x\nUmask:\t0022\nState:\tS (sleeping)\n".to_vec();
+        raw.extend_from_slice(b"Tgid:\t42\nPid:\t42\nPPid:\t1\nUid:\t1001\t1001\t1001\t1001\n");
+        raw.extend_from_slice(b"Gid:\t1001\t1001\t1001\t1001\n");
+        assert!(std::str::from_utf8(&raw).is_err());
+        assert_eq!(parse_uid(&raw), Some(1001));
+        // The kernel escapes a newline in the name: it cannot start a line.
+        assert_eq!(
+            parse_uid(b"Name:\tx\\nUid:\t0\nUid:\t1002\t0\t0\t0\n"),
+            Some(1002)
+        );
+        assert_eq!(parse_uid(b"Name:\tx\nUid:\t0\t0\t0\t0\n"), Some(0));
+        assert_eq!(parse_uid(b"Name:\tx\nGid:\t5\n"), None);
+        assert_eq!(parse_uid(b"Uid:\t\xff\n"), None);
+        assert_eq!(parse_uid(b""), None);
     }
 
     #[test]

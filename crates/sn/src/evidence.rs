@@ -95,10 +95,9 @@ pub fn collect(state: &State) -> Result<Evidence> {
         .map(|p| {
             let ppid = proc::read_stat(p.pid).map_or(0, |s| s.ppid);
             let cmd = proc::cmdline(p.pid).join(" ");
-            let lower = cmd.to_ascii_lowercase();
             // `out_conns` holds only connections the process opened: the remote
             // port of one a server accepted is the client's to choose.
-            let miner_hint = triage::MINER_HINTS.iter().any(|h| lower.contains(h))
+            let miner_hint = snsec_common::ai::has_miner_marker(&cmd)
                 || p.out_conns.iter().any(|c| triage::to_bad_port(c));
             EvProc {
                 pid: p.pid,
@@ -167,7 +166,8 @@ pub fn collect(state: &State) -> Result<Evidence> {
 // Persistence
 // ---------------------------------------------------------------------------
 
-/// Triage already finds cron and `ld.so.preload` hits as `path: line` strings.
+/// Triage already finds cron and `ld.so.preload` hits as `path: line` strings,
+/// with secrets masked; masking again changes nothing.
 fn triage_persistence(hits: &[String]) -> Vec<EvPersist> {
     hits.iter()
         .map(|h| {
@@ -192,17 +192,20 @@ fn triage_persistence(hits: &[String]) -> Vec<EvPersist> {
 /// A small regular file's text. A symlink, a device or a big file is skipped.
 /// Triage reads cron and `ld.so.preload` through this too.
 pub(crate) fn read_small(path: &Path) -> Option<String> {
-    let meta = std::fs::symlink_metadata(path).ok()?;
-    if !meta.file_type().is_file() || meta.len() > RC_MAX_BYTES {
+    read_small_owned(path).map(|(text, _)| text)
+}
+
+/// [`read_small`], with the owner of the file that was read (from the handle).
+pub(crate) fn read_small_owned(path: &Path) -> Option<(String, u32)> {
+    let f = open_regular(path)?;
+    let meta = f.metadata().ok()?;
+    if meta.len() > RC_MAX_BYTES {
         return None;
     }
     // Lossy: a single stray byte must not hide a whole start-up file from view.
     let mut bytes = Vec::new();
-    open_regular(path)?
-        .take(RC_MAX_BYTES)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    Some(String::from_utf8_lossy(&bytes).into_owned())
+    f.take(RC_MAX_BYTES).read_to_end(&mut bytes).ok()?;
+    Some((String::from_utf8_lossy(&bytes).into_owned(), meta.uid()))
 }
 
 fn home_persistence(users: &[EvUser]) -> Vec<EvPersist> {
