@@ -69,8 +69,8 @@ impl LogLine {
 }
 
 /// Split a line into logical tokens, treating `"..."` and `[...]` as single
-/// tokens (contents only). Handles the quoting used by both `combined` and the
-/// `sn` format.
+/// tokens (contents only). Handles the quoting of the `sn` format, which has no
+/// client-chosen field outside quotes.
 fn tokenize(line: &str) -> Vec<&str> {
     let bytes = line.as_bytes();
     let mut out = Vec::with_capacity(12);
@@ -101,6 +101,88 @@ fn tokenize(line: &str) -> Vec<&str> {
         }
     }
     out
+}
+
+fn is_blank(b: u8) -> bool {
+    b == b' ' || b == b'\t'
+}
+
+/// The next `"..."` field at or after the start of `s`: its contents and what
+/// follows the closing quote. A backslash escapes the next byte (Apache writes
+/// `\"` and `\\`; nginx writes `\x22` and never a raw backslash).
+fn quoted(s: &str) -> Option<(&str, &str)> {
+    let open = s.find('"')?;
+    let b = s.as_bytes();
+    let mut j = open + 1;
+    while j < b.len() {
+        match b[j] {
+            b'\\' => j += 2,
+            b'"' => return Some((&s[open + 1..j], &s[j + 1..])),
+            _ => j += 1,
+        }
+    }
+    None
+}
+
+/// A quoted field that must come next, after blanks only.
+fn next_quoted(s: &str) -> Option<(&str, &str)> {
+    let s = s.trim_start_matches([' ', '\t']);
+    if s.starts_with('"') { quoted(s) } else { None }
+}
+
+/// The next blank-separated word and what follows it.
+fn next_word(s: &str) -> Option<(&str, &str)> {
+    let s = s.trim_start_matches([' ', '\t']);
+    let end = s.bytes().position(is_blank).unwrap_or(s.len());
+    (end > 0).then(|| (&s[..end], &s[end..]))
+}
+
+/// An HTTP status: exactly three digits, 100..=599.
+fn http_status(s: &str) -> Option<u16> {
+    if s.len() != 3 || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n: u16 = s.parse().ok()?;
+    (100..=599).contains(&n).then_some(n)
+}
+
+/// `ip ident user [time] "request" status bytes "referer" "user-agent" ...`
+///
+/// Only the address is read by position from the start. The user field is
+/// whatever the client sent in `Authorization: Basic` (nginx logs it even where
+/// no auth is configured), spaces and brackets included, so neither it nor the
+/// time is taken to be one token. Both servers escape `"` inside fields, so the
+/// first quote opens the request; status and bytes follow it, then the referer
+/// and user agent as the next two quoted fields.
+fn parse_combined(line: &str) -> Option<LogLine> {
+    let line = line.trim_start_matches([' ', '\t']);
+    let ip_end = line.bytes().position(is_blank)?;
+    let peer: IpAddr = line[..ip_end].parse().ok()?;
+    let (mut request, mut rest) = quoted(&line[ip_end..])?;
+    // Apache writes an empty user name as a bare `""`, the one raw quote that
+    // can come before the request; the time field follows it.
+    if request.is_empty() && rest.trim_start_matches([' ', '\t']).starts_with('[') {
+        (request, rest) = quoted(rest)?;
+    }
+    let (status, rest) = next_word(rest)?;
+    let status = http_status(status)?;
+    let (bytes, rest) = next_word(rest)?;
+    if bytes != "-" && !bytes.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let (_referer, rest) = next_quoted(rest)?;
+    let (user_agent, _) = next_quoted(rest)?;
+    let (method, path) = split_request(request);
+    Some(LogLine {
+        peer: net::normalize(peer),
+        client: net::normalize(peer),
+        host: String::new(),
+        method,
+        path,
+        status,
+        user_agent: user_agent.to_string(),
+        request_time: None,
+    })
 }
 
 fn split_request(req: &str) -> (String, String) {
@@ -135,26 +217,7 @@ fn resolve_client(peer: IpAddr, cf: &str, xff: &str, trusted: &[Cidr]) -> IpAddr
 pub fn parse_line(fmt: LogFormat, line: &str, trusted: &[Cidr]) -> Option<LogLine> {
     match fmt {
         LogFormat::NginxJson => parse_json(line, trusted),
-        LogFormat::Combined => {
-            let t = tokenize(line);
-            // ip - user [time] "req" status bytes "ref" "ua"
-            if t.len() < 9 {
-                return None;
-            }
-            let peer: IpAddr = t[0].parse().ok()?;
-            let (method, path) = split_request(t[4]);
-            let status: u16 = t[5].parse().ok()?;
-            Some(LogLine {
-                peer: net::normalize(peer),
-                client: net::normalize(peer),
-                host: String::new(),
-                method,
-                path,
-                status,
-                user_agent: t[8].to_string(),
-                request_time: None,
-            })
-        }
+        LogFormat::Combined => parse_combined(line),
         LogFormat::Sn => {
             let t = tokenize(line);
             // realip remote cf xff [time] host "req" status bytes rt "ua"
@@ -257,6 +320,106 @@ mod tests {
         assert_eq!(p.path, "/wp-login.php");
         assert_eq!(p.status, 200);
         assert_eq!(p.user_agent, "curl/8.0");
+    }
+
+    fn combined_with_user(user: &str) -> Option<LogLine> {
+        let l = format!(
+            r#"203.0.113.9 - {user} [10/Oct/2026:01:02:03 +0000] "POST /wp-login.php HTTP/1.1" 403 17 "https://example.com/" "Mozilla/5.0 (X11)""#
+        );
+        parse_line(LogFormat::Combined, &l, &[])
+    }
+
+    #[test]
+    fn combined_user_field_cannot_shift_the_others() {
+        // nginx logs $remote_user from any Basic header, unescaped spaces and
+        // brackets included. Whatever it holds, the real request is read.
+        for user in [
+            "-",
+            "alice",
+            "a b",
+            "[",
+            "]",
+            "x ] y",
+            "a [b] c",
+            "a b [x] [GET /] 200 0 - - ua",
+            "[GET /.env HTTP/1.1] 200 0 r s",
+            // A forged request as nginx writes it: quotes escaped as \x22.
+            r"\x22GET /.env HTTP/1.1\x22 200 0 \x22-\x22 \x22sqlmap\x22",
+        ] {
+            let p = combined_with_user(user).unwrap_or_else(|| panic!("user {user:?}"));
+            assert_eq!(p.client.to_string(), "203.0.113.9", "user {user:?}");
+            assert_eq!(p.method, "POST", "user {user:?}");
+            assert_eq!(p.path, "/wp-login.php", "user {user:?}");
+            assert_eq!(p.status, 403, "user {user:?}");
+            assert_eq!(p.user_agent, "Mozilla/5.0 (X11)", "user {user:?}");
+        }
+    }
+
+    #[test]
+    fn combined_apache_quirks() {
+        // Apache writes an empty user name as "" and escapes quotes as \".
+        let l = r#"198.51.100.7 - "" [10/Oct/2026:01:02:03 +0000] "GET /a HTTP/1.1" 401 381 "-" "curl/8.0""#;
+        let p = parse_line(LogFormat::Combined, l, &[]).unwrap();
+        assert_eq!((p.path.as_str(), p.status), ("/a", 401));
+        assert_eq!(p.user_agent, "curl/8.0");
+
+        let l = r#"198.51.100.7 - - [10/Oct/2026:01:02:03 +0000] "GET /q\"x HTTP/1.1" 200 5 "-" "Mozilla \"evil\" 1.0""#;
+        let p = parse_line(LogFormat::Combined, l, &[]).unwrap();
+        assert_eq!(p.path, r#"/q\"x"#);
+        assert_eq!(p.status, 200);
+        assert_eq!(p.user_agent, r#"Mozilla \"evil\" 1.0"#);
+    }
+
+    #[test]
+    fn combined_extra_fields_and_empty_request() {
+        // nginx "main": X-Forwarded-For after the user agent.
+        let l = r#"203.0.113.9 - - [10/Oct/2026:01:02:03 +0000] "GET / HTTP/2.0" 200 612 "-" "nikto" "10.0.0.1""#;
+        assert_eq!(
+            parse_line(LogFormat::Combined, l, &[]).unwrap().user_agent,
+            "nikto"
+        );
+        // A connection that sent nothing: nginx logs an empty request.
+        let l = r#"203.0.113.9 - - [10/Oct/2026:01:02:03 +0000] "" 400 0 "-" "-""#;
+        let p = parse_line(LogFormat::Combined, l, &[]).unwrap();
+        assert_eq!((p.method.as_str(), p.status), ("", 400));
+        assert_eq!(p.user_agent, "-");
+    }
+
+    #[test]
+    fn combined_status_must_follow_the_request() {
+        let with = |status: &str, bytes: &str| {
+            let l = format!(
+                r#"203.0.113.9 - - [10/Oct/2026:01:02:03 +0000] "GET / HTTP/1.1" {status} {bytes} "-" "ua""#
+            );
+            parse_line(LogFormat::Combined, &l, &[]).map(|p| p.status)
+        };
+        assert_eq!(with("200", "12"), Some(200));
+        assert_eq!(with("599", "-"), Some(599));
+        for bad in ["2000", "20", "099", "600", "-", "2x0", "+20", "abc"] {
+            assert_eq!(with(bad, "0"), None, "status {bad:?}");
+        }
+        assert_eq!(with("200", "12k"), None);
+        // `common` (no referer / user agent) is not `combined`.
+        let l = r#"203.0.113.9 - - [10/Oct/2026:01:02:03 +0000] "GET / HTTP/1.1" 200 12"#;
+        assert!(parse_line(LogFormat::Combined, l, &[]).is_none());
+        // Referer and user agent must be the next fields, not anything later.
+        let l =
+            r#"203.0.113.9 - - [10/Oct/2026:01:02:03 +0000] "GET / HTTP/1.1" 200 12 x "-" "ua""#;
+        assert!(parse_line(LogFormat::Combined, l, &[]).is_none());
+    }
+
+    #[test]
+    fn combined_never_panics_on_any_cut() {
+        let lines = [
+            r#"203.0.113.9 - a [b] "c [10/Oct/2026:01:02:03 +0000] "GET /é\"\ HTTP/1.1" 200 1 "-" "ü\""#,
+            r#"2001:db8::1 - "" [x] "" 400 0 "\" "\\"#,
+        ];
+        for l in lines {
+            for (i, _) in l.char_indices() {
+                let _ = parse_line(LogFormat::Combined, &l[..i], &[]);
+                let _ = parse_line(LogFormat::Combined, &l[i..], &[]);
+            }
+        }
     }
 
     #[test]

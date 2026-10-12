@@ -196,6 +196,7 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<()> {
     let now = started;
     active.retain(|_, b| b.expires_ts > now);
     state.save_bans(&active)?;
+    prune_strikes(&mut strikes, now);
     state.save_strikes(&strikes)?;
 
     // Build cycle stats + top IPs.
@@ -313,6 +314,30 @@ fn ladder_ttl(strike: u32) -> u64 {
     }
 }
 
+/// A clean week resets the strike ladder.
+const STRIKE_DECAY_SECS: i64 = 7 * 86_400;
+/// Most addresses (or /64s) strikes.json remembers.
+const MAX_STRIKES: usize = 100_000;
+
+/// Forget strikes past the decay window, which count as none anyway, and keep
+/// at most [`MAX_STRIKES`], the most recent first, so strikes.json stays small
+/// however many addresses a flood brings.
+fn prune_strikes(strikes: &mut HashMap<String, Strike>, now: i64) {
+    strikes.retain(|_, s| now - s.last_ts <= STRIKE_DECAY_SECS);
+    let excess = strikes.len().saturating_sub(MAX_STRIKES);
+    if excess == 0 {
+        return;
+    }
+    let mut oldest: Vec<(i64, u32, String)> = strikes
+        .iter()
+        .map(|(k, s)| (s.last_ts, s.count, k.clone()))
+        .collect();
+    oldest.select_nth_unstable(excess - 1);
+    for (_, _, k) in oldest.into_iter().take(excess) {
+        strikes.remove(&k);
+    }
+}
+
 fn key_protected(
     key: &str,
     ip_of_key: &HashMap<String, IpAddr>,
@@ -345,16 +370,22 @@ fn collect(state: &State, trusted: &[Cidr], sources: &[LogSource]) -> Result<Cyc
     };
 
     let mut total_bytes: u64 = 0;
+    // Files matched this cycle, readable or not; `cut_short` when the byte
+    // budget ended the cycle before the last of them.
+    let mut seen = std::collections::HashSet::new();
+    let mut cut_short = false;
 
     'outer: for src in sources {
         let fmt = LogFormat::from_str_opt(&src.format).unwrap_or(LogFormat::Combined);
         for path in expand_glob(&src.glob) {
             if total_bytes >= CYCLE_BYTE_BUDGET {
                 data.catch_up = true;
+                cut_short = true;
                 break 'outer; // offsets already saved advance next cycle
             }
             data.files_matched += 1;
             let key = path.to_string_lossy().to_string();
+            seen.insert(key.clone());
             let prev = offsets.get(&key).copied();
             if prev.is_some() {
                 data.files_known += 1;
@@ -411,6 +442,13 @@ fn collect(state: &State, trusted: &[Cidr], sources: &[LogSource]) -> Result<Cyc
         }
     }
 
+    // Forget files no source matches any more (rotated away, a site removed,
+    // a file that stopped passing the owner check), so offsets.json cannot grow
+    // without bound. Not after a cut-short cycle: the files it never reached
+    // keep their place.
+    if !cut_short {
+        offsets.retain(|k, _| seen.contains(k));
+    }
     state.save_offsets(&offsets)?;
     Ok(data)
 }
@@ -896,6 +934,66 @@ mod tests {
             ..health()
         };
         assert!(assess_logs(&tiny, &g, None).0.is_empty());
+    }
+
+    #[test]
+    fn strikes_past_the_decay_window_are_forgotten_and_the_map_is_capped() {
+        let now: i64 = 1_000_000_000;
+        let strike = |count, age: i64| Strike {
+            count,
+            last_ts: now - age,
+        };
+        let mut s: HashMap<String, Strike> = HashMap::new();
+        s.insert("old".into(), strike(4, STRIKE_DECAY_SECS + 1));
+        s.insert("week".into(), strike(4, STRIKE_DECAY_SECS));
+        s.insert("new".into(), strike(1, 0));
+        prune_strikes(&mut s, now);
+        let mut keys: Vec<&str> = s.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["new", "week"]);
+
+        // A flood of distinct addresses: the oldest strikes go first.
+        let n = MAX_STRIKES + 10;
+        let mut s: HashMap<String, Strike> = (0..n)
+            .map(|i| (format!("k{i}"), strike(1, (n - i) as i64)))
+            .collect();
+        prune_strikes(&mut s, now);
+        assert_eq!(s.len(), MAX_STRIKES);
+        assert!(!s.contains_key("k0") && !s.contains_key("k9"));
+        assert!(s.contains_key("k10") && s.contains_key(&format!("k{}", n - 1)));
+    }
+
+    #[test]
+    fn offsets_are_kept_only_for_files_still_matched() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        std::fs::create_dir(&logs).unwrap();
+        let state = State::at(dir.path().join("state"));
+        let src = [LogSource {
+            glob: format!("{}/*.log", logs.display()),
+            format: "combined".into(),
+        }];
+        let a = logs.join("a.log");
+        let b = logs.join("b.log");
+        for p in [&a, &b] {
+            std::fs::write(p, "x\n").unwrap();
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        collect(&state, &[], &src).unwrap();
+        assert_eq!(state.offsets().len(), 2);
+
+        // A file that cannot be read this cycle keeps its place.
+        std::fs::set_permissions(&a, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let d = collect(&state, &[], &src).unwrap();
+        assert_eq!(d.unreadable, 1);
+        assert_eq!(state.offsets().len(), 2);
+
+        // A file no glob matches any more is forgotten.
+        std::fs::remove_file(&b).unwrap();
+        collect(&state, &[], &src).unwrap();
+        let keys: Vec<String> = state.offsets().into_keys().collect();
+        assert_eq!(keys, [a.to_string_lossy().to_string()]);
     }
 
     #[test]

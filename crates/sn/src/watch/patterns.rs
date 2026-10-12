@@ -16,14 +16,26 @@ pub struct IpAgg {
     pub login_posts: u64,
     pub xmlrpc_posts: u64,
     pub wp_pingback: u64,
-    pub probe_hit: bool,
+    /// Requests for a path only a scanner asks for (see [`is_probe_path`]).
+    pub probe_hits: u64,
     pub bad_ua: bool,
     pub empty_ua: bool,
     paths: HashSet<u64>,
     paths_capped: bool,
+    /// Distinct probe paths among `probe_hits`, up to [`PROBE_DISTINCT`].
+    probe_paths: Vec<u64>,
 }
 
 const PATH_CAP: usize = 64;
+
+/// Distinct probe paths that make a scanner on their own.
+const PROBE_DISTINCT: usize = 3;
+/// 4xx answers over as many distinct paths that, with a probe, make a scanner.
+const PROBE_MISSES: u64 = 10;
+/// Up to this many requests an uncorroborated probe is reported. Above it the
+/// probe decides nothing, so the request-rate check still applies to the
+/// address (one `/.env` must not buy a flood its way out of a rate ban).
+const PROBE_REPORT_MAX: u64 = 20;
 
 impl IpAgg {
     pub fn observe(&mut self, line: &LogLine) {
@@ -55,7 +67,11 @@ impl IpAgg {
         }
 
         if is_probe_path(path) {
-            self.probe_hit = true;
+            self.probe_hits += 1;
+            let h = fxhash(path.to_ascii_lowercase().as_bytes());
+            if self.probe_paths.len() < PROBE_DISTINCT && !self.probe_paths.contains(&h) {
+                self.probe_paths.push(h);
+            }
         }
         let ua = line.user_agent.trim();
         if ua.is_empty() || ua == "-" {
@@ -72,6 +88,17 @@ impl IpAgg {
         } else {
             self.paths.len()
         }
+    }
+
+    /// Probe requests plus something that marks a scanner. Any web page can make
+    /// a visitor's browser request `/.env` on this site, with the browser's own
+    /// User-Agent; one such request must not ban the visitor for a day.
+    fn probe_corroborated(&self) -> bool {
+        self.probe_hits > 0
+            && (self.bad_ua
+                || self.empty_ua
+                || self.probe_paths.len() >= PROBE_DISTINCT
+                || (self.err4xx >= PROBE_MISSES && self.distinct_paths() >= PROBE_MISSES as usize))
     }
 }
 
@@ -95,7 +122,7 @@ pub fn evaluate(a: &IpAgg) -> Option<PatternHit> {
             ban: true,
         });
     }
-    if a.probe_hit {
+    if a.probe_corroborated() {
         return Some(PatternHit {
             reason: "probe",
             ttl_secs: 86_400,
@@ -123,26 +150,37 @@ pub fn evaluate(a: &IpAgg) -> Option<PatternHit> {
             ban: false,
         });
     }
+    if a.probe_hits > 0 && a.requests <= PROBE_REPORT_MAX {
+        return Some(PatternHit {
+            reason: "probe",
+            ttl_secs: 0,
+            ban: false,
+        });
+    }
     None
 }
 
+/// Paths only a scanner asks for: secrets and version-control data left in the
+/// web root, and database admin tools. Matched on whole path segments, so
+/// `/blog/.environment` or `/assets/config.json` are ordinary requests.
 fn is_probe_path(path: &str) -> bool {
-    const PROBES: &[&str] = &[
-        "/.env",
-        "/.git/",
-        "/.git/config",
-        "/phpmyadmin",
-        "/pma/",
-        "/wp-config.php.bak",
-        "/wp-config.php~",
-        "/.ds_store",
-        "/.aws/",
-        "/config.json",
-        "/.svn/",
-        "/vendor/phpunit",
-    ];
     let lower = path.to_ascii_lowercase();
-    PROBES.iter().any(|p| lower.contains(p))
+    let segs: Vec<&str> = lower.split('/').filter(|s| !s.is_empty()).collect();
+    let (Some(first), Some(last)) = (segs.first(), segs.last()) else {
+        return false;
+    };
+    // .env, .env.local, .env.bak, .env~ - but not .envrc or .environment.
+    let env_file = last
+        .strip_prefix(".env")
+        .is_some_and(|rest| !rest.starts_with(|c: char| c.is_ascii_alphanumeric()));
+    env_file
+        || matches!(*last, ".ds_store" | "wp-config.php.bak" | "wp-config.php~")
+        || segs
+            .iter()
+            .any(|s| matches!(*s, ".git" | ".svn" | ".hg" | ".aws"))
+        || first.starts_with("phpmyadmin")
+        || *first == "pma"
+        || segs.windows(2).any(|w| w == ["vendor", "phpunit"])
 }
 
 fn is_bad_ua(ua: &str) -> bool {
@@ -194,13 +232,108 @@ mod tests {
         assert!(hit.ban);
     }
 
+    const BROWSER: &str = "Mozilla/5.0 (Windows NT 10.0) Chrome/148.0.0.0 Safari/537.36";
+
+    fn get(a: &mut IpAgg, path: &str, status: u16, ua: &str) {
+        a.observe(&line(&format!(
+            r#"1.2.3.4 - - [x] "GET {path} HTTP/1.1" {status} 1 "-" "{ua}""#
+        )));
+    }
+
     #[test]
-    fn probe_detected() {
+    fn a_lone_probe_from_a_browser_is_only_reported() {
+        // Any page can make a visitor's browser fetch /.env here, even a few
+        // times; that alone must not ban the visitor.
         let mut a = IpAgg::default();
-        a.observe(&line(
-            r#"1.2.3.4 - - [x] "GET /.env HTTP/1.1" 404 1 "-" "x""#,
-        ));
-        assert_eq!(evaluate(&a).unwrap().reason, "probe");
+        get(&mut a, "/", 200, BROWSER);
+        for _ in 0..3 {
+            get(&mut a, "/.env", 404, BROWSER);
+        }
+        let hit = evaluate(&a).unwrap();
+        assert_eq!(hit.reason, "probe");
+        assert!(!hit.ban);
+        assert_eq!(hit.ttl_secs, 0);
+    }
+
+    #[test]
+    fn a_probe_with_a_tool_or_missing_user_agent_bans() {
+        for ua in ["sqlmap/1.7", "", "-"] {
+            let mut a = IpAgg::default();
+            get(&mut a, "/.env", 404, ua);
+            let hit = evaluate(&a).unwrap();
+            assert_eq!((hit.reason, hit.ban, hit.ttl_secs), ("probe", true, 86_400));
+        }
+    }
+
+    #[test]
+    fn several_probe_paths_or_many_misses_ban() {
+        let mut a = IpAgg::default();
+        for p in ["/.env", "/.git/config", "/phpmyadmin/"] {
+            get(&mut a, p, 404, BROWSER);
+        }
+        assert!(evaluate(&a).unwrap().ban);
+
+        let mut a = IpAgg::default();
+        get(&mut a, "/.env", 404, BROWSER);
+        for i in 0..10 {
+            get(&mut a, &format!("/old{i}.php"), 404, BROWSER);
+        }
+        let hit = evaluate(&a).unwrap();
+        assert_eq!((hit.reason, hit.ban), ("probe", true));
+    }
+
+    #[test]
+    fn a_probe_does_not_hide_a_flood_from_the_rate_check() {
+        // Busy address with one /.env: the probe decides nothing, so `decide`
+        // falls through to the request-rate threshold.
+        let mut a = IpAgg::default();
+        for _ in 0..500 {
+            get(&mut a, "/", 200, BROWSER);
+        }
+        get(&mut a, "/.env", 404, BROWSER);
+        assert!(evaluate(&a).is_none());
+    }
+
+    #[test]
+    fn probe_paths_match_whole_segments() {
+        for p in [
+            "/.env",
+            "/.ENV",
+            "/.env.local",
+            "/.env~",
+            "/laravel/.env",
+            "//.env/",
+            "/.git/config",
+            "/.git",
+            "/app/.git/HEAD",
+            "/.svn/entries",
+            "/.aws/credentials",
+            "/phpmyadmin",
+            "/phpMyAdmin-5.2.1/index.php",
+            "/pma/",
+            "/wp-config.php.bak",
+            "/wp-config.php~",
+            "/.DS_Store",
+            "/vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php",
+            "/lib/vendor/phpunit/x",
+        ] {
+            assert!(is_probe_path(p), "{p}");
+        }
+        for p in [
+            "/",
+            "/config.json",
+            "/assets/config.json",
+            "/.envrc",
+            "/blog/.environment",
+            "/.github/logo.png",
+            "/docs/phpmyadmin-guide",
+            "/blog/pma/",
+            "/wp-config.php",
+            "/vendor/phpunit-docs",
+            "/search",
+        ] {
+            assert!(!is_probe_path(p), "{p}");
+        }
     }
 
     #[test]
