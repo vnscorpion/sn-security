@@ -80,6 +80,7 @@ impl Db {
             .context("applying AI schema")?;
         conn.execute_batch(crate::db_auth::SCHEMA_AUTH)
             .context("applying auth schema")?;
+        crate::db_auth::migrate_auth(&conn).context("migrating auth schema")?;
         Ok(Db { conn })
     }
 

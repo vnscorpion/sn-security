@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS admin_auth (
     totp_secret TEXT NOT NULL DEFAULT '',
     totp_enabled INTEGER NOT NULL DEFAULT 0,
     totp_last_step INTEGER NOT NULL DEFAULT 0,
+    totp_offset INTEGER NOT NULL DEFAULT 0,
     webauthn_user TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS passkeys (
@@ -49,6 +50,26 @@ CREATE TABLE IF NOT EXISTS login_log (
 );
 "#;
 
+/// Columns added after the first release, for databases created before them.
+/// `CREATE TABLE IF NOT EXISTS` does not touch an existing table.
+pub fn migrate_auth(conn: &rusqlite::Connection) -> Result<()> {
+    let has = |col: &str| -> Result<bool> {
+        let mut stmt = conn.prepare("SELECT name FROM pragma_table_info('admin_auth')")?;
+        let names: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .filter_map(std::result::Result::ok)
+            .collect();
+        Ok(names.iter().any(|n| n == col))
+    };
+    if !has("totp_offset")? {
+        conn.execute(
+            "ALTER TABLE admin_auth ADD COLUMN totp_offset INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 /// Recovery codes issued at a time.
 pub const RECOVERY_CODES: usize = 8;
 const LOGIN_LOG_KEEP: i64 = 200;
@@ -60,6 +81,9 @@ pub struct TotpState {
     pub secret: String,
     pub enabled: bool,
     pub last_step: u64,
+    /// Steps between this server's clock and the authenticator's, learned at
+    /// enrolment and followed at each sign-in (RFC 6238 §6).
+    pub offset: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -148,13 +172,14 @@ impl Db {
     pub fn totp(&self) -> Option<TotpState> {
         self.conn
             .query_row(
-                "SELECT totp_secret, totp_enabled, totp_last_step FROM admin_auth WHERE id = 1",
+                "SELECT totp_secret, totp_enabled, totp_last_step, totp_offset FROM admin_auth WHERE id = 1",
                 [],
                 |r| {
                     Ok(TotpState {
                         secret: r.get(0)?,
                         enabled: r.get::<_, i64>(1)? != 0,
                         last_step: u64::try_from(r.get::<_, i64>(2)?).unwrap_or(0),
+                        offset: r.get(3)?,
                     })
                 },
             )
@@ -169,7 +194,7 @@ impl Db {
     pub fn start_totp(&self, secret: &str) -> Result<()> {
         self.ensure_auth_row()?;
         self.conn.execute(
-            "UPDATE admin_auth SET totp_secret = ?1, totp_enabled = 0, totp_last_step = 0 WHERE id = 1",
+            "UPDATE admin_auth SET totp_secret = ?1, totp_enabled = 0, totp_last_step = 0, totp_offset = 0 WHERE id = 1",
             params![secret],
         )?;
         Ok(())
@@ -197,9 +222,18 @@ impl Db {
             .unwrap_or(false)
     }
 
+    /// Remember how far the authenticator's clock is from this server's.
+    pub fn set_totp_offset(&self, offset: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE admin_auth SET totp_offset = ?1 WHERE id = 1",
+            params![offset],
+        )?;
+        Ok(())
+    }
+
     pub fn disable_totp(&self) -> Result<()> {
         self.conn.execute(
-            "UPDATE admin_auth SET totp_secret = '', totp_enabled = 0, totp_last_step = 0 WHERE id = 1",
+            "UPDATE admin_auth SET totp_secret = '', totp_enabled = 0, totp_last_step = 0, totp_offset = 0 WHERE id = 1",
             [],
         )?;
         Ok(())
@@ -356,7 +390,7 @@ impl Db {
     pub fn reset_2fa(&self) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
-            "UPDATE admin_auth SET totp_secret = '', totp_enabled = 0, totp_last_step = 0 WHERE id = 1",
+            "UPDATE admin_auth SET totp_secret = '', totp_enabled = 0, totp_last_step = 0, totp_offset = 0 WHERE id = 1",
             [],
         )?;
         tx.execute("DELETE FROM passkeys", [])?;
@@ -417,6 +451,34 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("t.db")).unwrap();
         (db, dir)
+    }
+
+    #[test]
+    fn an_older_database_gains_the_offset_column_and_keeps_its_data() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("old.db");
+        {
+            // The table as 0.8.0–0.8.4 created it.
+            let c = rusqlite::Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE admin_auth (id INTEGER PRIMARY KEY CHECK (id = 1), \
+                 pw_hash TEXT NOT NULL DEFAULT '', pw_updated INTEGER NOT NULL DEFAULT 0, \
+                 totp_secret TEXT NOT NULL DEFAULT '', totp_enabled INTEGER NOT NULL DEFAULT 0, \
+                 totp_last_step INTEGER NOT NULL DEFAULT 0, webauthn_user TEXT NOT NULL DEFAULT ''); \
+                 INSERT INTO admin_auth (id, pw_hash, totp_secret, totp_enabled, totp_last_step) \
+                 VALUES (1, '$argon2id$x', 'ABCDEF234567', 1, 77);",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let t = db.totp().unwrap();
+        assert_eq!((t.enabled, t.last_step, t.offset), (true, 77, 0));
+        db.set_totp_offset(-3).unwrap();
+        assert_eq!(db.totp().unwrap().offset, -3);
+        assert_eq!(db.admin_pw_hash().as_deref(), Some("$argon2id$x"));
+        // Opening again is a no-op.
+        drop(db);
+        assert_eq!(Db::open(&path).unwrap().totp().unwrap().offset, -3);
     }
 
     #[test]

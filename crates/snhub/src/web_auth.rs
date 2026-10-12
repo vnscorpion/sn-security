@@ -548,11 +548,24 @@ pub async fn login_2fa_post(
             .ok()
             .and_then(|d| d.totp())
             .filter(|t| t.enabled);
+        let now_secs = at.max(0) as u64;
         let step = totp_state
-            .and_then(|t| totp::verify(&t.secret, &f.code, at.max(0) as u64, t.last_step));
+            .and_then(|t| totp::verify_at(&t.secret, &f.code, now_secs, t.offset, t.last_step));
         // The compare-and-set is what makes a code single-use: of two requests
         // carrying the same code, only one gets to move the stored step forward.
-        let claimed = step.is_some_and(|s| st.db.lock().is_ok_and(|d| d.claim_totp_step(s)));
+        let claimed = step.is_some_and(|s| {
+            st.db.lock().is_ok_and(|d| {
+                let won = d.claim_totp_step(s);
+                if won {
+                    // Follow slow drift of either clock (RFC 6238 §6).
+                    let drift = s as i64 - (now_secs / totp::STEP_SECS) as i64;
+                    if drift.abs() <= totp::ENROL_SEARCH_STEPS {
+                        let _ = d.set_totp_offset(drift);
+                    }
+                }
+                won
+            })
+        });
         (claimed, "password+totp", "", "code")
     };
     if ok {
@@ -782,6 +795,20 @@ pub async fn security_page(
             secret.chars().skip(n.saturating_sub(4)).collect::<String>()
         )
     };
+    // The codes this server expects right now, for the admin to compare with the
+    // app while enrolling. Shown only for a key not yet confirmed, on a page that
+    // already shows the key itself, so it reveals nothing new.
+    let compare = pending_totp.and_then(|t| {
+        let key = totp::base32_decode(&t.secret)?;
+        let secs = now().max(0) as u64;
+        let step = secs / totp::STEP_SECS;
+        Some((
+            totp::code_for_step(&key, step.saturating_sub(1)),
+            totp::code_for_step(&key, step),
+            totp::code_for_step(&key, step + 1),
+            totp::STEP_SECS - secs % totp::STEP_SECS,
+        ))
+    });
     let qr = pending_totp.and_then(|t| {
         totp::qr_svg(&totp::otpauth_uri(
             "SN Secure",
@@ -824,6 +851,21 @@ pub async fn security_page(
                 p { "1. Quét mã QR bằng ứng dụng, hoặc nhập tay khoá bên dưới. Mục mới trong ứng dụng tên " b { "SN Secure (" (totp_label(&t.secret)) ")" } "; hãy đọc mã từ đúng mục này." }
                 @if let Some(svg) = &qr { div style="background:#fff;display:inline-block;padding:6px;border-radius:8px" { (PreEscaped(svg.clone())) } }
                 p { "Khoá: " code style="user-select:all;letter-spacing:2px" { (t.secret) } }
+                @if let Some((prev, cur, next, left)) = &compare {
+                    details style="margin:0 0 12px" open {
+                        summary { b { "So mã với ứng dụng" } }
+                        p style="margin:6px 0" {
+                            "Hub đang tính (giờ máy chủ, lúc tải trang): "
+                            code style="font-size:20px;letter-spacing:3px" { (cur) }
+                            span class="mut" { " — còn " (left) " giây; 30 giây trước " (prev) ", 30 giây sau " (next) }
+                        }
+                        p class="help" {
+                            "Mã trong mục SN Secure (admin-" (totp_label(&t.secret).trim_start_matches("admin-")) ") của ứng dụng phải trùng một trong các mã này "
+                            "(tải lại trang để lấy mã mới). Khác hẳn: ứng dụng đang giữ khoá khác, xoá mục cũ rồi quét lại. "
+                            "Trùng nhưng lệch một nhịp: đồng hồ hơi lệch, vẫn dùng được."
+                        }
+                    }
+                }
                 p { "2. Nhập mã 6 số ứng dụng đang hiện để xác nhận." }
                 form method="post" action="/security/totp/confirm" {
                     div class="ctrls" {
@@ -1088,34 +1130,73 @@ pub async fn totp_confirm(
     let Some(t) = st.db.lock().expect("db").totp().filter(|t| !t.enabled) else {
         return back("Chưa có khoá nào đang chờ xác nhận.");
     };
-    let Some(step) = totp::verify(&t.secret, &f.code, at.max(0) as u64, 0) else {
-        // Two digits of the right code, to tell a wrong key from a wrong clock. This is
-        // an already signed-in admin who is looking at the key on this very page.
-        let expected_now = totp::base32_decode(&t.secret)
-            .map(|k| totp::code_for_step(&k, at.max(0) as u64 / 30))
+    let now_secs = at.max(0) as u64;
+    // Search a few minutes either way: it tells a wrong clock (the code fits at
+    // some offset) from a wrong key (it fits nowhere), and a clock that is merely
+    // off is learned and compensated instead of locking the admin out.
+    let Some(offset) = totp::find_offset(&t.secret, &f.code, now_secs, totp::ENROL_SEARCH_STEPS)
+    else {
+        let tail: String = t
+            .secret
+            .chars()
+            .skip(t.secret.chars().count().saturating_sub(4))
+            .collect();
+        // Side by side: what was typed and what this server computes, so the two can
+        // be compared directly. Only while enrolling, for an admin already signed in
+        // who is looking at the key itself on this page; never on the sign-in step.
+        let typed: String = f
+            .code
+            .chars()
+            .filter(char::is_ascii_digit)
+            .take(8)
+            .collect();
+        let step = now_secs / totp::STEP_SECS;
+        let expect = totp::base32_decode(&t.secret)
+            .map(|k| {
+                (
+                    totp::code_for_step(&k, step.saturating_sub(1)),
+                    totp::code_for_step(&k, step),
+                    totp::code_for_step(&k, step + 1),
+                )
+            })
             .unwrap_or_default();
+        tracing::warn!(
+            "TOTP enrolment refused: typed {typed:?}, key …{tail}, server {at}: expected prev {} now {} next {}",
+            expect.0,
+            expect.1,
+            expect.2
+        );
         return Redirect::to(&format!(
             "/security?totp=1&msg={}#totp",
             urlenc(&format!(
-                "Mã không đúng. Hãy nhập mã mới nhất đang hiện trong ứng dụng (đúng mục SN Secure vừa thêm). \
-                 Giờ máy chủ lúc này: {:02}:{:02}:{:02} UTC; đồng hồ điện thoại lệch quá 30 giây so với giờ này thì mã sẽ sai. \
-                 Để dò lỗi: khoá hub đang chờ kết thúc bằng \"{}\", và mã đúng lúc này kết thúc bằng \"{}\" \
-                 (nếu mã trong ứng dụng kết thúc khác, ứng dụng đang giữ khoá cũ hoặc nhầm mục: xoá hết mục SN Secure trong ứng dụng, bấm \"Tạo khoá mới\" rồi quét lại).",
+                "Mã không khớp. Bạn nhập: {typed}. Hub tính theo giờ máy chủ {:02}:{:02}:{:02} UTC: \
+                 30 giây trước {}, bây giờ {}, 30 giây sau {} (khoá …{tail}). \
+                 Nếu ứng dụng đang hiện một trong ba mã này mà vẫn bị từ chối, đó là lỗi của hub: chụp màn hình gửi lại. \
+                 Nếu ứng dụng hiện mã khác hẳn: mã không khớp khoá này ở bất kỳ thời điểm nào trong ±5 phút, \
+                 nên không phải lệch giờ mà ứng dụng đang giữ khoá khác (mục cũ, hoặc nhập tay sai khoá): \
+                 dùng đúng mục \"SN Secure (admin-{tail})\", hoặc xoá hết mục SN Secure, bấm \"Tạo khoá mới\" rồi quét lại.",
                 at.rem_euclid(86_400) / 3600,
                 at.rem_euclid(3600) / 60,
                 at.rem_euclid(60),
-                t.secret
-                    .chars()
-                    .skip(t.secret.chars().count().saturating_sub(4))
-                    .collect::<String>(),
-                expected_now.chars().skip(4).collect::<String>()
+                expect.0,
+                expect.1,
+                expect.2,
             ))
         ))
         .into_response();
     };
+    let Some(step) = (now_secs / totp::STEP_SECS).checked_add_signed(offset) else {
+        return back("Không bật được.");
+    };
     let (enabled, fresh_codes) = {
         let db = st.db.lock().expect("db");
-        let ok = db.enable_totp(step).is_ok();
+        let ok = db.enable_totp(step).is_ok() && db.set_totp_offset(offset).is_ok();
+        if offset.abs() > 1 {
+            tracing::warn!(
+                "TOTP enrolment: authenticator clock is {} s from this server's; compensating",
+                offset * totp::STEP_SECS as i64
+            );
+        }
         let fresh = if ok && db.recovery_codes_left() == 0 {
             let codes = new_recovery_codes();
             let hashes: Vec<String> = codes.iter().map(|(_, h)| h.clone()).collect();
@@ -1136,12 +1217,20 @@ pub async fn totp_confirm(
         return back("Không bật được.");
     }
     st.sessions.remove_all_except(&tok);
+    let skew = if offset.abs() > 1 {
+        format!(
+            " Lưu ý: đồng hồ máy chủ lệch khoảng {} giây so với điện thoại; hub đã tự bù, nhưng nên bật đồng bộ giờ (NTP) trên máy chủ.",
+            offset.abs() * totp::STEP_SECS as i64
+        )
+    } else {
+        String::new()
+    };
     match fresh_codes {
         Some(codes) => {
             let shown: Vec<String> = codes.into_iter().map(|(c, _)| c).collect();
-            codes_page(&shown, "Đã bật xác thực hai bước")
+            codes_page(&shown, &format!("Đã bật xác thực hai bước.{skew}"))
         }
-        None => back("Đã bật xác thực bằng ứng dụng."),
+        None => back(&format!("Đã bật xác thực bằng ứng dụng.{skew}")),
     }
 }
 

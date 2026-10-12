@@ -100,19 +100,31 @@ fn ct_eq(a: &str, b: &str) -> bool {
 /// Check a code typed by the admin. Returns the step it matched, which the caller
 /// stores as the new "last used" step; `None` when it is wrong, malformed, or a
 /// step that was already used (a replay).
+#[cfg(test)]
 #[must_use]
 pub fn verify(secret_b32: &str, input: &str, now_secs: u64, last_used_step: u64) -> Option<u64> {
-    let digits: String = input.chars().filter(|c| !c.is_whitespace()).collect();
-    if digits.len() != DIGITS as usize || !digits.chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
+    verify_at(secret_b32, input, now_secs, 0, last_used_step)
+}
+
+/// Like [`verify`], around `now + offset_steps`: the drift between this server's
+/// clock and the admin's authenticator, learned at enrolment (RFC 6238 §6), so a
+/// server clock that is off by a minute or two does not lock the admin out.
+#[must_use]
+pub fn verify_at(
+    secret_b32: &str,
+    input: &str,
+    now_secs: u64,
+    offset_steps: i64,
+    last_used_step: u64,
+) -> Option<u64> {
+    let digits = clean_code(input)?;
     let secret = base32_decode(secret_b32)?;
-    let now_step = now_secs / STEP_SECS;
+    let center = (now_secs / STEP_SECS).checked_add_signed(offset_steps)?;
     // Compare against every step in the window (no early exit on a match, so the
     // time taken does not say which step it was).
     let mut matched: Option<u64> = None;
     for d in -DRIFT_STEPS..=DRIFT_STEPS {
-        let Some(step) = now_step.checked_add_signed(d) else {
+        let Some(step) = center.checked_add_signed(d) else {
             continue;
         };
         if ct_eq(&code_for_step(&secret, step), &digits) && step > last_used_step {
@@ -120,6 +132,41 @@ pub fn verify(secret_b32: &str, input: &str, now_secs: u64, last_used_step: u64)
         }
     }
     matched
+}
+
+/// The six digits of what was typed (spaces allowed), or `None`.
+fn clean_code(input: &str) -> Option<String> {
+    let digits: String = input.chars().filter(|c| !c.is_whitespace()).collect();
+    (digits.len() == DIGITS as usize && digits.chars().all(|c| c.is_ascii_digit()))
+        .then_some(digits)
+}
+
+/// Widest clock difference searched at enrolment: ten steps (five minutes) each way.
+pub const ENROL_SEARCH_STEPS: i64 = 10;
+
+/// At enrolment only: at which step offset from this server's clock does the
+/// typed code match? `Some(0)` means the clocks agree; `Some(4)` means the
+/// authenticator runs about two minutes ahead of this server; `None` means the
+/// code fits this secret at no time within `max_steps` either way, i.e. the app
+/// holds a different key (an old entry, a mistyped key). The offset nearest zero
+/// wins.
+#[must_use]
+pub fn find_offset(secret_b32: &str, input: &str, now_secs: u64, max_steps: i64) -> Option<i64> {
+    let digits = clean_code(input)?;
+    let secret = base32_decode(secret_b32)?;
+    let now_step = now_secs / STEP_SECS;
+    let mut best: Option<i64> = None;
+    for d in -max_steps..=max_steps {
+        let Some(step) = now_step.checked_add_signed(d) else {
+            continue;
+        };
+        if ct_eq(&code_for_step(&secret, step), &digits)
+            && best.is_none_or(|b: i64| d.abs() < b.abs())
+        {
+            best = Some(d);
+        }
+    }
+    best
 }
 
 /// The `otpauth://` link an authenticator app reads from the QR code.
@@ -233,6 +280,39 @@ mod tests {
         assert_eq!(verify(&secret, &prev, t, 0), Some(step - 1));
         assert_eq!(verify(&secret, &next, t, 0), Some(step + 1));
         assert_eq!(verify(&secret, &far, t, 0), None);
+    }
+
+    #[test]
+    fn a_learned_clock_offset_moves_the_window_and_enrolment_finds_it() {
+        let secret = base32_encode(b"12345678901234567890");
+        let key = base32_decode(&secret).unwrap();
+        let t = 1_700_000_000u64;
+        let step = t / STEP_SECS;
+        // The phone runs four steps (two minutes) ahead of this server.
+        let phone = code_for_step(&key, step + 4);
+        assert_eq!(
+            verify(&secret, &phone, t, 0),
+            None,
+            "plain window misses it"
+        );
+        assert_eq!(find_offset(&secret, &phone, t, ENROL_SEARCH_STEPS), Some(4));
+        assert_eq!(verify_at(&secret, &phone, t, 4, 0), Some(step + 4));
+        // And behind.
+        let late = code_for_step(&key, step - 7);
+        assert_eq!(find_offset(&secret, &late, t, ENROL_SEARCH_STEPS), Some(-7));
+        assert_eq!(verify_at(&secret, &late, t, -7, 0), Some(step - 7));
+        // Agreeing clocks give 0.
+        let now = code_for_step(&key, step);
+        assert_eq!(find_offset(&secret, &now, t, ENROL_SEARCH_STEPS), Some(0));
+        // A code from another key fits at no offset (unless by a one-in-a-million
+        // chance, which this fixed pair does not hit).
+        let other = base32_encode(b"abcdefghijabcdefghij");
+        let foreign = code_for_step(&base32_decode(&other).unwrap(), step);
+        assert_eq!(find_offset(&secret, &foreign, t, ENROL_SEARCH_STEPS), None);
+        // Too far is too far.
+        let far = code_for_step(&key, step + 40);
+        assert_eq!(find_offset(&secret, &far, t, ENROL_SEARCH_STEPS), None);
+        assert_eq!(find_offset(&secret, "12x456", t, 10), None);
     }
 
     #[test]

@@ -124,6 +124,20 @@ impl Hub {
         let step = (now() / 30 + step_offset) as u64;
         totp::code_for_step(&key, step)
     }
+    /// A six-digit code that fits the pending/enabled key at no step within the
+    /// enrolment search window, so "wrong code" tests cannot pass by chance.
+    fn wrong_code(&self) -> String {
+        let secret = self.st.db.lock().unwrap().totp().unwrap().secret;
+        let key = totp::base32_decode(&secret).unwrap();
+        let step = now() / 30;
+        let near: Vec<String> = (-12..=12)
+            .map(|d| totp::code_for_step(&key, (step + d) as u64))
+            .collect();
+        (0..1000)
+            .map(|i| format!("{:06}", i * 997 % 1_000_000))
+            .find(|c| !near.contains(c))
+            .unwrap()
+    }
     fn enrolled(&self) -> bool {
         self.st.db.lock().unwrap().second_factor_enrolled()
     }
@@ -175,19 +189,28 @@ async fn enrolling_an_authenticator_app_then_signing_in_with_it() {
     // A reload or a visit to the page without the query keeps the same QR on screen.
     let again = h.get("/security", &cookie).await;
     assert!(again.body.contains("<svg") && again.body.contains("Tạo khoá mới"));
+    // The code the hub expects is shown next to the QR, to compare with the app.
+    assert!(again.body.contains("So mã với ứng dụng"));
+    assert!(again.body.contains(&h.code_at(0)) || again.body.contains(&h.code_at(-1)));
     assert!(page.body.contains("/security/totp/confirm"));
     // Not enabled until a code is confirmed.
     assert!(!h.enrolled());
 
     // A wrong code: told so, next to the form, and nothing is enabled.
     let r = h
-        .post("/security/totp/confirm", &cookie, "code=000000")
+        .post(
+            "/security/totp/confirm",
+            &cookie,
+            &format!("code={}", h.wrong_code()),
+        )
         .await;
     let loc = r.location();
     assert!(loc.starts_with("/security?totp=1&msg="), "{loc}");
     let page = h.get(loc.split('#').next().unwrap(), &cookie).await;
-    assert!(page.body.contains("Mã không đúng"), "{}", page.body);
-    assert!(page.body.contains("Giờ máy chủ"));
+    assert!(page.body.contains("Mã không khớp"), "{}", page.body);
+    // What was typed and what the hub expects, side by side.
+    assert!(page.body.contains(&format!("Bạn nhập: {}", h.wrong_code())));
+    assert!(page.body.contains(&h.code_at(0)) || page.body.contains(&h.code_at(1)));
     assert!(!h.enrolled());
 
     // The right code turns it on and shows the recovery codes once.
@@ -330,4 +353,58 @@ async fn with_two_factor_switched_off_sign_in_is_the_password_and_its_pages_do_n
         let r = h.send(method, uri, &cookie, "password=x").await;
         assert_eq!(r.status, StatusCode::NOT_FOUND, "{uri}");
     }
+}
+
+#[tokio::test]
+async fn a_server_clock_minutes_off_is_learned_at_enrolment_and_followed_at_sign_in() {
+    let h = hub();
+    let cookie = h.sign_in().await;
+    h.post("/security/totp/start", &cookie, &pw_form()).await;
+    // The phone runs four steps (about two minutes) ahead of this server: a plain
+    // ±30 s window would refuse every code.
+    let r = h
+        .post(
+            "/security/totp/confirm",
+            &cookie,
+            &format!("code={}", h.code_at(4)),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.location());
+    assert!(r.body.contains("lệch khoảng"), "the admin is told");
+    let t = h.st.db.lock().unwrap().totp().unwrap();
+    assert!(t.enabled);
+    assert!((3..=5).contains(&t.offset), "offset {}", t.offset);
+
+    // Signing in with the phone's (still ahead) clock works.
+    let r = h.post("/login", "", &pw_form()).await;
+    let pending = format!("snhub_2fa={}", r.set_cookie("snhub_2fa").unwrap());
+    let r = h
+        .post(
+            "/login/2fa",
+            &pending,
+            &format!("kind=totp&code={}", h.code_at(5)),
+        )
+        .await;
+    assert_eq!(r.location(), "/", "{}", r.body);
+    // A code by the server's own clock is now outside the learned window.
+    let r = h.post("/login", "", &pw_form()).await;
+    let pending = format!("snhub_2fa={}", r.set_cookie("snhub_2fa").unwrap());
+    let r = h
+        .post(
+            "/login/2fa",
+            &pending,
+            &format!("kind=totp&code={}", h.code_at(-3)),
+        )
+        .await;
+    assert_eq!(r.location(), "/login/2fa?err=code");
+}
+
+#[tokio::test]
+async fn the_reset_command_has_the_documented_name() {
+    use clap::CommandFactory;
+    let cmd = Cli::command();
+    let names: Vec<&str> = cmd.get_subcommands().map(|c| c.get_name()).collect();
+    assert!(names.contains(&"reset-2fa"), "{names:?}");
+    assert!(names.contains(&"totp-now"));
+    assert!(names.contains(&"set-admin-password"));
 }

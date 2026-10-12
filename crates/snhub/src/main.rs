@@ -89,7 +89,11 @@ enum Cmd {
     /// Forget the authenticator app, every passkey and the recovery codes (when
     /// the second factor is lost). The password stays; sign in with it, then
     /// enrol again on the Bảo mật page.
+    #[command(name = "reset-2fa", alias = "reset2fa")]
     Reset2fa,
+    /// Print this server's time and the authenticator-app codes it expects right
+    /// now, to compare with the phone when a code is refused.
+    TotpNow,
 }
 
 fn now() -> i64 {
@@ -121,6 +125,7 @@ fn real_main() -> Result<()> {
         Cmd::AddVps { name } => cmd_add_vps(&cli.config, &name),
         Cmd::SetAdminPassword { password } => cmd_set_password(&cli.config, password),
         Cmd::Reset2fa => cmd_reset_2fa(&cli.config),
+        Cmd::TotpNow => cmd_totp_now(&cli.config),
     }
 }
 
@@ -202,6 +207,54 @@ fn cmd_reset_2fa(config_path: &Path) -> Result<()> {
     println!(
         "Two-factor sign-in removed (app, passkeys, recovery codes). The password is unchanged."
     );
+    Ok(())
+}
+
+fn cmd_totp_now(config_path: &Path) -> Result<()> {
+    let cfg = HubConfig::load(config_path)?;
+    let db = Db::open(&cfg.data_path().join("snhub.sqlite"))?;
+    let at = now();
+    println!(
+        "Server time: {:02}:{:02}:{:02} UTC (unix {at})",
+        at.rem_euclid(86_400) / 3600,
+        at.rem_euclid(3600) / 60,
+        at.rem_euclid(60)
+    );
+    let Some(t) = db.totp() else {
+        println!("No authenticator-app key on this hub (none started or enabled).");
+        return Ok(());
+    };
+    let n = t.secret.chars().count();
+    let tail: String = t.secret.chars().skip(n.saturating_sub(4)).collect();
+    println!(
+        "Key: entry \"SN Secure (admin-{tail})\" in the app, {}",
+        if t.enabled {
+            "enabled"
+        } else {
+            "waiting for confirmation"
+        }
+    );
+    let key = totp::base32_decode(&t.secret).context("stored key is not base32")?;
+    let step = (at.max(0) as u64) / totp::STEP_SECS;
+    let left = totp::STEP_SECS - (at.max(0) as u64) % totp::STEP_SECS;
+    println!(
+        "Code by this server's clock now: {} ({left} s left)",
+        totp::code_for_step(&key, step)
+    );
+    println!(
+        "  previous {}  next {}",
+        totp::code_for_step(&key, step.saturating_sub(1)),
+        totp::code_for_step(&key, step + 1)
+    );
+    if t.offset != 0 {
+        let s = step.checked_add_signed(t.offset).unwrap_or(step);
+        println!(
+            "Learned clock offset: {} s; code the hub accepts now: {}",
+            t.offset * totp::STEP_SECS as i64,
+            totp::code_for_step(&key, s)
+        );
+    }
+    println!("If the phone shows a different code, the phone holds another key (old entry).");
     Ok(())
 }
 
