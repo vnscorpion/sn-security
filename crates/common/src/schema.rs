@@ -142,6 +142,13 @@ pub struct ClamavInfo {
     /// `[hunt] clamav = "off"`: installed or not, hunts do not use it.
     #[serde(default)]
     pub disabled: bool,
+    /// What the agent did with the last `install_clamav` order it received
+    /// ("started", or why it ignored it), so a silent no-op is visible on the hub.
+    #[serde(default)]
+    pub last_order: String,
+    /// Unix time of that order; 0 = none received.
+    #[serde(default)]
+    pub last_order_at: i64,
 }
 
 /// Outcome of one `sn hunt` run.

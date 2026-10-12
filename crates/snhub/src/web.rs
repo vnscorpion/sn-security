@@ -265,9 +265,18 @@ fn knows_clamav(r: &ReportBody) -> bool {
 /// ClamAV status for the "Quét mã độc" card, with the install button when it can
 /// work. `hub` is the hub's public address, for the command that lets the VPS
 /// accept the install.
-fn clamav_block(agent_id: &str, hub: &str, r: &ReportBody) -> Markup {
+fn clamav_block(
+    agent_id: &str,
+    hub: &str,
+    r: &ReportBody,
+    flash: &str,
+    install_pending: bool,
+) -> Markup {
     html! {
         div class="note" style="margin:0 0 12px" {
+            @if !flash.is_empty() {
+                p style="margin:0 0 8px;color:var(--ok)" { b { (flash) } }
+            }
             b { "ClamAV (engine thứ hai, chữ ký mã độc đã biết)" }
             br;
             @if !knows_clamav(r) {
@@ -275,6 +284,10 @@ fn clamav_block(agent_id: &str, hub: &str, r: &ReportBody) -> Markup {
             } @else if let Some(c) = &r.clamav {
                 @if c.disabled {
                     "Đang tắt trên VPS này (" code { "[hunt] clamav = \"off\"" } "). Quét chỉ dùng heuristic."
+                } @else if install_pending && !c.installed {
+                    // The order is queued but the VPS has not picked it up yet (it asks
+                    // the hub every few minutes).
+                    span class="badge b-warn" { "Đã gửi lệnh" } " Đang chờ VPS nhận lệnh ở lần báo cáo kế tiếp (tối đa ~5–15 phút); sau đó VPS mới bắt đầu cài. Tải lại trang để xem trạng thái."
                 } @else if c.install_state == "running" {
                     // Before "installed": the package puts its programs on disk early,
                     // long before the signatures are downloaded.
@@ -303,6 +316,11 @@ fn clamav_block(agent_id: &str, hub: &str, r: &ReportBody) -> Markup {
                     } @else {
                         p class="help" style="margin:8px 0 0" { "Hệ điều hành này chưa có công thức cài tự động (hỗ trợ: Debian, Ubuntu, AlmaLinux, Rocky, CentOS, Fedora). Cài ClamAV thủ công rồi lần quét sau sẽ tự dùng." }
                     }
+                }
+                // What the agent did with the last install order: without this a
+                // silently ignored order looks like one that never arrived.
+                @if !c.installed && c.last_order_at > 0 && !c.last_order.is_empty() {
+                    p class="help" style="margin:8px 0 0" { "Lệnh cài gần nhất VPS nhận (" (rel_time(c.last_order_at)) "): " (c.last_order) }
                 }
                 // Whether or not the programs ended up on disk, a failed attempt
                 // says why. (The message of a success would go stale, so it is
@@ -829,9 +847,12 @@ pub struct AgentQuery {
     /// Page of the malware findings (independent of the blocklist page).
     #[serde(default)]
     fpage: usize,
-    /// A one-line result to show in the AI card after an action.
+    /// A one-line result to show after an action.
     #[serde(default)]
     msg: String,
+    /// Which card shows `msg`: `scan` (malware scan / ClamAV) or the AI card.
+    #[serde(default)]
+    at: String,
 }
 
 /// Download the latest scan results: `csv` (every finding) or `txt` (paths of
@@ -931,6 +952,18 @@ pub async fn agent_detail(
 
     let ai_data = crate::web_ai::card_data(&st, &agent.id);
 
+    // An install order that is queued but that the VPS has not run yet: until it
+    // does, the page says so instead of offering the button again.
+    let install_pending = {
+        let applied = report.as_ref().map_or(0, |r| r.applied_desired.seq);
+        desired.as_ref().is_some_and(|(_, _, b)| {
+            b.jobs_seq > applied
+                && b.jobs
+                    .iter()
+                    .any(|j| matches!(j, snsec_common::schema::Job::InstallClamav))
+        })
+    };
+
     // Blocklist: filter by address, then show one page.
     let needle = aq.q.trim().to_lowercase();
     let filtered: Vec<&BanView> = bans
@@ -1014,7 +1047,7 @@ pub async fn agent_detail(
             p class="help" { "“Hoàn tác” chỉ chạy nếu VPS bật tuỳ chọn cho phép (" code { "[remote] allow_undo" } ")." }
         }
 
-        (crate::web_ai::ai_card(&agent.id, report.as_ref(), &ai_data, aq.msg.trim()))
+        (crate::web_ai::ai_card(&agent.id, report.as_ref(), &ai_data, if aq.at == "scan" { "" } else { aq.msg.trim() }))
 
         div class="card" id="bans" {
             h2 { "IP đang bị chặn (" (bans.len() + hidden) ")" }
@@ -1231,7 +1264,13 @@ pub async fn agent_detail(
                     p class="help" style="margin:0 0 12px" { "Chưa có kết quả quét. VPS tự quét lúc 3 giờ sáng mỗi ngày; hoặc bấm “Quét ngay” ở mục Điều khiển phía trên." }
                 }
 
-                (clamav_block(&agent.id, &hub_base(&st), r))
+                (clamav_block(
+                    &agent.id,
+                    &hub_base(&st),
+                    r,
+                    if aq.at == "scan" { aq.msg.trim() } else { "" },
+                    install_pending,
+                ))
 
                 @if !r.findings.is_empty() {
                     div style="display:flex;gap:14px;flex-wrap:wrap;align-items:center;margin:0 0 12px" {
@@ -1422,8 +1461,31 @@ pub async fn job_post(
     let db = st.db.lock().expect("db");
     let queued = db.queue_job(&id, now(), "admin", job, &detail);
     drop(db);
+    // Where to land and what to say. Without this the page just reloaded at the top
+    // and nothing showed that the order had been sent.
+    let (ok_msg, at, anchor) = match f.kind.as_str() {
+        "install_clamav" => (
+            "Đã gửi lệnh cài ClamAV. VPS nhận lệnh ở lần báo cáo kế tiếp (tối đa ~5–15 phút), rồi mới bắt đầu cài (vài phút, tải vài trăm MB chữ ký). Tải lại trang để xem trạng thái.",
+            "scan",
+            "scan",
+        ),
+        "hunt" => (
+            "Đã gửi lệnh quét mã độc. VPS nhận lệnh ở lần báo cáo kế tiếp (tối đa ~5–15 phút), rồi quét; kết quả hiện ở đây sau lần báo cáo tiếp theo.",
+            "scan",
+            "scan",
+        ),
+        _ => (
+            "Đã gửi lệnh. VPS thực hiện ở lần báo cáo kế tiếp (tối đa ~5–15 phút).",
+            "ai",
+            "ai",
+        ),
+    };
     match queued {
-        Ok(()) => Redirect::to(&format!("/agent/{id}")).into_response(),
+        Ok(()) => Redirect::to(&format!(
+            "/agent/{id}?msg={}&at={at}#{anchor}",
+            urlenc(ok_msg)
+        ))
+        .into_response(),
         // Say why nothing happened (e.g. the previous order has not run yet).
         Err(e) => Redirect::to(&format!("/agent/{id}?msg={}#ai", urlenc(&format!("{e:#}"))))
             .into_response(),

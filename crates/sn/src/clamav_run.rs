@@ -447,6 +447,26 @@ fn write_install_state(state: &State, st: &str, message: &str) {
     }
 }
 
+/// Remember what the agent did with an `install_clamav` order, so the hub can show
+/// it: a silently ignored order looks the same as one that never arrived.
+pub fn record_order(state: &State, msg: &str) {
+    let s = InstallState {
+        at: util::now_secs(),
+        state: "order".into(),
+        message: clamav::clean_text(&util::ellipsize(msg, 300)),
+    };
+    if let Ok(bytes) = serde_json::to_vec(&s) {
+        let _ = std::fs::write(state.dir.join("clamav-order.json"), bytes);
+    }
+}
+
+fn read_order(state: &State) -> InstallState {
+    std::fs::read(state.dir.join("clamav-order.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
 fn os_release() -> String {
     std::fs::read_to_string("/etc/os-release").unwrap_or_default()
 }
@@ -459,7 +479,10 @@ pub fn info(cfg: &Config, state: &State) -> ClamavInfo {
         inst.state = "failed".into();
         inst.message = "Lần cài trước không kết thúc (quá lâu không có kết quả).".into();
     }
+    let order = read_order(state);
     ClamavInfo {
+        last_order: order.message,
+        last_order_at: order.at,
         installed: find_bin("clamscan").is_some() || find_bin("clamdscan").is_some(),
         db_age_hours: db_age_hours(now),
         install_state: inst.state,

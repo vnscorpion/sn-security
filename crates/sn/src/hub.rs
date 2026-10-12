@@ -561,25 +561,36 @@ fn apply_desired(cfg: &Config, state: &State, d: &DesiredBody) -> Result<()> {
     let dels: Vec<String> = d.unbans.iter().map(|ip| normalize_ban_key(ip)).collect();
 
     if (!adds.is_empty() || !dels.is_empty()) && crate::sys::fw::available() {
-        crate::sys::fw::ensure_table(&cfg.fw.web_ports)?;
-        crate::sys::fw::apply_bans(&adds, &dels)?;
-        // Record operator bans in state so reports stay consistent.
-        let mut active = state.bans();
-        for (key, ttl) in &adds {
-            active.insert(
-                key.clone(),
-                crate::state::ActiveBan {
-                    reason: "hub".into(),
-                    expires_ts: now + *ttl as i64,
-                    strike: 0,
-                    layer: "l3".into(),
-                },
-            );
+        // A firewall problem must not stop the rest of the order. This used to
+        // return the error, so the desired-state was never marked applied, the
+        // same order was retried and failed every cycle, and a job in it (install
+        // ClamAV, a scan, an incident order) never ran.
+        let applied = crate::sys::fw::ensure_table(&cfg.fw.web_ports)
+            .and_then(|()| crate::sys::fw::apply_bans(&adds, &dels));
+        match applied {
+            Err(e) => eprintln!(
+                "hub: could not apply the ban list ({e:#}); carrying on with the rest of the order"
+            ),
+            Ok(()) => {
+                // Record operator bans in state so reports stay consistent.
+                let mut active = state.bans();
+                for (key, ttl) in &adds {
+                    active.insert(
+                        key.clone(),
+                        crate::state::ActiveBan {
+                            reason: "hub".into(),
+                            expires_ts: now + *ttl as i64,
+                            strike: 0,
+                            layer: "l3".into(),
+                        },
+                    );
+                }
+                for key in &dels {
+                    active.remove(key);
+                }
+                let _ = state.save_bans(&active);
+            }
         }
-        for key in &dels {
-            active.remove(key);
-        }
-        let _ = state.save_bans(&active);
     }
 
     // Policy tier (trusted_proxies / patterns / mode->observe) must be root
@@ -684,6 +695,10 @@ fn run_job(cfg: &Config, state: &State, job: &snsec_common::schema::Job) {
                 eprintln!(
                     "hub: ignoring install_clamav job (set [remote] allow_install_clamav=true to permit)"
                 );
+                crate::clamav_run::record_order(
+                    state,
+                    "bỏ qua: VPS này chưa cho phép hub cài ([remote] allow_install_clamav = true)",
+                );
                 return;
             }
             // Its own systemd unit, like the scan: a package install outlives this
@@ -692,11 +707,31 @@ fn run_job(cfg: &Config, state: &State, job: &snsec_common::schema::Job) {
                 .args(install_clamav_unit_args())
                 .status()
             {
-                Ok(s) if s.success() => eprintln!("hub: started ClamAV install"),
-                Ok(s) => eprintln!(
-                    "hub: could not start the ClamAV install ({s}); one may already be running (`systemctl status sn-install-clamav`)"
-                ),
-                Err(e) => eprintln!("hub: could not start the ClamAV install: {e}"),
+                Ok(s) if s.success() => {
+                    eprintln!("hub: started ClamAV install");
+                    crate::clamav_run::record_order(
+                        state,
+                        "đã nhận lệnh và bắt đầu cài (đơn vị systemd sn-install-clamav)",
+                    );
+                }
+                Ok(s) => {
+                    eprintln!(
+                        "hub: could not start the ClamAV install ({s}); one may already be running (`systemctl status sn-install-clamav`)"
+                    );
+                    crate::clamav_run::record_order(
+                        state,
+                        &format!(
+                            "không khởi động được lần cài ({s}); có thể một lần cài khác đang chạy: systemctl status sn-install-clamav"
+                        ),
+                    );
+                }
+                Err(e) => {
+                    eprintln!("hub: could not start the ClamAV install: {e}");
+                    crate::clamav_run::record_order(
+                        state,
+                        &format!("không chạy được systemd-run: {e}"),
+                    );
+                }
             }
         }
         Job::Evidence => {
