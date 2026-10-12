@@ -4,23 +4,31 @@ on:
   push:
     tags: ["v*"]
 
+# Read-only by default; only the job that publishes the release may write.
 permissions:
-  contents: write
+  contents: read
 
+# Actions are pinned to a commit, with the tag it had in the comment: a tag can be
+# moved to other code, a commit cannot.
 jobs:
   build:
     name: build ${{ matrix.arch }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
         arch: [x86_64, aarch64]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
           targets: ${{ matrix.arch }}-unknown-linux-musl
-      - uses: taiki-e/setup-cross-toolchain-action@v1
+      - uses: taiki-e/setup-cross-toolchain-action@12b7ad4acfa95a1476779d6c06699b96ec1691f8 # v1.42.0
         with:
           target: ${{ matrix.arch }}-unknown-linux-musl
       - name: build
@@ -30,7 +38,7 @@ jobs:
           mkdir -p out
           cp target/${{ matrix.arch }}-unknown-linux-musl/release/sn    out/sn-${{ matrix.arch }}
           cp target/${{ matrix.arch }}-unknown-linux-musl/release/snhub out/snhub-${{ matrix.arch }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: bin-${{ matrix.arch }}
           path: out/*
@@ -39,9 +47,13 @@ jobs:
     name: package + publish
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: artifacts
       - name: assemble dist
@@ -55,26 +67,37 @@ jobs:
           cd dist && sha256sum sn-* snhub-* install.sh > SHA256SUMS
           cat SHA256SUMS
 
-      - name: sign SHA256SUMS (optional)
-        if: ${{ env.MINISIGN_SECRET != '' }}
+      # Signs when the MINISIGN_SECRET secret holds a minisign secret key (plus
+      # MINISIGN_PASSWORD if the key has one). The step tests the secret itself:
+      # an `if:` cannot read secrets, and a job-level env would hand the key to the
+      # release action below as well. No release key exists yet (SEC-5); once one
+      # does and the install scripts check it, a missing secret must fail here.
+      - name: sign SHA256SUMS
         env:
           MINISIGN_SECRET: ${{ secrets.MINISIGN_SECRET }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y minisign
-          printf '%s' "$MINISIGN_SECRET" > /tmp/minisign.key
-          minisign -S -s /tmp/minisign.key -m dist/SHA256SUMS
-          rm -f /tmp/minisign.key
+          if [ -z "$MINISIGN_SECRET" ]; then
+            echo "::warning::MINISIGN_SECRET is not set: SHA256SUMS is published unsigned"
+            exit 0
+          fi
+          sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+          key="$RUNNER_TEMP/minisign.key"
+          trap 'rm -f "$key"' EXIT
+          (umask 077 && printf '%s\n' "$MINISIGN_SECRET" > "$key")
+          printf '%s\n' "$MINISIGN_PASSWORD" | minisign -S -s "$key" -m dist/SHA256SUMS
+          test -s dist/SHA256SUMS.minisig
 
       - name: create release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
+          # SHA256SUMS* is SHA256SUMS plus, when signed, SHA256SUMS.minisig.
           files: |
             dist/sn-x86_64
             dist/sn-aarch64
             dist/snhub-x86_64
             dist/snhub-aarch64
             dist/install.sh
-            dist/SHA256SUMS
-            dist/SHA256SUMS.minisig
-          fail_on_unmatched_files: false
+            dist/SHA256SUMS*
+          fail_on_unmatched_files: true
           generate_release_notes: true

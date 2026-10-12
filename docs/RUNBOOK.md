@@ -19,7 +19,7 @@
 
 ## Đưa một VPS vào theo dõi
 
-1. Hub → "Thêm VPS" → copy lệnh → dán vào VPS (mặc định **observe**).
+1. Hub → "Thêm VPS" → copy lệnh → dán vào VPS, rồi dán token (hub hiện ở ô riêng dưới lệnh) khi bộ cài hỏi. Token không đi trên dòng lệnh nào; cài tự động thì xem README, mục "Thêm một VPS". Mặc định **observe**.
 2. Để observe 3–7 ngày. Trên hub xem `would_ban` của VPS; nếu có IP hợp lệ (bot, CDN, nhà mạng, IPN thanh toán) thì thêm vào `[fw] whitelist` trong `/etc/sn/agent.toml` (chỉ sửa trên VPS) hoặc chỉnh `trusted_proxies`.
 3. Khi `would_ban` sạch: trên hub đổi **mode → enforce**. Áp dụng ở chu kỳ kế (≤ 15 phút).
 

@@ -11,12 +11,19 @@ ExecStart=/usr/local/bin/snhub --config /etc/snhub/snhub.toml serve
 Restart=on-failure
 RestartSec=3s
 Environment=RUST_LOG=info
+# The database, its -wal/-shm files and anything else the hub creates are private.
+UMask=0077
 
 # Hardening — the hub only needs its data dir and the loopback/public socket.
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 ReadWritePaths=/var/lib/snhub
+# What VPSes download and run as root (agent binaries, install.sh, SHA256SUMS) and
+# the signing key: the hub reads them, only root rewrites them (install/update
+# scripts). The deeper path wins over ReadWritePaths= above.
+ReadOnlyPaths=/var/lib/snhub/public
+ReadOnlyPaths=-/var/lib/snhub/hub.key
 ReadOnlyPaths=/etc/snhub
 PrivateTmp=yes
 PrivateDevices=yes

@@ -1,7 +1,13 @@
 #!/bin/sh
 # SN Secure agent installer. Generated install command comes from the hub UI:
 #
-#   curl -fsSL https://HUB/install.sh | sudo sh -s -- --hub https://HUB --name web-01 --token TOKEN
+#   curl -fsSL https://HUB/install.sh | sudo sh -s -- --hub https://HUB --name web-01
+#
+# It then asks on the terminal for the one-time enrollment token the hub shows
+# below the command, so the token is on no command line: not in the process list,
+# not in the sudo log. With no terminal (automation), give it in SN_ENROLL_TOKEN,
+# set with `export` and never on a command line (see no_tty_help below).
+# `--token TOKEN` still works but every local user can read it while this runs.
 #
 # Downloads the sn binary from the hub (sha256-verified), detects the web server
 # and logs, writes /etc/sn/agent.toml in OBSERVE mode, enrolls, and installs the
@@ -11,7 +17,9 @@ set -eu
 
 HUB=""
 NAME=""
-TOKEN=""
+TOKEN="${SN_ENROLL_TOKEN:-}"
+# Handed to `sn enroll` alone, not to every command below.
+unset SN_ENROLL_TOKEN
 ARCH=""
 UPGRADE=0
 
@@ -19,7 +27,11 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --hub) HUB="$2"; shift 2;;
     --name) NAME="$2"; shift 2;;
-    --token) TOKEN="$2"; shift 2;;
+    --token)
+      TOKEN="$2"; shift 2
+      echo "!! --token: every local user can read the token in the process list while this runs," >&2
+      echo "   and sudo keeps it in its log. Without --token the installer asks for it." >&2
+      ;;
     --arch) ARCH="$2"; shift 2;;
     --upgrade) UPGRADE=1; shift;;
     # No longer needed: the hub decides what an installed agent does. Accepted so
@@ -29,13 +41,42 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# Ways to give the token without a terminal that keep it off every command line.
+# `sudo VAR=...` and `sudo env VAR=...` do not: sudo's own arguments hold it for
+# the whole install, and its log keeps it.
+no_tty_help() {
+  cat >&2 <<EOF
+no terminal to ask for the enrollment token. Run the command in an interactive shell, or
+\`export SN_ENROLL_TOKEN=<token>\` in the shell or script that runs the installer (never
+put the token on a command line), then:
+  as root (root shell, cloud-init):
+    curl -fsSL $HUB/install.sh | sh -s -- --hub $HUB --name $NAME
+  through sudo (sudo writes the value to its own log, readable by root and adm only):
+    curl -fsSL $HUB/install.sh | sudo --preserve-env=SN_ENROLL_TOKEN sh -s -- --hub $HUB --name $NAME
+\`sudo SN_ENROLL_TOKEN=...\` and \`sudo env SN_ENROLL_TOKEN=...\` show it to every local user.
+EOF
+}
+
 [ "$(id -u)" -eq 0 ] || { echo "run as root (sudo)"; exit 1; }
 [ -n "$HUB" ] || { echo "--hub is required"; exit 1; }
+HUB="${HUB%/}"
 if [ "$UPGRADE" -ne 1 ]; then
   [ -n "$NAME" ] || { echo "--name is required"; exit 1; }
-  [ -n "$TOKEN" ] || { echo "--token is required"; exit 1; }
+  if [ -z "$TOKEN" ]; then
+    # Under `curl | sh` stdin is the script itself: ask on the terminal.
+    if ! (: </dev/tty) 2>/dev/null; then
+      no_tty_help
+      exit 1
+    fi
+    printf 'Enrollment token (shown on the hub below the install command): ' >/dev/tty
+    read -r TOKEN </dev/tty || true
+  fi
+  TOKEN="$(printf '%s' "$TOKEN" | tr -d '[:space:]')"
+  [ -n "$TOKEN" ] || { echo "no enrollment token given (type it when asked, or set SN_ENROLL_TOKEN)" >&2; exit 1; }
+  case "$TOKEN" in
+    *[!A-Za-z0-9_-]*) echo "that is not an enrollment token (paste only the token the hub shows)" >&2; exit 1;;
+  esac
 fi
-HUB="${HUB%/}"
 
 if [ -z "$ARCH" ]; then
   m="$(uname -m)"
@@ -50,6 +91,11 @@ echo ">> SN Secure agent (arch=$ARCH, hub=$HUB)"
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+
+# Evidence, reports and quarantined files are for root only. A `sn triage` run
+# from a normal root shell before this installer leaves the directory 0755.
+mkdir -p /var/lib/sn
+chmod 0700 /var/lib/sn
 
 # Download the agent binary from the hub, verify its sha256, install it.
 install_binary() {
@@ -166,7 +212,19 @@ EOF
 chmod 0600 /etc/sn/agent.toml
 
 echo ">> enrolling with hub"
-/usr/local/bin/sn --config /etc/sn/agent.toml enroll --url "$HUB" --name "$NAME" --token "$TOKEN"
+# The token goes in sn's environment, which only root can read, not in its
+# arguments. An older sn only takes --token: it rejects this call as a usage
+# error (exit 2) before contacting the hub, and gets the token the old way.
+rc=0
+SN_ENROLL_TOKEN="$TOKEN" /usr/local/bin/sn --config /etc/sn/agent.toml enroll --url "$HUB" --name "$NAME" 2>"$TMP/enroll.err" || rc=$?
+case "$rc" in
+  0) cat "$TMP/enroll.err" >&2;;
+  2)
+    echo "!! this sn takes the token only as an argument (visible in the process list)" >&2
+    /usr/local/bin/sn --config /etc/sn/agent.toml enroll --url "$HUB" --name "$NAME" --token "$TOKEN"
+    ;;
+  *) cat "$TMP/enroll.err" >&2; exit "$rc";;
+esac
 
 # --- systemd units -----------------------------------------------------------
 echo ">> installing systemd timers"

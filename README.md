@@ -84,7 +84,9 @@ curl -fsSL https://raw.githubusercontent.com/vnscorpion/sn-security/main/deploy/
 > ```
 > Agent không bị ảnh hưởng: bộ cài agent do **hub** phục vụ qua `public_url`, không lấy từ GitHub.
 
-Script tải binary (kiểm sha256), tạo user `snhub`, sinh key (in **root secret offline** một lần — lưu ra ngoài server), cài `snhub.service`, và seed bộ cài agent để hub phục vụ cho các VPS. Sau đó:
+Script tải binary (kiểm sha256), tạo user `snhub`, sinh key (in **root secret offline** một lần — lưu ra ngoài server), cài `snhub.service`, và seed bộ cài agent để hub phục vụ cho các VPS. Chạy lại trên hub đang chạy: hub dừng trong lúc cài và được chạy lại nếu script lỗi giữa chừng.
+
+Quyền file: `/var/lib/snhub` (0700) chỉ user `snhub` vào được, database `snhub.sqlite*` 0600 (chứa API key AI, khoá 2FA, hash mật khẩu admin, token cài đang hiệu lực), `/etc/snhub` 0750. `public/` (binary agent, `install.sh`, `SHA256SUMS` mà mọi VPS chạy bằng root) và `hub.key` thuộc **root**: service chỉ đọc (`ReadOnlyPaths=` trong `snhub.service`), chỉ script cài/cập nhật (chạy bằng root) mới ghi được. Sau đó:
 
 ```sh
 # 1) Đặt mật khẩu admin
@@ -120,11 +122,28 @@ Hub cập nhật từ bản trước: mật khẩu cũ vẫn dùng được (k�
 
 ## Thêm một VPS
 
-Trên giao diện hub bấm **"Thêm VPS"** → nhập tên → copy lệnh cài (token dùng một lần, hết hạn 15 phút), dán vào VPS. Lệnh có dạng (`HUB` = URL hub của bạn):
+Trên giao diện hub bấm **"Thêm VPS"** → nhập tên → hub hiện lệnh cài và, ở ô riêng bên dưới, **token** (dùng một lần, hết hạn 15 phút). Copy lệnh, dán vào VPS. Lệnh có dạng (`HUB` = URL hub của bạn):
 
 ```sh
-curl -fsSL https://HUB/install.sh | sudo sh -s -- --hub https://HUB --name web-01 --token <TOKEN>
+curl -fsSL https://HUB/install.sh | sudo sh -s -- --hub https://HUB --name web-01
 ```
+
+Bộ cài hỏi token: dán token vào khi được hỏi. Token không nằm trên dòng lệnh nào nên các user khác trên VPS không đọc được qua danh sách tiến trình (`ps`, `/proc`), và sudo không ghi nó vào nhật ký; bộ cài chuyển nó cho `sn enroll` qua biến môi trường `SN_ENROLL_TOKEN` (chỉ root đọc được). Trên máy hub, `snhub add-vps --name web-01` in lệnh cùng dạng và token ở dòng `Token:` riêng.
+
+**Cài tự động (không có terminal):** gán token cho `SN_ENROLL_TOKEN` bằng `export` trong shell hoặc script chạy bộ cài, không bao giờ đặt nó trên một dòng lệnh, rồi:
+
+- chạy bằng root (shell root, script cloud-init), không qua sudo:
+  ```sh
+  export SN_ENROLL_TOKEN=<TOKEN>
+  curl -fsSL https://HUB/install.sh | sh -s -- --hub https://HUB --name web-01
+  ```
+- qua sudo: `export SN_ENROLL_TOKEN=<TOKEN>` như trên, rồi
+  ```sh
+  curl -fsSL https://HUB/install.sh | sudo --preserve-env=SN_ENROLL_TOKEN sh -s -- --hub https://HUB --name web-01
+  ```
+  Token không lên danh sách tiến trình, nhưng sudo ghi giá trị biến vào nhật ký của nó (`ENV=SN_ENROLL_TOKEN=…`, chỉ root và nhóm `adm` đọc được). Token dùng một lần nên hết giá trị ngay khi VPS enroll xong.
+
+Đừng dùng `sudo SN_ENROLL_TOKEN=… sh …` hay `sudo env SN_ENROLL_TOKEN=… sh …`: token khi đó nằm trên dòng lệnh của sudo suốt lúc cài, user nào trên VPS cũng đọc được. Lệnh cũ có `--token <TOKEN>` vẫn chạy nhưng bộ cài cảnh báo vì cùng lý do.
 
 Bộ cài ghi `/etc/sn/agent.toml` ở **chế độ observe** (chỉ báo `would_ban`, chưa ban gì), enroll với hub, cài 2 timer (`sn-watch` mỗi 5 phút, `sn-hunt` lúc 3h sáng) và in ra những file log mà agent tự tìm được. Sau vài ngày `would_ban` sạch, bật **enforce** từ hub.
 
@@ -132,13 +151,15 @@ Bộ cài ghi `/etc/sn/agent.toml` ở **chế độ observe** (chỉ báo `woul
 
 Khi có bản mới, cập nhật **hub trước, rồi từng VPS**. Mọi tải về đều kiểm sha256; cấu hình, khoá và dữ liệu giữ nguyên.
 
+> **sha256 chỉ bắt file hỏng hoặc lẫn bản khi tải, không chứng minh nguồn gốc.** `SHA256SUMS` lấy từ cùng nhánh `main` với binary, nên ai push được `main` là quyết định binary của hub và, qua hub, của mọi VPS (bản phát hành có chữ ký: SEC-5 trong [docs/REVIEW.md](docs/REVIEW.md), chưa làm). Muốn chỉ cài đúng bản đã xem: cố định theo commit như ở cuối mục này.
+
 **1. Trên VPS master (hub)** — cập nhật binary hub và cả bản `sn` mà hub phục vụ cho các VPS:
 ```sh
 curl -fsSL https://raw.githubusercontent.com/vnscorpion/sn-security/main/deploy/update-hub.sh | sudo bash
 ```
-Script giữ bản cũ để quay lại, và tự khôi phục nếu hub không chạy lên được. Cuối cùng nó in sẵn lệnh ở bước 2 với địa chỉ hub của bạn.
+Script giữ bản cũ để quay lại, và tự khôi phục nếu hub không chạy lên được. Cuối cùng nó in sẵn lệnh ở bước 2 với địa chỉ hub của bạn. Hub dừng vài giây trong lúc thay file; nếu script lỗi giữa chừng, nó chạy lại hub trước khi thoát. Script cũng đưa quyền file của bản cài cũ về như bản cài mới (xem [Cài hub](#cài-hub-server-trung-tâm--ubuntu-2404--debian-12)), thêm `/etc/systemd/system/snhub.service.d/10-hardening.conf` (`UMask=0077`, `public/` và `hub.key` chỉ đọc với service) mà không ghi đè `snhub.service` bạn đã sửa, và dựng lại `public/` từ đầu: chỉ còn 4 file hub phục vụ cho VPS, không giữ gì bản cũ để lại trong đó.
 
-**2. Trên từng VPS đã cài agent** (bằng root) — thay binary, giữ nguyên cấu hình, khoá và timer (chỉ nâng giới hạn RAM của timer quét hằng đêm từ 256 MB lên 2 GB để chạy được ClamAV):
+**2. Trên từng VPS đã cài agent** (bằng root) — thay binary, giữ nguyên cấu hình, khoá và timer (chỉ nâng giới hạn RAM của timer quét hằng đêm từ 256 MB lên 2 GB để chạy được ClamAV, và đặt lại `/var/lib/sn` về 0700 để bằng chứng, báo cáo và file cách ly chỉ root đọc được):
 ```sh
 curl -fsSL https://HUB/install.sh | sudo sh -s -- --hub https://HUB --upgrade
 ```
@@ -333,7 +354,8 @@ crates/
   sn/       agent trên VPS (triage/contain/hunt/clean/watch/enroll)
   snhub/    hub master (axum + SQLite, enroll/report/desired, UI web)
 deploy/     install-hub.sh, install.sh, uninstall.sh, systemd/, *.toml.example
-dist/       binary dựng sẵn (musl amd64+arm64) + SHA256SUMS cho install-hub.sh
+dist/       những gì install-hub.sh/update-hub.sh tải về và hub phục vụ cho VPS: binary dựng sẵn (musl amd64+arm64),
+            install.sh (bản sao y deploy/install.sh, CI kiểm) + SHA256SUMS
 rules/      patterns.yml, heuristics.yml (tài liệu rule đã nhúng trong binary)
 docs/       ARCHITECTURE, SECURITY, RUNBOOK, ROADMAP, REVIEW
 .github/    CI (fmt/clippy/test/build) + release (ký + checksum)
