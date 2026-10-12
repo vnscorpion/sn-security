@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use axum::extract::{Path as AxPath, State};
+use axum::extract::{DefaultBodyLimit, Path as AxPath, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -142,6 +142,7 @@ fn cmd_init(config_path: &Path, public_url: String, bind: String, data_dir: Stri
     // Hub key (online) + DB.
     let hubkey = HubKey::load_or_create(&cfg.data_path())?;
     let _db = Db::open(&cfg.data_path().join("snhub.sqlite"))?;
+    lock_data_dir(&cfg.data_path());
 
     // Root key (offline) — generate only if not already configured.
     if cfg.root_pubkey.is_empty() {
@@ -168,6 +169,44 @@ fn cmd_init(config_path: &Path, public_url: String, bind: String, data_dir: Stri
     Ok(())
 }
 
+/// What `snhub init` and the hub put in the data directory.
+const DATA_DIR_ENTRIES: &[&str] = &[
+    "hub.key",
+    "snhub.sqlite",
+    "snhub.sqlite-wal",
+    "snhub.sqlite-shm",
+    "snhub.sqlite-journal",
+    "public",
+];
+
+/// Make the data directory (hub key, database with API keys and the TOTP
+/// secret) reachable by its owner only. Only when it holds nothing but the
+/// hub's own files: a mistaken `--data-dir /var/lib` must not lock up the
+/// system.
+fn lock_data_dir(dir: &Path) {
+    let ours = std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries.filter_map(Result::ok).all(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| DATA_DIR_ENTRIES.contains(&n))
+        })
+    });
+    if ours {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
+                eprintln!("note: could not chmod 700 {}: {e}", dir.display());
+            }
+        }
+    } else {
+        eprintln!(
+            "note: {} holds other files; not changing its permissions (run chmod 700 on the hub's own data directory)",
+            dir.display()
+        );
+    }
+}
+
 fn cmd_set_password(config_path: &Path, password: Option<String>) -> Result<()> {
     let mut cfg = HubConfig::load(config_path)?;
     let pw = password
@@ -186,26 +225,47 @@ fn cmd_set_password(config_path: &Path, password: Option<String>) -> Result<()> 
     cfg.admin_salt.clear();
     cfg.save(config_path)?;
     // A password changed from the web UI lives in the database and would
-    // otherwise win over this one: replace it too. No restart needed.
+    // otherwise win over this one: replace it too. The running hub also ends
+    // every web session opened before now (it reads the time from the database).
     let db = Db::open(&cfg.data_path().join("snhub.sqlite"))?;
-    db.set_admin_pw_hash(&hash, now())?;
+    let at = now();
+    db.set_admin_pw_hash(&hash, at)?;
+    db.revoke_sessions(at)?;
+    db.log_login(
+        at,
+        "console",
+        true,
+        "đặt mật khẩu",
+        "bằng dòng lệnh trên máy chủ, đăng xuất mọi phiên",
+    );
     println!("admin password set (Argon2id).");
+    println!(
+        "Every web session is signed out, and a pause of the second sign-in step after too many \
+         wrong codes is lifted (the running hub notices within a few seconds)."
+    );
     Ok(())
 }
 
 fn cmd_reset_2fa(config_path: &Path) -> Result<()> {
     let cfg = HubConfig::load(config_path)?;
     let db = Db::open(&cfg.data_path().join("snhub.sqlite"))?;
+    let at = now();
     db.reset_2fa()?;
+    db.revoke_sessions(at)?;
     db.log_login(
-        now(),
+        at,
         "console",
         true,
         "reset 2FA",
-        "bằng dòng lệnh trên máy chủ",
+        "bằng dòng lệnh trên máy chủ, đăng xuất mọi phiên",
     );
     println!(
         "Two-factor sign-in removed (app, passkeys, recovery codes). The password is unchanged."
+    );
+    println!("Every web session is signed out (the running hub notices within a few seconds).");
+    println!(
+        "If password re-checks are paused after too many wrong answers, the password may be \
+         known to someone else: set a new one with `snhub set-admin-password`, which lifts the pause."
     );
     Ok(())
 }
@@ -296,14 +356,30 @@ fn cmd_serve(config_path: &Path) -> Result<()> {
     rt.block_on(async move { serve(cfg, state).await })
 }
 
+/// Largest signed report accepted: axum's 2 MiB default, stated here. Agents
+/// deployed so far list every would-be ban of a cycle (`would_ban` has no cap),
+/// so a botnet wave seen in observe mode makes reports past 1 MiB; such an
+/// agent sends its queue oldest first and stops at the first refused report,
+/// so a lower limit would silence it until the oversized report ages out of its
+/// queue. Lower it only once the agents in the field cap that list.
+const AGENT_BODY_LIMIT: usize = 2 * 1024 * 1024;
+/// An enrollment request is a token, a name and a public key.
+const ENROLL_BODY_LIMIT: usize = 16 * 1024;
+
 /// Every route, with the browser guard in front. Separate from `serve` so tests can
 /// drive the whole app without a socket.
 fn router(state: Arc<AppState>) -> Router {
     let base = Router::new()
         // agent API
-        .route("/v1/report", post(api::post_report))
+        .route(
+            "/v1/report",
+            post(api::post_report).layer(DefaultBodyLimit::max(AGENT_BODY_LIMIT)),
+        )
         .route("/v1/desired", get(api::get_desired))
-        .route("/v1/enroll", post(api::post_enroll))
+        .route(
+            "/v1/enroll",
+            post(api::post_enroll).layer(DefaultBodyLimit::max(ENROLL_BODY_LIMIT)),
+        )
         // admin UI
         .route("/", get(web::overview))
         .route(

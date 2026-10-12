@@ -175,6 +175,7 @@ pub fn user_prompt(host: &str, alerts: &[String], ev: &Evidence) -> String {
     let alerts: Vec<String> = alerts.iter().take(10).map(|a| clean(a, 200)).collect();
 
     let mut ev = ev.clone();
+    shorten_fields(&mut ev);
     let render = |ev: &Evidence| {
         serde_json::json!({ "server": host, "alerts": alerts, "evidence": ev }).to_string()
     };
@@ -221,6 +222,67 @@ fn cut(s: &str, max: usize) -> String {
     match s.char_indices().nth(max) {
         Some((i, _)) => s[..i].to_string(),
         None => s,
+    }
+}
+
+/// Shorten `s` to `max` characters in place, leaving it otherwise as it is: a
+/// value the model must copy back exactly (a path, a hash) still matches the
+/// evidence when it was within bounds.
+fn shorten(s: &mut String, max: usize) {
+    if let Some((i, _)) = s.char_indices().nth(max) {
+        s.truncate(i);
+    }
+}
+
+/// Names, addresses and other short values.
+const FIELD_SHORT: usize = 128;
+/// Paths, command lines and file lines.
+const FIELD_LONG: usize = 1024;
+/// Outbound connections listed per process.
+const MAX_OUT_CONNS: usize = 20;
+
+/// Bound every string in the evidence the agent sent, so the halving of the
+/// lists in [`user_prompt`] is enough to keep the prompt within
+/// `MAX_PROMPT_BYTES`: one huge field would otherwise ride along whole.
+fn shorten_fields(ev: &mut Evidence) {
+    let (s, l) = (FIELD_SHORT, FIELD_LONG);
+    ev.label = cut(&ev.label, 40);
+    for p in &mut ev.processes {
+        shorten(&mut p.user, s);
+        shorten(&mut p.comm, s);
+        shorten(&mut p.exe, l);
+        shorten(&mut p.cmdline, l);
+        p.out_conns.truncate(MAX_OUT_CONNS);
+        for c in &mut p.out_conns {
+            shorten(c, s);
+        }
+    }
+    for p in &mut ev.persistence {
+        shorten(&mut p.kind, s);
+        shorten(&mut p.path, l);
+        shorten(&mut p.user, s);
+        shorten(&mut p.line, l);
+        shorten(&mut p.sha256, s);
+        shorten(&mut p.reason, s);
+    }
+    for f in &mut ev.temp_files {
+        shorten(&mut f.path, l);
+        shorten(&mut f.owner, s);
+    }
+    for x in &mut ev.ssh_logins {
+        shorten(&mut x.user, s);
+        shorten(&mut x.ip, s);
+        shorten(&mut x.method, s);
+        shorten(&mut x.when, s);
+    }
+    for x in &mut ev.listeners {
+        shorten(&mut x.addr, s);
+        shorten(&mut x.comm, s);
+    }
+    for u in &mut ev.shell_users {
+        shorten(&mut u.name, s);
+        shorten(&mut u.home, l);
+        shorten(&mut u.shell, l);
     }
 }
 
@@ -1585,6 +1647,58 @@ mod tests {
         assert!(p.contains("cpu_high"));
         assert!(p.len() < MAX_PROMPT_BYTES + 1_000, "{}", p.len());
         assert!(system_prompt().contains("untrusted"));
+    }
+
+    #[test]
+    fn huge_fields_cannot_push_the_prompt_past_its_bound() {
+        // Each character grows when written as JSON; one field alone is bigger
+        // than the whole budget.
+        let big = "\u{1}é\"".repeat(30_000);
+        let mut ev = evidence();
+        ev.label = big.clone();
+        for p in &mut ev.processes {
+            p.cmdline = big.clone();
+            p.exe = big.clone();
+            p.user = big.clone();
+            p.out_conns = vec![big.clone(); 30];
+        }
+        for p in &mut ev.persistence {
+            p.line = big.clone();
+            p.reason = big.clone();
+        }
+        ev.ssh_logins.push(EvLogin {
+            user: big.clone(),
+            ip: big.clone(),
+            method: big.clone(),
+            when: big.clone(),
+        });
+        ev.shell_users.push(EvUser {
+            name: big.clone(),
+            home: big.clone(),
+            shell: big.clone(),
+            ..EvUser::default()
+        });
+        ev.listeners.push(crate::schema::EvListener {
+            addr: big.clone(),
+            comm: big.clone(),
+            ..Default::default()
+        });
+        ev.temp_files.push(EvFile {
+            path: big.clone(),
+            owner: big.clone(),
+            ..EvFile::default()
+        });
+        let p = user_prompt(&big, &vec![big.clone(); 50], &ev);
+        assert!(p.len() <= MAX_PROMPT_BYTES + 1_000, "{}", p.len());
+        // Ordinary values are passed on exactly, so the model can copy them back.
+        let ev = evidence();
+        let p = user_prompt("web-01", &[], &ev);
+        for proc in &ev.processes {
+            assert!(p.contains(&proc.exe), "{}", proc.exe);
+        }
+        for line in &ev.persistence {
+            assert!(p.contains(&line.sha256));
+        }
     }
 
     #[test]

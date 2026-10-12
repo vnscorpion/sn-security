@@ -23,7 +23,8 @@ CREATE TABLE IF NOT EXISTS admin_auth (
     totp_enabled INTEGER NOT NULL DEFAULT 0,
     totp_last_step INTEGER NOT NULL DEFAULT 0,
     totp_offset INTEGER NOT NULL DEFAULT 0,
-    webauthn_user TEXT NOT NULL DEFAULT ''
+    webauthn_user TEXT NOT NULL DEFAULT '',
+    sessions_revoked_at INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS passkeys (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -64,6 +65,12 @@ pub fn migrate_auth(conn: &rusqlite::Connection) -> Result<()> {
     if !has("totp_offset")? {
         conn.execute(
             "ALTER TABLE admin_auth ADD COLUMN totp_offset INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !has("sessions_revoked_at")? {
+        conn.execute(
+            "ALTER TABLE admin_auth ADD COLUMN sessions_revoked_at INTEGER NOT NULL DEFAULT 0",
             [],
         )?;
     }
@@ -165,6 +172,47 @@ impl Db {
             params![phc, now],
         )?;
         Ok(())
+    }
+
+    /// When the admin password was last set, from the web or the command line
+    /// (0: never, only the config file's).
+    pub fn admin_pw_updated(&self) -> i64 {
+        self.conn
+            .query_row("SELECT pw_updated FROM admin_auth WHERE id = 1", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .optional()
+            .ok()
+            .flatten()
+            .unwrap_or(0)
+    }
+
+    // ---- sign-out of every session -----------------------------------------
+
+    /// End every web session opened at or before `now` (a reset from the command
+    /// line). The running hub reads it within a few seconds; sessions live only
+    /// in its memory, so this is how another process reaches them.
+    pub fn revoke_sessions(&self, now: i64) -> Result<()> {
+        self.ensure_auth_row()?;
+        self.conn.execute(
+            "UPDATE admin_auth SET sessions_revoked_at = MAX(sessions_revoked_at, ?1) WHERE id = 1",
+            params![now],
+        )?;
+        Ok(())
+    }
+
+    /// When every session was last ended from the command line (0: never).
+    pub fn sessions_revoked_at(&self) -> i64 {
+        self.conn
+            .query_row(
+                "SELECT sessions_revoked_at FROM admin_auth WHERE id = 1",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .unwrap_or(0)
     }
 
     // ---- authenticator app (TOTP) -----------------------------------------
@@ -476,9 +524,31 @@ mod tests {
         db.set_totp_offset(-3).unwrap();
         assert_eq!(db.totp().unwrap().offset, -3);
         assert_eq!(db.admin_pw_hash().as_deref(), Some("$argon2id$x"));
+        // The sign-out column came with it.
+        assert_eq!(db.sessions_revoked_at(), 0);
+        db.revoke_sessions(90).unwrap();
         // Opening again is a no-op.
         drop(db);
-        assert_eq!(Db::open(&path).unwrap().totp().unwrap().offset, -3);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.totp().unwrap().offset, -3);
+        assert_eq!(db.sessions_revoked_at(), 90);
+    }
+
+    #[test]
+    fn a_sign_out_of_every_session_is_recorded_and_never_moves_back() {
+        let (db, _d) = db();
+        assert_eq!(db.sessions_revoked_at(), 0, "no row yet");
+        db.revoke_sessions(100).unwrap();
+        assert_eq!(db.sessions_revoked_at(), 100);
+        db.revoke_sessions(40).unwrap();
+        assert_eq!(db.sessions_revoked_at(), 100);
+        // Other writes to the row leave it alone.
+        assert_eq!(db.admin_pw_updated(), 0);
+        db.set_admin_pw_hash("$argon2id$y", 200).unwrap();
+        db.reset_2fa().unwrap();
+        assert_eq!(db.sessions_revoked_at(), 100);
+        // A 2FA reset leaves the time the password was set as it was.
+        assert_eq!(db.admin_pw_updated(), 200);
     }
 
     #[test]

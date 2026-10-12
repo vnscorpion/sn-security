@@ -6,7 +6,7 @@
 //! checks against the agent's own evidence; carrying a plan out is a signed job to
 //! the agent, which checks again.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use anyhow::{Result, bail};
 use snsec_common::ai::{self, Plan};
@@ -24,11 +24,151 @@ pub const FRESH_EVIDENCE_SECS: i64 = 10 * 60;
 /// The agent refuses evidence older than 2 hours; the hub stops a little earlier.
 pub const MAX_ORDER_EVIDENCE_AGE_SECS: i64 = 100 * 60;
 
+/// Model calls in flight at once, across every VPS (analyses and connection
+/// tests). One more is refused, not queued: each can hold a blocking thread for
+/// minutes, and each costs money.
+pub const MAX_MODEL_CALLS: usize = 3;
+
 fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// Which VPSes have an analysis running, and the permits for model calls.
+pub struct Slots {
+    running: Mutex<Vec<String>>,
+    calls: Arc<tokio::sync::Semaphore>,
+}
+
+static SLOTS: LazyLock<Slots> = LazyLock::new(|| Slots::new(MAX_MODEL_CALLS));
+
+/// Why an analysis did not start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refused {
+    /// One is already running for this VPS.
+    Running,
+    /// Every model-call permit is taken.
+    Busy,
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Refused::Running => f.write_str(
+                "AI đang phân tích sự cố của VPS này; kết quả hiện ở đây khi xong, không cần bấm lại.",
+            ),
+            Refused::Busy => write!(
+                f,
+                "AI đang bận ({MAX_MODEL_CALLS} yêu cầu cùng lúc); thử lại sau ít phút."
+            ),
+        }
+    }
+}
+
+/// An analysis claimed for one VPS, with its model-call permit. Dropping it
+/// (when the run ends, however it ends) frees both.
+pub struct Claim {
+    slots: &'static Slots,
+    agent_id: String,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl Slots {
+    fn new(calls: usize) -> Slots {
+        Slots {
+            running: Mutex::new(Vec::new()),
+            calls: Arc::new(tokio::sync::Semaphore::new(calls)),
+        }
+    }
+
+    /// Claim the one analysis this VPS may have running, and a model call.
+    fn claim(&'static self, agent_id: &str) -> Result<Claim, Refused> {
+        let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
+        if running.iter().any(|a| a == agent_id) {
+            return Err(Refused::Running);
+        }
+        let permit = Arc::clone(&self.calls)
+            .try_acquire_owned()
+            .map_err(|_| Refused::Busy)?;
+        running.push(agent_id.to_string());
+        Ok(Claim {
+            slots: self,
+            agent_id: agent_id.to_string(),
+            _permit: permit,
+        })
+    }
+
+    fn is_running(&self, agent_id: &str) -> bool {
+        self.running
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|a| a == agent_id)
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        self.slots
+            .running
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|a| a != &self.agent_id);
+    }
+}
+
+/// Is an analysis running for this VPS right now?
+#[must_use]
+pub fn running(agent_id: &str) -> bool {
+    SLOTS.is_running(agent_id)
+}
+
+/// A permit for one model call outside an analysis (a connection test), if one
+/// is free.
+#[must_use]
+pub fn model_call_permit() -> Option<tokio::sync::OwnedSemaphorePermit> {
+    Arc::clone(&SLOTS.calls).try_acquire_owned().ok()
+}
+
+/// Start an analysis for `agent_id` on a blocking thread. Call it with the
+/// database lock held (`db`), so deciding and claiming are one step: a second
+/// report or click cannot start another one for the same VPS, and the
+/// cool-down starts now.
+///
+/// # Errors
+/// When one is already running for this VPS, or every model call is taken.
+pub fn start(st: &Arc<AppState>, db: &Db, agent_id: &str, at: i64) -> Result<(), Refused> {
+    let claim = SLOTS.claim(agent_id)?;
+    let _ = db.touch_analysis(agent_id, at);
+    let st2 = Arc::clone(st);
+    let id = agent_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        let _claim = claim;
+        run(&st2, &id);
+    });
+    Ok(())
+}
+
+/// The evidence an analysis was waiting for arrived while every model call was
+/// taken: it is not queued. Say so on the VPS page and stop waiting.
+pub fn note_busy(db: &Db, agent_id: &str, at: i64) {
+    let _ = db.create_proposal(
+        at,
+        &NewProposal {
+            agent_id,
+            provider: "",
+            status: "error",
+            plan: &Plan::default(),
+            note: &format!(
+                "{} Bằng chứng đã nhận; bấm “Phân tích bằng AI” để phân tích.",
+                Refused::Busy
+            ),
+            auto: false,
+        },
+    );
+    let _ = db.set_pending(agent_id, false, at);
 }
 
 /// Does the agent understand (and has its VPS allowed) this kind of job? The
@@ -308,6 +448,9 @@ pub fn request(st: &Arc<AppState>, agent_id: &str) -> Result<String> {
     if db.default_provider()?.is_none() {
         bail!("Chưa cấu hình AI: vào Cài đặt AI để thêm endpoint, model và API key.");
     }
+    if running(agent_id) {
+        bail!("{}", Refused::Running);
+    }
     let Some(report) = db.latest_report(agent_id)? else {
         bail!("VPS chưa gửi báo cáo nào");
     };
@@ -319,11 +462,11 @@ pub fn request(st: &Arc<AppState>, agent_id: &str) -> Result<String> {
     if let Some(ev) = db.latest_evidence(agent_id)?
         && at - ev.at <= FRESH_EVIDENCE_SECS
     {
+        if let Err(e) = start(st, &db, agent_id, at) {
+            bail!("{e}");
+        }
+        // Still under the lock: the run cannot clear it before it is set.
         db.set_pending(agent_id, true, at)?;
-        drop(db);
-        let st2 = Arc::clone(st);
-        let id = agent_id.to_string();
-        tokio::task::spawn_blocking(move || run(&st2, &id));
         return Ok("Đang phân tích bằng AI (dùng bằng chứng mới thu thập)…".into());
     }
     db.queue_job(
@@ -457,5 +600,38 @@ mod tests {
     fn the_capability_check_reads_the_agents_own_list() {
         let r = report(&["evidence", "clamav"], &[], None);
         assert!(can(&r, "evidence") && !can(&r, "remediate"));
+    }
+
+    #[test]
+    fn one_analysis_per_vps_and_only_a_few_model_calls_at_once() {
+        let slots: &'static Slots = Box::leak(Box::new(Slots::new(2)));
+        let a = slots.claim("vps-a").unwrap();
+        assert_eq!(slots.claim("vps-a").err(), Some(Refused::Running));
+        let b = slots.claim("vps-b").unwrap();
+        // Every call is taken: refused at once, not queued, and nothing is left
+        // marked as running.
+        assert_eq!(slots.claim("vps-c").err(), Some(Refused::Busy));
+        assert!(!slots.is_running("vps-c"));
+        assert!(slots.is_running("vps-a"));
+        // A run that ends (or panics: the claim is dropped either way) frees both.
+        drop(a);
+        assert!(!slots.is_running("vps-a"));
+        let c = slots.claim("vps-c").unwrap();
+        let a2 = slots.claim("vps-a");
+        assert_eq!(a2.err(), Some(Refused::Busy));
+        drop((b, c));
+        assert!(slots.claim("vps-a").is_ok());
+    }
+
+    #[test]
+    fn a_busy_hub_says_so_on_the_vps_page_and_stops_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        db.set_pending("a1", true, 100).unwrap();
+        note_busy(&db, "a1", 120);
+        assert!(!db.ai_state("a1").unwrap().pending);
+        let p = db.latest_proposal("a1").unwrap().unwrap();
+        assert_eq!(p.status, "error");
+        assert!(p.note.contains("AI đang bận"), "{}", p.note);
     }
 }

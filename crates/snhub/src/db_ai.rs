@@ -2,9 +2,11 @@
 //! configured, the latest evidence per VPS, per-VPS autonomy, and the proposals
 //! the model made with what became of them.
 //!
-//! API keys are stored as written, in the hub's own SQLite file (readable only by
-//! the hub's user), because the hub must send them. They are never put back into
-//! a page: the UI shows only the last four characters.
+//! API keys are stored as written, in the hub's own SQLite file (created mode
+//! 0600 in a 0700 data directory, see `Db::open`), because the hub must send
+//! them. They are never put back into a page: the UI shows only the last four
+//! characters, and a key only follows a provider to a new host when it is typed
+//! again.
 
 use anyhow::Result;
 use rusqlite::{OptionalExtension, Row, params};
@@ -117,6 +119,45 @@ pub struct NewProposal<'a> {
 
 const PROVIDER_COLS: &str = "id, name, kind, endpoint, model, api_key, is_default";
 
+/// Where a provider's key is sent: `scheme://authority` of the URL the hub
+/// calls, lower case, with the default port written out. The authority is
+/// everything up to the first `/`, `?`, `#` or `\`, the same cut an HTTP client
+/// makes, so two endpoints with the same value cannot reach different hosts.
+fn key_destination(kind: &str, endpoint: &str) -> Option<String> {
+    let url = crate::ai_client::request_url(kind, endpoint).ok()?;
+    let (scheme, rest) = url.split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    let authority = rest
+        .split(['/', '?', '#', '\\'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if authority.is_empty() {
+        return None;
+    }
+    // A port is the digits after the last `:` (an IPv6 literal ends in `]`).
+    let has_port = authority
+        .rsplit_once(':')
+        .is_some_and(|(_, p)| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
+    let default_port = if scheme == "https" { "443" } else { "80" };
+    Some(if has_port {
+        format!("{scheme}://{authority}")
+    } else {
+        format!("{scheme}://{authority}:{default_port}")
+    })
+}
+
+/// Would a key for the old settings go to the same place with the new ones?
+fn same_destination(old_kind: &str, old_endpoint: &str, kind: &str, endpoint: &str) -> bool {
+    match (
+        key_destination(old_kind, old_endpoint),
+        key_destination(kind, endpoint),
+    ) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AiState {
     pub autonomy: String,
@@ -213,7 +254,12 @@ impl Db {
     }
 
     /// Add (`id = None`) or change a provider. An empty `api_key` on a change
-    /// keeps the stored one, so editing a name does not require re-typing it.
+    /// keeps the stored one, so editing a name does not require re-typing it, but
+    /// only while the key would still go to the same place: a change of API kind
+    /// or of the endpoint's scheme, host or port needs the key typed again, so
+    /// whoever can edit the form cannot send the stored key to a host of their
+    /// choosing. Callers hold the database lock, so the check and the write are
+    /// one step.
     pub fn save_provider(&self, id: Option<i64>, p: &ProviderInput<'_>, now: i64) -> Result<i64> {
         let ProviderInput {
             name,
@@ -224,6 +270,16 @@ impl Db {
         } = *p;
         match id {
             Some(id) => {
+                if api_key.is_empty()
+                    && let Some(old) = self.get_provider(id)?
+                    && !old.api_key.is_empty()
+                    && (old.kind != kind
+                        || !same_destination(&old.kind, &old.endpoint, kind, endpoint))
+                {
+                    anyhow::bail!(
+                        "Đổi loại API hoặc máy chủ của endpoint thì phải nhập lại API key (key đã lưu không được gửi sang nơi khác)."
+                    );
+                }
                 if api_key.is_empty() {
                     self.conn.execute(
                         "UPDATE ai_providers SET name=?1, kind=?2, endpoint=?3, model=?4 WHERE id=?5",
@@ -531,6 +587,111 @@ mod tests {
         )
         .unwrap();
         assert_eq!(db.get_provider(a).unwrap().unwrap().api_key, "new-key-9999");
+    }
+
+    #[test]
+    fn a_stored_key_does_not_follow_the_provider_to_another_host() {
+        let (db, _d) = db();
+        let a = db
+            .save_provider(
+                None,
+                &pi("H", "openai", "https://h.example/v1", "m", "sk-secret-1"),
+                1,
+            )
+            .unwrap();
+        let key = |db: &Db| db.get_provider(a).unwrap().unwrap().api_key;
+        // Same scheme, host and port: the key stays, however the path is written.
+        for same in [
+            "https://h.example/v1/chat/completions",
+            "https://H.example:443/v2",
+        ] {
+            db.save_provider(Some(a), &pi("H", "openai", same, "m2", ""), 2)
+                .unwrap();
+            assert_eq!(key(&db), "sk-secret-1", "{same}");
+        }
+        // Another host, scheme, port or user part, or another API kind: refused
+        // without the key, and nothing is changed.
+        for (kind, endpoint) in [
+            ("openai", "https://evil.example/v1"),
+            ("openai", "http://h.example/v1"),
+            ("openai", "https://h.example:8443/v1"),
+            ("openai", "https://x@h.example/v1"),
+            ("openai", "https://h.example.evil.example/v1"),
+            ("openai_responses", "https://h.example/v1"),
+            ("anthropic", ""),
+        ] {
+            let r = db.save_provider(Some(a), &pi("H", kind, endpoint, "m", ""), 3);
+            assert!(r.is_err(), "{kind} {endpoint}");
+            let p = db.get_provider(a).unwrap().unwrap();
+            assert_eq!(
+                (p.kind.as_str(), p.endpoint.as_str(), p.api_key.as_str()),
+                ("openai", "https://H.example:443/v2", "sk-secret-1")
+            );
+        }
+        // Typing the key again moves it.
+        db.save_provider(
+            Some(a),
+            &pi("H", "openai", "https://evil.example/v1", "m", "sk-new-2"),
+            4,
+        )
+        .unwrap();
+        assert_eq!(key(&db), "sk-new-2");
+        // A provider without a key (a local model) moves freely.
+        let b = db
+            .save_provider(
+                None,
+                &pi("L", "openai", "http://127.0.0.1:11434/v1", "m", ""),
+                5,
+            )
+            .unwrap();
+        db.save_provider(
+            Some(b),
+            &pi("L", "openai", "http://10.0.0.2:11434/v1", "m", ""),
+            6,
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_provider(b).unwrap().unwrap().endpoint,
+            "http://10.0.0.2:11434/v1"
+        );
+    }
+
+    #[test]
+    fn the_key_destination_is_scheme_host_and_port() {
+        assert_eq!(
+            key_destination("anthropic", "").as_deref(),
+            Some("https://api.anthropic.com:443")
+        );
+        assert_eq!(
+            key_destination("anthropic", "https://api.anthropic.com/").as_deref(),
+            Some("https://api.anthropic.com:443")
+        );
+        assert_eq!(
+            key_destination("openai", "http://[::1]:8080/v1").as_deref(),
+            Some("http://[::1]:8080")
+        );
+        // Cut where an HTTP client ends the host (a `\` counts as `/`), so text
+        // after it cannot name another host.
+        for (endpoint, dest) in [
+            (
+                "https://h.example\\@evil.example/v1",
+                "https://h.example:443",
+            ),
+            ("https://h.example/v1@evil.example", "https://h.example:443"),
+            (
+                "https://evil.example#@h.example/v1",
+                "https://evil.example:443",
+            ),
+            ("https://u:p@h.example/v1", "https://u:p@h.example:443"),
+        ] {
+            assert_eq!(
+                key_destination("openai", endpoint).as_deref(),
+                Some(dest),
+                "{endpoint}"
+            );
+        }
+        assert_eq!(key_destination("openai", ""), None);
+        assert!(!same_destination("openai", "", "openai", ""));
     }
 
     #[test]

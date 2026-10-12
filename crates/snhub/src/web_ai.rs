@@ -22,6 +22,7 @@ use crate::ai_client::{self, KIND_ANTHROPIC, KIND_OPENAI, KIND_RESPONSES};
 use crate::analysis;
 use crate::db_ai::{AiState, ProposalRow, ProviderInput};
 use crate::web::{guard, now, rel_time, shell, urlenc};
+use crate::web_auth::{Recheck, recheck_password};
 
 // ---------------------------------------------------------------------------
 // Wording
@@ -134,13 +135,15 @@ pub struct AiCardData {
     pub evidence: Option<Evidence>,
     pub has_provider: bool,
     pub provider_name: String,
+    /// An analysis for this VPS is talking to the model right now.
+    pub running: bool,
 }
 
 pub fn ai_card(agent_id: &str, report: Option<&ReportBody>, d: &AiCardData, msg: &str) -> Markup {
     let can_evidence = report.is_some_and(|r| analysis::can(r, "evidence"));
     let can_remediate = report.is_some_and(|r| analysis::can(r, "remediate"));
-    let pending =
-        d.state.pending && now() - d.state.pending_since < crate::db_ai::PENDING_TIMEOUT_SECS;
+    let pending = d.running
+        || (d.state.pending && now() - d.state.pending_since < crate::db_ai::PENDING_TIMEOUT_SECS);
     html! {
         div class="card" id="ai" {
             h2 { "AI xử lý sự cố" }
@@ -324,6 +327,7 @@ pub fn card_data(st: &AppState, agent_id: &str) -> AiCardData {
             .flatten()
             .map(|p| p.name)
             .unwrap_or_default(),
+        running: analysis::running(agent_id),
     }
 }
 
@@ -530,7 +534,10 @@ pub async fn settings_page(
                                 td class="mut" { (ai_client::mask_key(&p.api_key)) }
                                 td {
                                     div style="display:flex;gap:6px;flex-wrap:wrap" {
-                                        form method="post" action={"/settings/provider/" (p.id) "/test"} style="margin:0" { button class="ghost" type="submit" { "Thử kết nối" } }
+                                        form method="post" action={"/settings/provider/" (p.id) "/test"} style="margin:0;display:flex;gap:6px" {
+                                            input type="password" name="password" placeholder="Mật khẩu hiện tại" required autocomplete="current-password" style="width:150px";
+                                            button class="ghost" type="submit" { "Thử kết nối" }
+                                        }
                                         @if !p.is_default {
                                             form method="post" action={"/settings/provider/" (p.id) "/default"} style="margin:0" { button class="ghost" type="submit" { "Đặt làm mặc định" } }
                                         }
@@ -567,8 +574,10 @@ pub async fn settings_page(
                         input type="text" name="model" value=(editing.as_ref().map_or("", |e| e.model.as_str())) placeholder="vd: hermes-4-405b" required maxlength="120"; }
                 }
                 div class="ctrls" {
-                    label class="f" style="flex:1;min-width:260px" { span class="t" { "API key" (if editing.is_some() { " (để trống = giữ key cũ)" } else { "" }) }
+                    label class="f" style="flex:1;min-width:260px" { span class="t" { "API key" (if editing.is_some() { " (để trống = giữ key cũ, trừ khi đổi loại API hoặc máy chủ)" } else { "" }) }
                         input type="password" name="api_key" autocomplete="off" placeholder="sk-…" style="width:100%"; }
+                    label class="f" { span class="t" { "Mật khẩu hiện tại" }
+                        input type="password" name="password" required autocomplete="current-password"; }
                 }
                 p { button type="submit" { "Lưu" } " " @if editing.is_some() { a href="/settings" { "Huỷ" } } }
             }
@@ -597,6 +606,25 @@ fn settings_back(msg: &str) -> Response {
     Redirect::to(&format!("/settings?msg={}", urlenc(msg))).into_response()
 }
 
+/// Ask for the current password before a provider is saved or tested: the key
+/// is the one secret here worth stealing, and a stolen session alone must not
+/// be enough to send it somewhere. `None` when it is right.
+async fn provider_password(
+    st: &Arc<AppState>,
+    headers: &HeaderMap,
+    pw: String,
+) -> Option<Response> {
+    match recheck_password(st, headers, pw).await {
+        Recheck::Right => None,
+        Recheck::Wrong => Some(settings_back(
+            "Mật khẩu hiện tại không đúng (cần nhập để lưu hoặc thử nhà cung cấp AI).",
+        )),
+        Recheck::Wait(wait) => Some(settings_back(&format!(
+            "Thử mật khẩu quá nhiều lần, chờ {wait} giây."
+        ))),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct ProviderForm {
     #[serde(default)]
@@ -608,6 +636,15 @@ pub struct ProviderForm {
     model: String,
     #[serde(default)]
     api_key: String,
+    /// The admin's current password.
+    #[serde(default)]
+    password: String,
+}
+
+#[derive(Deserialize)]
+pub struct PasswordForm {
+    #[serde(default)]
+    password: String,
 }
 
 pub async fn provider_save_post(
@@ -633,6 +670,9 @@ pub async fn provider_save_post(
     }
     if f.api_key.len() > 512 || f.api_key.chars().any(char::is_control) {
         return settings_back("API key không hợp lệ.");
+    }
+    if let Some(r) = provider_password(&st, &headers, f.password).await {
+        return r;
     }
     let id = f.id.trim().parse::<i64>().ok();
     let saved = st.db.lock().expect("db").save_provider(
@@ -680,8 +720,12 @@ pub async fn provider_test_post(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(pid): Path<i64>,
+    Form(f): Form<PasswordForm>,
 ) -> Response {
     if let Some(r) = guard(&st, &headers) {
+        return r;
+    }
+    if let Some(r) = provider_password(&st, &headers, f.password).await {
         return r;
     }
     let provider = st
@@ -695,9 +739,13 @@ pub async fn provider_test_post(
     let Some(provider) = provider else {
         return settings_back("Không tìm thấy nhà cung cấp.");
     };
+    let Some(permit) = analysis::model_call_permit() else {
+        return settings_back(&analysis::Refused::Busy.to_string());
+    };
     let name = provider.name.clone();
     // The call blocks for up to a few seconds: off the async threads.
     let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         ai_client::complete(
             &provider,
             "You are a connection test. Reply with the single word OK.",
@@ -729,6 +777,7 @@ mod tests {
             evidence: ev,
             has_provider: true,
             provider_name: "Hermes".into(),
+            running: false,
         }
     }
 

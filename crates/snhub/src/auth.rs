@@ -4,20 +4,27 @@
 //!
 //! Sessions, half-finished logins and the limiter live in memory: a restart signs
 //! everyone out, which is the right failure. Nothing here is persisted except what
-//! the caller stores (the password hash, the second factors).
+//! the caller stores (the password hash, the second factors, and the time of a
+//! sign-out of every session ordered from the command line).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
 use argon2::Argon2;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use axum::http::HeaderMap;
+use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
 pub const COOKIE: &str = "snhub_session";
 /// Cookie that carries a login whose password was right but whose second factor
 /// is still to come.
 pub const PENDING_COOKIE: &str = "snhub_2fa";
+/// Cookie that marks a browser which has signed in before (see [`device_cookie`]).
+pub const DEVICE_COOKIE: &str = "snhub_device";
+/// How long a browser stays "known" after its last sign-in.
+pub const DEVICE_TTL_SECS: i64 = 30 * 86_400;
 
 /// A session ends this long after sign-in, whatever happens.
 const SESSION_ABS_SECS: i64 = 24 * 3600;
@@ -164,6 +171,96 @@ fn short_id(token: &str) -> String {
     hex::encode(&Sha256::digest(token.as_bytes())[..6])
 }
 
+fn device_mac(secret: &[u8], issued: i64) -> Hmac<Sha256> {
+    let mut mac =
+        <Hmac<Sha256> as Mac>::new_from_slice(secret).expect("HMAC takes a key of any length");
+    mac.update(format!("snhub-device-v1|{issued}").as_bytes());
+    mac
+}
+
+/// The value of the "known device" cookie a browser gets when it signs in:
+/// the time, signed with a hub secret. It only lets that browser past the
+/// all-keys pause of the password step (an outsider's flood of wrong passwords
+/// must not lock the admin out); every per-address limit still applies.
+#[must_use]
+pub fn device_cookie(secret: &[u8], issued: i64) -> String {
+    let tag = device_mac(secret, issued).finalize().into_bytes();
+    format!("{issued}.{}", hex::encode(tag))
+}
+
+/// Is this a known-device cookie this hub signed, younger than
+/// [`DEVICE_TTL_SECS`] and issued after `not_before` (the last sign-out of every
+/// session from the command line)?
+#[must_use]
+pub fn device_cookie_ok(secret: &[u8], value: &str, now: i64, not_before: i64) -> bool {
+    let Some((issued, tag)) = value.split_once('.') else {
+        return false;
+    };
+    let (Ok(issued), Ok(tag)) = (issued.parse::<i64>(), hex::decode(tag)) else {
+        return false;
+    };
+    issued > not_before
+        && issued <= now.saturating_add(60)
+        && now.saturating_sub(issued) <= DEVICE_TTL_SECS
+        && device_mac(secret, issued).verify_slice(&tag).is_ok()
+}
+
+/// The known-device cookie's value.
+#[must_use]
+pub fn device_from_headers(headers: &HeaderMap) -> Option<String> {
+    cookie_value(headers, DEVICE_COOKIE)
+}
+
+// ---------------------------------------------------------------------------
+// Password hashing queue
+// ---------------------------------------------------------------------------
+
+/// Hashes allowed to wait for a free slot; past this a request is turned away
+/// at once, so a burst of guesses cannot queue the admin's own sign-in behind
+/// thousands of them.
+pub const MAX_HASH_WAITERS: usize = 16;
+
+/// How many password checks are waiting for a hashing slot.
+#[derive(Default)]
+pub struct HashQueue {
+    waiting: AtomicUsize,
+}
+
+/// A place in the [`HashQueue`], given back when dropped (once the hash has a
+/// slot, or the request is gone).
+pub struct HashTicket<'a>(&'a HashQueue);
+
+impl HashQueue {
+    #[must_use]
+    pub const fn new() -> Self {
+        HashQueue {
+            waiting: AtomicUsize::new(0),
+        }
+    }
+
+    /// A place in the queue, unless it is already long.
+    pub fn try_join(&self) -> Option<HashTicket<'_>> {
+        if self.waiting.fetch_add(1, Ordering::SeqCst) >= MAX_HASH_WAITERS {
+            self.waiting.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(HashTicket(self))
+    }
+
+    /// A place in the queue however long it is: for a known device or a
+    /// signed-in session, whose attempts the limiter already bounds.
+    pub fn join(&self) -> HashTicket<'_> {
+        self.waiting.fetch_add(1, Ordering::SeqCst);
+        HashTicket(self)
+    }
+}
+
+impl Drop for HashTicket<'_> {
+    fn drop(&mut self) {
+        self.0.waiting.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Sessions
 // ---------------------------------------------------------------------------
@@ -185,10 +282,24 @@ pub struct SessionInfo {
 #[derive(Default)]
 pub struct Sessions {
     live: Mutex<HashMap<String, SessionInfo>>,
+    /// Every session opened at or before this time is over: the password or the
+    /// second factors were reset from the command line, which writes the time to
+    /// the database (see `web_auth::session_valid`).
+    revoked_at: AtomicI64,
+    /// When `revoked_at` was last read from the database.
+    revoked_read: AtomicI64,
 }
+
+/// How often the sign-out time written by the command line is read again.
+pub const REVOKED_REFRESH_SECS: i64 = 5;
 
 fn expired(s: &SessionInfo, now: i64) -> bool {
     now - s.created > SESSION_ABS_SECS || now - s.last_seen > SESSION_IDLE_SECS
+}
+
+/// Opened at or before a sign-out of every session (0: there never was one).
+fn revoked(s: &SessionInfo, revoked_at: i64) -> bool {
+    revoked_at > 0 && s.created <= revoked_at
 }
 
 impl Sessions {
@@ -228,11 +339,12 @@ impl Sessions {
 
     /// Is this a live session? A request counts as activity.
     pub fn valid(&self, token: &str, now: i64) -> bool {
+        let revoked_at = self.revoked_at();
         let Ok(mut m) = self.live.lock() else {
             return false;
         };
         match m.get_mut(token) {
-            Some(s) if !expired(s, now) => {
+            Some(s) if !expired(s, now) && !revoked(s, revoked_at) => {
                 s.last_seen = now;
                 true
             }
@@ -244,6 +356,41 @@ impl Sessions {
         }
     }
 
+    /// The time before which (inclusive) every session is over.
+    pub fn revoked_at(&self) -> i64 {
+        self.revoked_at.load(Ordering::SeqCst)
+    }
+
+    /// End every session opened at or before `at`. Returns how many were ended.
+    pub fn revoke_through(&self, at: i64) -> usize {
+        self.revoked_at.fetch_max(at, Ordering::SeqCst);
+        let Ok(mut m) = self.live.lock() else {
+            return 0;
+        };
+        let before = m.len();
+        m.retain(|_, s| !revoked(s, at));
+        before - m.len()
+    }
+
+    /// Time to read the command line's sign-out time from the database again?
+    /// `true` for one caller at most every [`REVOKED_REFRESH_SECS`].
+    pub fn revocation_due(&self, now: i64) -> bool {
+        let last = self.revoked_read.load(Ordering::SeqCst);
+        if (0..REVOKED_REFRESH_SECS).contains(&(now - last)) {
+            return false;
+        }
+        self.revoked_read
+            .compare_exchange(last, now, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    /// Read the sign-out time again on the next request (tests that cannot
+    /// wait [`REVOKED_REFRESH_SECS`]).
+    #[cfg(test)]
+    pub fn recheck_revocation(&self) {
+        self.revoked_read.store(0, Ordering::SeqCst);
+    }
+
     pub fn remove(&self, token: &str) {
         if let Ok(mut m) = self.live.lock() {
             m.remove(token);
@@ -252,10 +399,15 @@ impl Sessions {
 
     /// Every live session, newest first.
     pub fn list(&self, now: i64) -> Vec<SessionInfo> {
+        let revoked_at = self.revoked_at();
         let Ok(m) = self.live.lock() else {
             return Vec::new();
         };
-        let mut v: Vec<SessionInfo> = m.values().filter(|s| !expired(s, now)).cloned().collect();
+        let mut v: Vec<SessionInfo> = m
+            .values()
+            .filter(|s| !expired(s, now) && !revoked(s, revoked_at))
+            .cloned()
+            .collect();
         v.sort_by_key(|s| std::cmp::Reverse(s.created));
         v
     }
@@ -413,6 +565,17 @@ impl Pending {
             m.remove(token);
         }
     }
+
+    /// Drop everything started at or before `at` (every half-finished login
+    /// and held challenge, for `i64::MAX`). Returns how many were dropped.
+    pub fn drop_through(&self, at: i64) -> usize {
+        let Ok(mut m) = self.m.lock() else {
+            return 0;
+        };
+        let before = m.len();
+        m.retain(|_, p| p.created > at);
+        before - m.len()
+    }
 }
 
 /// The limiter key for an address: IPv6 clients are grouped by their /64 (one
@@ -446,12 +609,39 @@ const GLOBAL_FAILS: u32 = 40;
 const GLOBAL_WINDOW_SECS: i64 = 10 * 60;
 const GLOBAL_LOCK_SECS: i64 = 5 * 60;
 const MAX_KEYS: usize = 5_000;
+/// Across all keys, failures *behind* a right password (a wrong second factor,
+/// a wrong current password on a signed-in page): this many in
+/// `FACTOR_WINDOW_SECS` pause those steps for everyone. Only someone who has the
+/// password or a session can cause them, so this cannot lock the admin out on
+/// an outsider's say-so; per-address keys alone would let such a person guess
+/// codes from as many addresses as they hold.
+const FACTOR_FAILS: usize = 10;
+const FACTOR_WINDOW_SECS: i64 = 3600;
+/// The pause, doubled at each further trip (up to `FACTOR_MAX_DOUBLINGS`) until
+/// a day passes without one.
+const FACTOR_LOCK_SECS: i64 = 3600;
+const FACTOR_MAX_DOUBLINGS: u32 = 5;
+const FACTOR_FORGET_SECS: i64 = 24 * 3600;
+/// Password-correct sign-ins that may start waiting for a second factor per
+/// hour, across all addresses.
+const PENDING_PER_HOUR: usize = 20;
 
 #[derive(Default)]
 struct LimiterInner {
     keys: HashMap<String, (u32, i64, i64)>, // fails, last_fail, locked_until
     global: Vec<i64>,
     global_locked_until: i64,
+    factor: Vec<i64>,
+    factor_locked_until: i64,
+    factor_trips: u32,
+    factor_last_trip: i64,
+    pending_starts: Vec<i64>,
+}
+
+/// Keys of the steps behind a right password: the second factor at sign-in and
+/// the current password asked again on a signed-in page.
+fn behind_password(key: &str) -> bool {
+    key.starts_with("2fa:") || key.starts_with("pw:")
 }
 
 #[derive(Default)]
@@ -510,18 +700,36 @@ impl Limiter {
     /// the slow hash, so a burst of parallel guesses cannot all pass the check
     /// before any is counted. A right answer clears the key with `success`.
     /// The all-keys pause applies to `ip:` keys only (the password step, which
-    /// anyone can reach); steps behind a right password are bounded per key, so
-    /// a flood of bad passwords cannot also lock the admin out of finishing a
-    /// login that is already half done.
+    /// anyone can reach); steps behind a right password (`2fa:`, `pw:`) have
+    /// their own all-keys pause (see `wrong_factor`), so a flood of bad
+    /// passwords cannot also lock the admin out of finishing a login that is
+    /// already half done.
     ///
     /// # Errors
     /// The seconds left until the lock lifts.
     pub fn begin(&self, key: &str, now: i64) -> Result<(), i64> {
+        self.start(key, now, false)
+    }
+
+    /// `begin` for a browser with a valid known-device cookie: it skips the
+    /// all-keys pause of the password step, so an outsider's flood cannot keep
+    /// the admin out. Its own per-address limit still applies.
+    ///
+    /// # Errors
+    /// The seconds left until the lock lifts.
+    pub fn begin_known_device(&self, key: &str, now: i64) -> Result<(), i64> {
+        self.start(key, now, true)
+    }
+
+    fn start(&self, key: &str, now: i64, known_device: bool) -> Result<(), i64> {
         let Ok(mut i) = self.inner.lock() else {
             return Err(LOCK_BASE_SECS);
         };
-        if key.starts_with("ip:") && i.global_locked_until > now {
+        if key.starts_with("ip:") && !known_device && i.global_locked_until > now {
             return Err(i.global_locked_until - now);
+        }
+        if behind_password(key) && i.factor_locked_until > now {
+            return Err(i.factor_locked_until - now);
         }
         if let Some(&(_, _, locked)) = i.keys.get(key)
             && locked > now
@@ -537,6 +745,75 @@ impl Limiter {
         if let Ok(mut i) = self.inner.lock() {
             Self::count_global(&mut i, now);
         }
+    }
+
+    /// A wrong answer behind a right password (a second factor, or the current
+    /// password asked again), already counted per key by `begin`. Returns the
+    /// pause in seconds when this one tripped the all-keys lock; the caller then
+    /// drops every half-finished login.
+    pub fn wrong_factor(&self, now: i64) -> Option<i64> {
+        let Ok(mut i) = self.inner.lock() else {
+            return None;
+        };
+        i.factor.retain(|t| now - t <= FACTOR_WINDOW_SECS);
+        i.factor.push(now);
+        if i.factor.len() < FACTOR_FAILS {
+            return None;
+        }
+        if now - i.factor_last_trip > FACTOR_FORGET_SECS {
+            i.factor_trips = 0;
+        }
+        let secs = FACTOR_LOCK_SECS << i.factor_trips.min(FACTOR_MAX_DOUBLINGS);
+        i.factor_trips = i.factor_trips.saturating_add(1);
+        i.factor_last_trip = now;
+        i.factor_locked_until = now + secs;
+        i.factor.clear();
+        Some(secs)
+    }
+
+    /// Seconds left of the all-keys pause behind the password, if it is on.
+    pub fn factor_paused(&self, now: i64) -> Option<i64> {
+        let i = self.inner.lock().ok()?;
+        (i.factor_locked_until > now).then(|| i.factor_locked_until - now)
+    }
+
+    /// A new admin password was set from the command line: whatever the guesser
+    /// knew is worthless, so lift the pause behind the password, its counts and
+    /// the per-address locks of those steps. The trip count stays, so guessing
+    /// again with the new password pauses for longer. Returns whether a pause
+    /// was on.
+    pub fn clear_factor_pause(&self, now: i64) -> bool {
+        let Ok(mut i) = self.inner.lock() else {
+            return false;
+        };
+        let was = i.factor_locked_until > now;
+        i.factor.clear();
+        i.factor_locked_until = 0;
+        i.pending_starts.clear();
+        i.keys.retain(|k, _| !behind_password(k));
+        was
+    }
+
+    /// May a password-correct sign-in start waiting for its second factor? Not
+    /// while that step is paused, and not more than `PENDING_PER_HOUR` an hour:
+    /// someone who has the password cannot stockpile half-finished logins.
+    ///
+    /// # Errors
+    /// The seconds to wait.
+    pub fn begin_pending(&self, now: i64) -> Result<(), i64> {
+        let Ok(mut i) = self.inner.lock() else {
+            return Err(LOCK_BASE_SECS);
+        };
+        if i.factor_locked_until > now {
+            return Err(i.factor_locked_until - now);
+        }
+        i.pending_starts.retain(|t| now - t < 3600);
+        if i.pending_starts.len() >= PENDING_PER_HOUR {
+            let oldest = i.pending_starts.iter().min().copied().unwrap_or(now);
+            return Err((oldest + 3600 - now).max(1));
+        }
+        i.pending_starts.push(now);
+        Ok(())
     }
 
     /// Record a failed attempt (counted here, not by `begin`).
@@ -771,6 +1048,197 @@ mod tests {
         let wait = l.check("ip:brand-new", 1001).unwrap_err();
         assert!(wait > 0 && wait <= GLOBAL_LOCK_SECS);
         assert!(l.check("ip:brand-new", 1000 + GLOBAL_LOCK_SECS + 1).is_ok());
+    }
+
+    #[test]
+    fn wrong_second_factors_from_many_addresses_pause_that_step_for_everyone() {
+        let l = Limiter::default();
+        let t = 10_000;
+        // One guess from each of many addresses: no per-address key ever locks.
+        for n in 0..FACTOR_FAILS - 1 {
+            let key = format!("2fa:10.0.0.{n}");
+            assert!(l.begin(&key, t).is_ok());
+            assert_eq!(l.wrong_factor(t), None);
+        }
+        assert!(l.begin("2fa:10.0.1.1", t).is_ok());
+        let secs = l.wrong_factor(t).expect("tripped");
+        assert_eq!(secs, FACTOR_LOCK_SECS);
+        // Every second factor and password re-check is refused, from anywhere,
+        // and no new half-finished login can start.
+        assert!(l.begin("2fa:192.0.2.1", t + 1).is_err());
+        assert!(l.begin("pw:192.0.2.1", t + 1).is_err());
+        assert!(l.begin_pending(t + 1).is_err());
+        assert_eq!(l.factor_paused(t + 1), Some(FACTOR_LOCK_SECS - 1));
+        // The password step is not part of it.
+        assert!(l.begin("ip:192.0.2.1", t + 1).is_ok());
+        // After the pause, a second trip pauses twice as long.
+        let t2 = t + FACTOR_LOCK_SECS + 1;
+        assert!(l.begin("2fa:192.0.2.1", t2).is_ok());
+        for _ in 0..FACTOR_FAILS - 1 {
+            assert_eq!(l.wrong_factor(t2), None);
+        }
+        assert_eq!(l.wrong_factor(t2), Some(2 * FACTOR_LOCK_SECS));
+        // A day without a trip forgets the doubling.
+        let t3 = t2 + 2 * FACTOR_LOCK_SECS + FACTOR_FORGET_SECS + 1;
+        for _ in 0..FACTOR_FAILS - 1 {
+            assert_eq!(l.wrong_factor(t3), None);
+        }
+        assert_eq!(l.wrong_factor(t3), Some(FACTOR_LOCK_SECS));
+    }
+
+    #[test]
+    fn a_new_password_lifts_the_pause_behind_it_but_a_new_trip_still_doubles() {
+        let l = Limiter::default();
+        let t = 10_000;
+        for _ in 0..PENDING_PER_HOUR {
+            assert!(l.begin_pending(t).is_ok());
+        }
+        for n in 0..FREE_FAILS {
+            assert!(l.begin("2fa:198.51.100.1", t + i64::from(n)).is_ok());
+        }
+        assert!(l.begin("ip:203.0.113.1", t).is_ok());
+        for _ in 0..FACTOR_FAILS {
+            l.wrong_factor(t);
+        }
+        assert!(l.factor_paused(t + 1).is_some());
+        assert!(l.clear_factor_pause(t + 1), "it was on");
+        assert_eq!(l.factor_paused(t + 1), None);
+        assert!(
+            l.begin_pending(t + 1).is_ok(),
+            "the hourly count starts over"
+        );
+        assert!(
+            l.begin("2fa:198.51.100.1", t + 1).is_ok(),
+            "its own lock too"
+        );
+        assert!(l.begin("pw:198.51.100.1", t + 1).is_ok());
+        assert!(!l.clear_factor_pause(t + 1), "nothing left to lift");
+        // The password step's own counts are not touched.
+        assert!(l.inner.lock().unwrap().keys.contains_key("ip:203.0.113.1"));
+        // Guessing on: the next trip pauses twice as long as the first.
+        for _ in 0..FACTOR_FAILS - 1 {
+            assert_eq!(l.wrong_factor(t + 2), None);
+        }
+        assert_eq!(l.wrong_factor(t + 2), Some(2 * FACTOR_LOCK_SECS));
+    }
+
+    #[test]
+    fn wrong_second_factors_spread_over_hours_do_not_add_up() {
+        let l = Limiter::default();
+        for n in 0..(FACTOR_FAILS as i64 * 3) {
+            assert_eq!(l.wrong_factor(1_000 + n * (FACTOR_WINDOW_SECS / 5)), None);
+        }
+        assert_eq!(l.factor_paused(1_000 + FACTOR_WINDOW_SECS * 10), None);
+    }
+
+    #[test]
+    fn half_finished_logins_are_capped_per_hour() {
+        let l = Limiter::default();
+        for n in 0..PENDING_PER_HOUR as i64 {
+            assert!(l.begin_pending(100 + n).is_ok());
+        }
+        let wait = l.begin_pending(200).unwrap_err();
+        assert!(wait > 0 && wait <= 3600, "{wait}");
+        assert!(l.begin_pending(100 + 3600).is_ok(), "the oldest aged out");
+    }
+
+    #[test]
+    fn a_known_device_is_not_held_by_the_all_keys_pause_but_by_its_own_limit() {
+        let l = Limiter::default();
+        for _ in 0..GLOBAL_FAILS {
+            l.wrong(1000);
+        }
+        assert!(l.begin("ip:198.51.100.1", 1001).is_err());
+        assert!(l.begin_known_device("ip:198.51.100.1", 1001).is_ok());
+        for _ in 1..FREE_FAILS {
+            assert!(l.begin_known_device("ip:198.51.100.1", 1001).is_ok());
+        }
+        assert!(
+            l.begin_known_device("ip:198.51.100.1", 1001).is_err(),
+            "per-address limit"
+        );
+    }
+
+    #[test]
+    fn the_known_device_cookie_is_signed_bound_to_this_hub_and_expires() {
+        let secret = [7u8; 32];
+        let v = device_cookie(&secret, 5_000);
+        assert!(device_cookie_ok(&secret, &v, 5_000, 0));
+        assert!(device_cookie_ok(&secret, &v, 5_000 + DEVICE_TTL_SECS, 0));
+        assert!(!device_cookie_ok(&secret, &v, 5_001 + DEVICE_TTL_SECS, 0));
+        // Another hub's secret, a changed time, junk.
+        assert!(!device_cookie_ok(&[8u8; 32], &v, 5_000, 0));
+        let forged = v.replacen("5000", "9000", 1);
+        assert!(!device_cookie_ok(&secret, &forged, 9_000, 0));
+        for junk in ["", "5000", "5000.", "x.y", "5000.zz"] {
+            assert!(!device_cookie_ok(&secret, junk, 5_000, 0), "{junk}");
+        }
+        // Issued before a sign-out of every session: no longer known.
+        assert!(!device_cookie_ok(&secret, &v, 6_000, 5_000));
+        assert!(device_cookie_ok(&secret, &v, 6_000, 4_999));
+        let mut h = HeaderMap::new();
+        h.insert(
+            "cookie",
+            format!("snhub_session=t; {DEVICE_COOKIE}={v}")
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(device_from_headers(&h), Some(v));
+    }
+
+    #[test]
+    fn the_hash_queue_turns_away_a_burst_but_not_a_known_device() {
+        let q = HashQueue::new();
+        let held: Vec<HashTicket<'_>> = (0..MAX_HASH_WAITERS)
+            .map(|_| q.try_join().expect("room"))
+            .collect();
+        assert!(q.try_join().is_none(), "full");
+        let priority = q.join();
+        assert!(q.try_join().is_none());
+        drop(priority);
+        drop(held);
+        assert!(q.try_join().is_some(), "places are given back");
+    }
+
+    #[test]
+    fn a_command_line_sign_out_ends_the_sessions_opened_before_it() {
+        let s = Sessions::default();
+        s.insert("old".into(), "1.1.1.1", "UA", "password", 100);
+        s.insert("same".into(), "1.1.1.1", "UA", "password", 200);
+        s.insert("new".into(), "1.1.1.1", "UA", "password", 201);
+        assert_eq!(s.revoked_at(), 0);
+        assert_eq!(s.revoke_through(200), 2);
+        assert!(!s.valid("old", 300) && !s.valid("same", 300));
+        assert!(s.valid("new", 300));
+        assert_eq!(s.list(300).len(), 1);
+        // It never moves back.
+        s.revoke_through(50);
+        assert_eq!(s.revoked_at(), 200);
+        // A session opened later (a fresh sign-in) is fine.
+        s.insert("later".into(), "1.1.1.1", "UA", "password", 400);
+        assert!(s.valid("later", 401));
+    }
+
+    #[test]
+    fn the_sign_out_time_is_read_again_only_every_few_seconds() {
+        let s = Sessions::default();
+        assert!(s.revocation_due(1_000));
+        assert!(!s.revocation_due(1_000));
+        assert!(!s.revocation_due(1_000 + REVOKED_REFRESH_SECS - 1));
+        assert!(s.revocation_due(1_000 + REVOKED_REFRESH_SECS));
+        // A clock that went back does not stop it.
+        assert!(s.revocation_due(10));
+    }
+
+    #[test]
+    fn half_finished_logins_can_be_dropped_all_at_once() {
+        let p = Pending::default();
+        let a = p.create("1.1.1.1", "UA", 100);
+        let b = p.create("1.1.1.1", "UA", 200);
+        assert_eq!(p.drop_through(150), 1);
+        assert!(p.get(&a, 210).is_none() && p.get(&b, 210).is_some());
+        assert_eq!(p.drop_through(i64::MAX), 1);
+        assert!(p.get(&b, 210).is_none());
     }
 
     #[test]

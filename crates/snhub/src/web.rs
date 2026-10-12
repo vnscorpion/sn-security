@@ -120,7 +120,7 @@ pub(crate) fn shell(title: &str, body: Markup) -> Markup {
 
 pub(crate) fn guard(st: &AppState, headers: &HeaderMap) -> Option<Response> {
     match auth::session_from_headers(headers) {
-        Some(tok) if st.sessions.valid(&tok, now()) => None,
+        Some(tok) if crate::web_auth::session_valid(st, &tok) => None,
         _ => Some(Redirect::to("/login").into_response()),
     }
 }
@@ -629,6 +629,7 @@ fn action_vi(a: &str) -> &str {
         "unban" => "Gỡ chặn IP",
         "mode" => "Đổi chế độ",
         "job" => "Lệnh một lần",
+        "drop" => "Bỏ lệnh sai dạng",
         other => other,
     }
 }
@@ -773,7 +774,8 @@ pub struct AgentQuery {
     /// A one-line result to show after an action.
     #[serde(default)]
     msg: String,
-    /// Which card shows `msg`: `scan` (malware scan / ClamAV) or the AI card.
+    /// Which card shows `msg`: `scan` (malware scan / ClamAV), `ctl` (the
+    /// controls) or the AI card.
     #[serde(default)]
     at: String,
 }
@@ -927,8 +929,11 @@ pub async fn agent_detail(
             }
         }
 
-        div class="card" {
+        div class="card" id="ctl" {
             h2 { "Điều khiển" }
+            @if aq.at == "ctl" && !aq.msg.trim().is_empty() {
+                div class="note" style="border-left-color:var(--bad);color:var(--fg)" { (aq.msg.trim()) }
+            }
             p class="help" { "Mọi thao tác áp dụng ở lần quét kế tiếp của VPS (tối đa ~15 phút), vì VPS tự gọi về hub chứ hub không gọi vào VPS." }
             div class="ctrls" {
                 form method="post" action={"/agent/" (agent.id) "/mode"} {
@@ -969,7 +974,7 @@ pub async fn agent_detail(
             }
             p class="help" { "“Hoàn tác” gỡ chặn IP và thả nhốt tiến trình do agent đặt; không đụng tới việc của AI." }        }
 
-        (crate::web_ai::ai_card(&agent.id, report.as_ref(), &ai_data, if aq.at == "scan" { "" } else { aq.msg.trim() }))
+        (crate::web_ai::ai_card(&agent.id, report.as_ref(), &ai_data, if aq.at == "scan" || aq.at == "ctl" { "" } else { aq.msg.trim() }))
 
         div class="card" id="bans" {
             h2 { "IP đang bị chặn (" (bans.len() + hidden) ")" }
@@ -1257,10 +1262,14 @@ pub async fn ban_post(
         return r;
     }
     let ttl = f.ttl.unwrap_or(3600).min(24 * 3600);
-    let ip = f.ip.trim().to_string();
-    if ip.is_empty() {
+    if f.ip.trim().is_empty() {
         return Redirect::to(&format!("/agent/{id}")).into_response();
     }
+    // Only the canonical text of one address (or of the IPv6 /64 the VPS lists
+    // its clients by) goes into the order the VPS runs.
+    let Some(ip) = crate::db::ban_target(&f.ip) else {
+        return control_msg(&id, &bad_ip_msg(&f.ip, false));
+    };
     let ts = now();
     let key = key_of(&ip);
     let db = st.db.lock().expect("db");
@@ -1291,10 +1300,12 @@ pub async fn unban_post(
     if let Some(r) = guard(&st, &headers) {
         return r;
     }
-    let ip = f.ip.trim().to_string();
-    if ip.is_empty() {
+    if f.ip.trim().is_empty() {
         return Redirect::to(&format!("/agent/{id}")).into_response();
     }
+    let Some(ip) = crate::db::ban_target(&f.ip) else {
+        return control_msg(&id, &bad_ip_msg(&f.ip, true));
+    };
     let key = key_of(&ip);
     let db = st.db.lock().expect("db");
     let _ = db.update_desired(&id, now(), "admin", "unban", &ip, |d| {
@@ -1484,6 +1495,26 @@ pub async fn add_vps_post(
         .into_string(),
     )
     .into_response()
+}
+
+/// Back to the VPS page with a message in its "Điều khiển" card.
+fn control_msg(id: &str, msg: &str) -> Response {
+    Redirect::to(&format!("/agent/{id}?msg={}&at=ctl#ctl", urlenc(msg))).into_response()
+}
+
+fn bad_ip_msg(input: &str, unban: bool) -> String {
+    let shown: String = input
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(60)
+        .collect();
+    format!(
+        "Không {} “{shown}”: cần đúng một địa chỉ IP (vd: 203.0.113.7 hoặc 2001:db8::1) \
+         hoặc một dải IPv6 /64 (vd: 2001:db8:1:2::/64), không phải địa chỉ nội bộ của máy \
+         (loopback), địa chỉ 0, multicast hay broadcast.",
+        if unban { "gỡ chặn" } else { "chặn" },
+    )
 }
 
 // ---- ip check --------------------------------------------------------------
