@@ -401,7 +401,9 @@ fn hidden_bans(report: Option<&ReportBody>) -> usize {
 }
 
 /// Rows per page in the blocklist.
-const BAN_PAGE_SIZE: usize = 50;
+const BAN_PAGE_SIZE: usize = 10;
+/// Rows per page in the malware findings.
+const FINDING_PAGE_SIZE: usize = 10;
 
 /// Slice bounds for a 1-based `page`: `(start, end, page, pages)`. An
 /// out-of-range page is clamped to the nearest valid one; an empty list is one
@@ -435,6 +437,58 @@ fn bans_url(agent_id: &str, q: &str, page: usize) -> String {
     }
     url.push_str("#bans");
     url
+}
+
+/// Link to a page of the malware findings, keeping the blocklist page and filter.
+fn findings_url(agent_id: &str, q: &str, page: usize, fpage: usize) -> String {
+    let mut url = format!("/agent/{agent_id}?page={page}&fpage={fpage}");
+    if !q.is_empty() {
+        url.push_str("&q=");
+        url.push_str(&urlenc(q));
+    }
+    url.push_str("#scan");
+    url
+}
+
+/// One CSV cell. Quoted always; a leading `=`, `+`, `-`, `@`, tab or CR is
+/// prefixed with `'` because spreadsheets run such cells as formulas, and these
+/// values (file paths, code excerpts) come from the scanned machine.
+fn csv_cell(s: &str) -> String {
+    let mut v = String::with_capacity(s.len() + 2);
+    if s.starts_with(['=', '+', '-', '@', '\t', '\r']) {
+        v.push('\'');
+    }
+    v.push_str(s);
+    format!("\"{}\"", v.replace('"', "\"\""))
+}
+
+/// Every finding as CSV, with a BOM so Excel reads the UTF-8 correctly.
+fn findings_csv(findings: &[snsec_common::schema::Finding]) -> String {
+    let mut out = String::from("\u{feff}verdict,score,path,rules,context,sha256\r\n");
+    for f in findings {
+        let row = [
+            csv_cell(&f.verdict),
+            f.score.to_string(),
+            csv_cell(&f.path),
+            csv_cell(&f.rules.join(" ")),
+            csv_cell(&f.context),
+            csv_cell(&f.sha256),
+        ];
+        out.push_str(&row.join(","));
+        out.push_str("\r\n");
+    }
+    out
+}
+
+/// Paths of the files judged malicious, one per line, for scripts. A control
+/// character in a name (a newline would split the list) becomes `?`.
+fn findings_paths(findings: &[snsec_common::schema::Finding]) -> String {
+    let mut out = String::new();
+    for f in findings.iter().filter(|f| f.verdict == "malicious") {
+        out.extend(f.path.chars().map(|c| if c.is_control() { '?' } else { c }));
+        out.push('\n');
+    }
+    out
 }
 
 /// "còn 12 phút" / "còn 3 giờ" until `ts`.
@@ -702,6 +756,79 @@ pub struct AgentQuery {
     q: String,
     #[serde(default)]
     page: usize,
+    /// Page of the malware findings (independent of the blocklist page).
+    #[serde(default)]
+    fpage: usize,
+}
+
+/// Download the latest scan results: `csv` (every finding) or `txt` (paths of
+/// the files judged malicious).
+async fn findings_download(
+    st: Arc<AppState>,
+    headers: HeaderMap,
+    id: String,
+    csv: bool,
+) -> Response {
+    if let Some(r) = guard(&st, &headers) {
+        return r;
+    }
+    let db = st.db.lock().expect("db");
+    let Some(agent) = db.agent(&id).ok().flatten() else {
+        return (StatusCode::NOT_FOUND, "VPS không tồn tại").into_response();
+    };
+    let report = db.latest_report(&id).ok().flatten();
+    drop(db);
+    let Some(report) = report else {
+        return (StatusCode::NOT_FOUND, "Chưa có báo cáo nào từ VPS này").into_response();
+    };
+    // The name goes into a header: keep it to safe characters.
+    let name: String = agent
+        .id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        .collect();
+    let (body, ctype, ext) = if csv {
+        (
+            findings_csv(&report.findings),
+            "text/csv; charset=utf-8",
+            "csv",
+        )
+    } else {
+        (
+            findings_paths(&report.findings),
+            "text/plain; charset=utf-8",
+            "txt",
+        )
+    };
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, ctype.to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"malware-{name}.{ext}\""),
+            ),
+            (header::CACHE_CONTROL, "no-store".to_string()),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+pub async fn findings_csv_download(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    findings_download(st, headers, id, true).await
+}
+
+pub async fn findings_txt_download(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    findings_download(st, headers, id, false).await
 }
 
 pub async fn agent_detail(
@@ -741,6 +868,13 @@ pub async fn agent_detail(
         .collect();
     let (start, end, page, pages) = page_bounds(filtered.len(), aq.page, BAN_PAGE_SIZE);
     let shown = &filtered[start..end];
+
+    // Malware findings: one page at a time.
+    let all_findings: &[snsec_common::schema::Finding] =
+        report.as_ref().map_or(&[][..], |r| r.findings.as_slice());
+    let (fstart, fend, fpage, fpages) =
+        page_bounds(all_findings.len(), aq.fpage, FINDING_PAGE_SIZE);
+    let shown_findings = &all_findings[fstart..fend];
 
     let body = html! {
         p { a href="/" { "← Tổng quan" } }
@@ -1021,10 +1155,22 @@ pub async fn agent_detail(
                 }
 
                 @if !r.findings.is_empty() {
+                    div style="display:flex;gap:14px;flex-wrap:wrap;align-items:center;margin:0 0 12px" {
+                        a href={"/agent/" (agent.id) "/findings.csv"} { "Tải danh sách (CSV, tất cả " (r.findings.len()) " file)" }
+                        a href={"/agent/" (agent.id) "/findings.txt"} { "Chỉ đường dẫn file độc hại (.txt)" }
+                    }
+                    @if let Some(h) = &r.hunt {
+                        @if (h.malicious + h.suspicious) as usize > r.findings.len() {
+                            p class="help" style="margin:0 0 10px" {
+                                "VPS tìm thấy " b { (h.malicious + h.suspicious) } " file nhưng chỉ gửi về hub " b { (r.findings.len()) } " file có điểm cao nhất. "
+                                "Danh sách đầy đủ có trên VPS: chạy " code { "sn hunt" } "."
+                            }
+                        }
+                    }
                     div class="wrap" {
                         table {
                             thead { tr { th { "Điểm" } th { "Kết luận" } th { "Đường dẫn" } th { "Dấu hiệu khớp" } } }
-                            tbody { @for f in &r.findings {
+                            tbody { @for f in shown_findings {
                                 tr {
                                     td { (f.score) }
                                     td { @if f.verdict == "malicious" { span class="badge b-bad" { (verdict_vi(&f.verdict)) } } @else { span class="badge b-warn" { (verdict_vi(&f.verdict)) } } }
@@ -1032,6 +1178,13 @@ pub async fn agent_detail(
                                     td class="mut" { (f.rules.join(", ")) }
                                 }
                             }}
+                        }
+                    }
+                    @if fpages > 1 {
+                        div style="display:flex;gap:14px;align-items:center;justify-content:center;margin-top:14px" {
+                            @if fpage > 1 { a href=(findings_url(&agent.id, aq.q.trim(), page, fpage - 1)) { "← Trước" } } @else { span class="mut" { "← Trước" } }
+                            span class="mut" { "Trang " (fpage) " / " (fpages) " · hiển thị " (fstart + 1) "–" (fend) " trong " (all_findings.len()) }
+                            @if fpage < fpages { a href=(findings_url(&agent.id, aq.q.trim(), page, fpage + 1)) { "Sau →" } } @else { span class="mut" { "Sau →" } }
                         }
                     }
                     p class="help" {
@@ -1578,6 +1731,72 @@ mod tests {
         assert!(note("fd00::1").is_some());
         assert!(note("203.0.113.7").is_none());
         assert!(note("2001:db8::1").is_none());
+    }
+
+    fn finding(path: &str, verdict: &str, context: &str) -> snsec_common::schema::Finding {
+        snsec_common::schema::Finding {
+            path: path.into(),
+            score: 120,
+            verdict: verdict.into(),
+            rules: vec!["source-to-sink".into(), "dropper".into()],
+            context: context.into(),
+            sha256: "ab12".into(),
+        }
+    }
+
+    #[test]
+    fn csv_cells_are_quoted_and_cannot_run_as_spreadsheet_formulas() {
+        assert_eq!(csv_cell("a,b"), "\"a,b\"");
+        assert_eq!(csv_cell("say \"hi\""), "\"say \"\"hi\"\"\"");
+        for evil in ["=HYPERLINK(\"http://x\")", "+1", "-2", "@SUM(A1)", "\tx"] {
+            assert!(csv_cell(evil).starts_with("\"'"), "{evil}");
+        }
+        // An ordinary path is left alone.
+        assert_eq!(csv_cell("/home/a/x.php"), "\"/home/a/x.php\"");
+    }
+
+    #[test]
+    fn the_csv_has_a_header_a_bom_and_one_row_per_finding() {
+        let rows = [
+            finding("/home/a/x.php", "malicious", "eval($_POST['a'])"),
+            finding("/home/a/y.php", "suspicious", "=cmd|' /C calc'!A0"),
+        ];
+        let csv = findings_csv(&rows);
+        assert!(csv.starts_with("\u{feff}verdict,score,path,rules,context,sha256\r\n"));
+        assert_eq!(csv.matches("\r\n").count(), 3);
+        assert!(csv.contains("\"malicious\",120,\"/home/a/x.php\",\"source-to-sink dropper\""));
+        // The formula-looking excerpt is defused.
+        assert!(csv.contains("\"'=cmd"));
+        assert_eq!(findings_csv(&[]).matches("\r\n").count(), 1);
+    }
+
+    #[test]
+    fn the_path_list_has_only_malicious_files_one_per_line_and_no_newlines_inside() {
+        let rows = [
+            finding("/home/a/x.php", "malicious", ""),
+            finding("/home/a/y.php", "suspicious", ""),
+            finding("/home/a/evil\nname.php", "malicious", ""),
+        ];
+        assert_eq!(
+            findings_paths(&rows),
+            "/home/a/x.php\n/home/a/evil?name.php\n"
+        );
+        assert_eq!(findings_paths(&[]), "");
+    }
+
+    #[test]
+    fn findings_links_keep_the_blocklist_page_and_filter() {
+        assert_eq!(
+            findings_url("x", "10.0 ", 3, 2),
+            "/agent/x?page=3&fpage=2&q=10.0%20#scan"
+        );
+        assert_eq!(findings_url("x", "", 1, 1), "/agent/x?page=1&fpage=1#scan");
+    }
+
+    #[test]
+    fn sixteen_blocked_ips_are_two_pages_of_ten() {
+        assert_eq!(page_bounds(16, 1, BAN_PAGE_SIZE), (0, 10, 1, 2));
+        assert_eq!(page_bounds(16, 2, BAN_PAGE_SIZE), (10, 16, 2, 2));
     }
 
     fn stat(key: &str, flagged: bool) -> snsec_common::schema::PatternStat {

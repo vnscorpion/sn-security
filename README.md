@@ -191,7 +191,7 @@ sn hunt                 # quét ngay, in kết quả
 sn clean --yes          # cách ly các file "độc hại" (khôi phục được: sn restore <id>)
 ```
 
-Ba cách chạy: **tự động lúc 3 giờ sáng** (timer `sn-hunt`, ưu tiên CPU/IO thấp), **bấm "Quét ngay" trên hub**, hoặc chạy tay như trên. Kết quả (số file đã quét, số độc hại/nghi ngờ, danh sách file kèm đoạn mã trích ra) hiện ở mục **Quét mã độc** trên trang VPS; có file độc hại thì hub báo cảnh báo khẩn. Trang cũng cho biết "đã quét, không có gì" khác với "chưa quét lần nào".
+Ba cách chạy: **tự động lúc 3 giờ sáng** (timer `sn-hunt`, ưu tiên CPU/IO thấp), **bấm "Quét ngay" trên hub**, hoặc chạy tay như trên. Kết quả (số file đã quét, số độc hại/nghi ngờ, danh sách file kèm đoạn mã trích ra) hiện ở mục **Quét mã độc** trên trang VPS; có file độc hại thì hub báo cảnh báo khẩn. Trang cũng cho biết "đã quét, không có gì" khác với "chưa quét lần nào". Danh sách hiện 10 file mỗi trang, và có thể **tải xuống**: CSV (tất cả file, kèm điểm, dấu hiệu khớp, đoạn mã trích, sha256; các ô bắt đầu bằng `=`, `+`, `-`, `@` được thêm dấu `'` để Excel không chạy chúng như công thức) hoặc `.txt` chỉ gồm đường dẫn các file "độc hại", mỗi dòng một file. VPS chỉ gửi về hub tối đa 100 file điểm cao nhất mỗi lần; muốn đủ danh sách thì chạy `sn hunt` trên VPS. Danh sách IP đang bị chặn cũng hiện 10 IP mỗi trang.
 
 **Nó bắt được gì:** request đi thẳng vào lệnh chạy mã/lệnh hệ thống (`eval`, `system`, `exec`, `call_user_func`...), biến lấy từ request rồi đưa vào các lệnh đó, request quyết định tên hàm được gọi, `eval` của dữ liệu đã giải mã (base64/gzinflate...), `preg_replace` với modifier `/e`, file ghi dữ liệu từ request ra đĩa, file PHP trong `uploads/` hoặc đuôi ảnh, blob base64/entropy cao.
 

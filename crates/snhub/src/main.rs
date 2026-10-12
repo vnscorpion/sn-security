@@ -221,6 +221,8 @@ async fn serve(cfg: HubConfig, state: Arc<AppState>) -> Result<()> {
         .route("/agent/{id}/unban", post(web::unban_post))
         .route("/agent/{id}/mode", post(web::mode_post))
         .route("/agent/{id}/job", post(web::job_post))
+        .route("/agent/{id}/findings.csv", get(web::findings_csv_download))
+        .route("/agent/{id}/findings.txt", get(web::findings_txt_download))
         .route("/add-vps", get(web::add_vps_page).post(web::add_vps_post))
         .route("/log", get(web::log_page))
         .route("/check-ip", get(web::check_ip))
