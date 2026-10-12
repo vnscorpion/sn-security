@@ -178,19 +178,11 @@ fn apply(op: &UndoOp, state_dir: &Path) -> Result<()> {
             if !Path::new(backup).starts_with(&vault) || backup.contains("..") {
                 bail!("refusing a backup outside the rc-backups directory");
             }
-            let data = std::fs::read(backup).context("reading the backup")?;
-            let mut f = OpenOptions::new()
-                .write(true)
-                .custom_flags(nix::libc::O_NOFOLLOW)
-                .open(path)
-                .with_context(|| format!("opening {path}"))?;
-            let meta = f.metadata()?;
-            if !meta.is_file() || meta.uid() != *uid {
-                bail!("{path} is no longer the user's regular file");
+            if !is_rc_target(Path::new(path), *uid) {
+                bail!("refusing {path}: not a start-up file in that user's home");
             }
-            f.set_len(0)?;
-            f.write_all(&data)?;
-            Ok(())
+            let data = std::fs::read(backup).context("reading the backup")?;
+            rewrite_users_file(Path::new(path), &data, *uid)
         }
         UndoOp::EnableService { unit } => {
             if !snsec_common::ai::ALLOWED_UNITS.contains(&unit.as_str()) {
@@ -198,5 +190,106 @@ fn apply(op: &UndoOp, state_dir: &Path) -> Result<()> {
             }
             systemctl(&["enable", "--now", unit])
         }
+    }
+}
+
+/// `sn remediate` edits only `<home>/<start-up file>` of the file's owner (the
+/// home of root is `/root`): a record naming anything else is not opened.
+fn is_rc_target(path: &Path, uid: u32) -> bool {
+    let name_ok = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| crate::evidence::RC_FILES.contains(&n));
+    let home = if uid == 0 {
+        Some(PathBuf::from("/root"))
+    } else {
+        nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
+            .ok()
+            .flatten()
+            .map(|u| u.dir)
+    };
+    name_ok
+        && !path
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
+        && home.is_some_and(|h| path.parent() == Some(h.as_path()))
+}
+
+/// Put `data` back into `path`, which must still be `uid`'s own regular file
+/// with a single name. `O_NONBLOCK`: a FIFO the user left in its place makes the
+/// open fail at once instead of blocking this record and every one behind it
+/// (on the regular file it is checked to be, the flag changes nothing).
+fn rewrite_users_file(path: &Path, data: &[u8], uid: u32) -> Result<()> {
+    let mut f = OpenOptions::new()
+        .write(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    let meta = f.metadata()?;
+    if !meta.is_file() || meta.uid() != uid || meta.nlink() != 1 {
+        bail!(
+            "{} is no longer the user's own regular file",
+            path.display()
+        );
+    }
+    f.set_len(0)?;
+    f.write_all(data)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn me() -> u32 {
+        nix::unistd::getuid().as_raw()
+    }
+
+    #[test]
+    fn a_fifo_in_place_of_the_file_fails_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join(".bashrc");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let p = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(rewrite_users_file(&p, b"x", me()).is_err());
+        });
+        // Without O_NONBLOCK the open would wait for a reader forever.
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(true));
+    }
+
+    #[test]
+    fn only_the_users_own_single_link_regular_file_is_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let rc = dir.path().join(".bashrc");
+        std::fs::write(&rc, "edited\n").unwrap();
+        rewrite_users_file(&rc, b"original\n", me()).unwrap();
+        assert_eq!(std::fs::read(&rc).unwrap(), b"original\n");
+
+        // Someone else's file.
+        assert!(rewrite_users_file(&rc, b"x", me().wrapping_add(1)).is_err());
+        // A second name for it.
+        std::fs::hard_link(&rc, dir.path().join("other")).unwrap();
+        assert!(rewrite_users_file(&rc, b"x", me()).is_err());
+        assert_eq!(std::fs::read(&rc).unwrap(), b"original\n");
+        // A symlink in its place.
+        let target = dir.path().join("target");
+        std::fs::write(&target, "keep").unwrap();
+        let link = dir.path().join(".profile");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(rewrite_users_file(&link, b"x", me()).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn a_record_must_name_a_start_up_file_in_the_owners_home() {
+        assert!(is_rc_target(Path::new("/root/.bashrc"), 0));
+        assert!(!is_rc_target(Path::new("/etc/passwd"), 0));
+        assert!(!is_rc_target(Path::new("/tmp/.bashrc"), 0));
+        assert!(!is_rc_target(Path::new("/root/../etc/.bashrc"), 0));
+        assert!(!is_rc_target(Path::new("/root/sub/.bashrc"), 0));
     }
 }

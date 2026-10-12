@@ -26,8 +26,9 @@ mod whitelist;
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use nix::sys::stat::{Mode, umask};
 
 use config::Config;
 use state::State;
@@ -128,8 +129,10 @@ enum Cmd {
         url: String,
         #[arg(long)]
         name: String,
+        /// Enrollment token. Better given in the SN_ENROLL_TOKEN environment
+        /// variable: a command line is visible to every local user.
         #[arg(long)]
-        token: String,
+        token: Option<String>,
     },
     /// Kill switch: remove the sn firewall table and release any jail.
     Disable,
@@ -138,6 +141,7 @@ enum Cmd {
 }
 
 fn main() -> std::process::ExitCode {
+    private_umask();
     match run() {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
@@ -145,6 +149,32 @@ fn main() -> std::process::ExitCode {
             std::process::ExitCode::FAILURE
         }
     }
+}
+
+/// Everything the agent creates (state, evidence, the vault, config) is root's
+/// alone, whatever umask it was started with: a rescue shell's or systemd's 022
+/// would leave incident data readable by every local account. Returns the
+/// previous mask.
+fn private_umask() -> Mode {
+    umask(Mode::S_IRWXG | Mode::S_IRWXO)
+}
+
+/// The enrollment token: `--token` if given, else `SN_ENROLL_TOKEN` (where the
+/// installer puts it, out of the process list).
+fn enroll_token(flag: Option<String>, env: Option<std::ffi::OsString>) -> Result<String> {
+    let token = match flag {
+        Some(t) => t,
+        None => env
+            .context("no enrollment token: set SN_ENROLL_TOKEN (or pass --token)")?
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("SN_ENROLL_TOKEN is not valid UTF-8"))?
+            .trim()
+            .to_string(),
+    };
+    if token.is_empty() {
+        anyhow::bail!("the enrollment token is empty");
+    }
+    Ok(token)
 }
 
 fn run() -> Result<()> {
@@ -196,15 +226,21 @@ fn run() -> Result<()> {
         }
         Cmd::InstallClamav => {
             let state = State::open()?;
+            // System packages: their install scripts and the update timer's unit
+            // files are meant to have the system's usual modes.
+            umask(Mode::S_IWGRP | Mode::S_IWOTH);
             clamav_run::install(&state)?;
         }
         Cmd::Clean { yes } => {
             let state = State::open()?;
-            clean::clean(&state, yes)?;
+            clean::clean(&state, &cfg.hunt.allowed_roots, yes)?;
         }
         Cmd::Quarantine { path } => {
             let state = State::open()?;
-            let id = clean::quarantine(&state, &path)?;
+            // Walked from `/`: a relative path is made absolute first, without
+            // resolving any symlink in it.
+            let path = std::path::absolute(&path)?;
+            let id = clean::quarantine_safe(&state, &path, None)?;
             println!("quarantined -> {id}");
         }
         Cmd::Restore { id } => {
@@ -240,6 +276,7 @@ fn run() -> Result<()> {
             }
         }
         Cmd::Enroll { url, name, token } => {
+            let token = enroll_token(token, std::env::var_os("SN_ENROLL_TOKEN"))?;
             hub::enroll(&cli.config, &url, &name, &token)?;
         }
         Cmd::Disable => {
@@ -297,4 +334,48 @@ fn run() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_agent_runs_with_a_private_umask() {
+        // Put straight back: the mask is process-wide and other tests run
+        // alongside this one.
+        let before = private_umask();
+        let set = umask(before);
+        assert_eq!(set.bits() & 0o777, 0o077);
+    }
+
+    #[test]
+    fn enroll_takes_the_token_from_the_environment() {
+        // No token on the command line...
+        let cli =
+            Cli::try_parse_from(["sn", "enroll", "--url", "https://h", "--name", "v"]).unwrap();
+        let Cmd::Enroll { token, .. } = cli.cmd else {
+            panic!("not enroll");
+        };
+        assert_eq!(token, None);
+        assert_eq!(enroll_token(None, Some("tok\n".into())).unwrap(), "tok");
+        assert!(enroll_token(None, None).is_err());
+        assert!(enroll_token(None, Some(" ".into())).is_err());
+        // ...but an older installer's --token still works, and wins.
+        let cli = Cli::try_parse_from([
+            "sn",
+            "enroll",
+            "--url",
+            "https://h",
+            "--name",
+            "v",
+            "--token",
+            "old",
+        ])
+        .unwrap();
+        let Cmd::Enroll { token, .. } = cli.cmd else {
+            panic!("not enroll");
+        };
+        assert_eq!(enroll_token(token, Some("env".into())).unwrap(), "old");
+    }
 }
