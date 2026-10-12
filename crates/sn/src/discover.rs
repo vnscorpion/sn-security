@@ -12,6 +12,8 @@
 //! Apache usually only sees the proxy's `127.0.0.1` anyway.
 
 use std::collections::HashSet;
+use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 
 use crate::config::LogSource;
 use crate::sys::{netstat, proc};
@@ -41,24 +43,31 @@ impl Listener {
 // Usual access-log locations per server. A pattern only counts if it matches at
 // least one real access-log file (error logs and archives are filtered out).
 const NGINX: &[&str] = &[
-    "/var/log/nginx/domains/*.log", // DirectAdmin, HestiaCP, VestaCP
-    "/var/log/nginx/*access*.log",  // distro packages
-    "/www/wwwlogs/*.log",           // aaPanel
+    "/var/log/nginx/domains/*.log",     // DirectAdmin, HestiaCP, VestaCP
+    "/var/log/nginx/*access*.log",      // distro packages
+    "/www/wwwlogs/*.log",               // aaPanel
+    "/var/log/virtualmin/*_access_log", // Virtualmin
 ];
 const APACHE: &[&str] = &[
-    "/var/log/httpd/domains/*.log",  // DirectAdmin
-    "/var/log/httpd/*access_log",    // RHEL family
-    "/var/log/apache2/*access*.log", // Debian family
-    "/usr/local/apache/domlogs/*",   // cPanel
-    "/www/wwwlogs/*.log",            // aaPanel
-    "/home/*/logs/*access*log",      // other panels
+    "/var/log/httpd/domains/*.log",     // DirectAdmin
+    "/var/log/httpd/*access_log",       // RHEL family
+    "/var/log/apache2/*access*.log",    // Debian family
+    "/usr/local/apache/domlogs/*",      // cPanel
+    "/www/wwwlogs/*.log",               // aaPanel
+    "/var/log/virtualmin/*_access_log", // Virtualmin (~/logs links here)
+    "/home/*/logs/*access*log",         // other panels (see TENANT_AREA)
 ];
 const LITESPEED: &[&str] = &[
     "/var/log/openlitespeed/*access*.log", // OPanel: <domain>.access.log per website
     "/usr/local/lsws/logs/*access*.log",   // server-level / default vhost
     "/usr/local/apache/domlogs/*",         // cPanel + LiteSpeed
-    "/home/*/logs/*access*log",            // CyberPanel
+    "/home/*/logs/*access*log",            // CyberPanel (see TENANT_AREA)
 ];
+
+/// Directories the sites' owners control. Anyone with a site can create a file
+/// called `x.access_log` in their own home, so a log there is followed only
+/// file by file, each one checked (see [`tenant_log_ok`]).
+const TENANT_AREA: &str = "/home/";
 
 /// The patterns to try for a given server. When the server is unknown, try
 /// everything: reading too much beats reading nothing.
@@ -103,9 +112,10 @@ pub fn classify(found: &[Listener]) -> Listener {
     Listener::Unknown
 }
 
-/// Which web server owns a listening socket on :80 or :443.
-#[must_use]
-pub fn detect_listener(conns: &[netstat::Conn]) -> Listener {
+/// Web-server processes holding a socket that listens on :80 or :443 (the
+/// master and its workers), with their pids. The name alone proves nothing, as
+/// any user can start a process called nginx; holding that socket does.
+fn web_listeners(conns: &[netstat::Conn]) -> Vec<(Listener, i32)> {
     let listening: HashSet<u64> = conns
         .iter()
         .filter(|c| c.state == netstat::ST_LISTEN && matches!(c.local_port, 80 | 443))
@@ -113,7 +123,7 @@ pub fn detect_listener(conns: &[netstat::Conn]) -> Listener {
         .filter(|&i| i != 0)
         .collect();
     if listening.is_empty() {
-        return Listener::Unknown;
+        return Vec::new();
     }
     let mut found = Vec::new();
     for pid in proc::list_pids() {
@@ -125,10 +135,51 @@ pub fn detect_listener(conns: &[netstat::Conn]) -> Listener {
             .iter()
             .any(|ino| listening.contains(ino))
         {
-            found.push(kind);
+            found.push((kind, pid));
         }
     }
+    found
+}
+
+/// Which web server owns a listening socket on :80 or :443.
+#[must_use]
+pub fn detect_listener(conns: &[netstat::Conn]) -> Listener {
+    let found: Vec<Listener> = web_listeners(conns).into_iter().map(|(k, _)| k).collect();
     classify(&found)
+}
+
+/// The users the web server runs as. Its access logs belong to root or to one
+/// of them; a file owned by anyone else was not written by it.
+#[must_use]
+pub fn web_server_uids() -> Vec<u32> {
+    let mut uids: Vec<u32> = web_listeners(&netstat::all())
+        .into_iter()
+        .filter_map(|(_, pid)| proc::uid(pid))
+        .collect();
+    uids.sort_unstable();
+    uids.dedup();
+    uids
+}
+
+/// A log under a site owner's home is followed only if nothing from the home
+/// directory down is a symlink, it has no other hard link, and it passes the
+/// check every log gets on open (regular file, owned by root or the web server,
+/// not writable by others). What the site's owner can create there is theirs.
+fn tenant_log_ok(area: &Path, file: &Path) -> bool {
+    let Ok(rel) = file.strip_prefix(area) else {
+        return false;
+    };
+    let mut at = area.to_path_buf();
+    for part in rel.components() {
+        at.push(part);
+        match std::fs::symlink_metadata(&at) {
+            Ok(m) if !m.file_type().is_symlink() => {}
+            _ => return false,
+        }
+    }
+    crate::watch::tail::open_log(file)
+        .and_then(|f| f.metadata())
+        .is_ok_and(|m| m.nlink() == 1)
 }
 
 /// What detection came up with.
@@ -148,12 +199,25 @@ pub fn discover(listener: Listener, root: &str) -> Discovery {
     for g in candidate_globs(listener) {
         let pattern = format!("{root}{g}");
         tried.push(pattern.clone());
-        if !crate::watch::expand_glob(&pattern).is_empty() {
-            found.push(LogSource {
-                glob: pattern,
-                // Every server above writes the Apache/nginx "combined" layout.
-                format: "combined".into(),
-            });
+        // Every server above writes the Apache/nginx "combined" layout.
+        let source = |glob: String| LogSource {
+            glob,
+            format: "combined".into(),
+        };
+        if g.starts_with(TENANT_AREA) {
+            // One source per checked file, never the pattern: a file created
+            // there after this check is not followed until it passes it too.
+            let area = format!("{root}{}", TENANT_AREA.trim_end_matches('/'));
+            let area = Path::new(&area);
+            for file in crate::watch::expand_glob(&pattern) {
+                if let Some(path) = file.to_str()
+                    && tenant_log_ok(area, &file)
+                {
+                    found.push(source(glob::Pattern::escape(path)));
+                }
+            }
+        } else if !crate::watch::expand_glob(&pattern).is_empty() {
+            found.push(source(pattern));
         }
     }
     Discovery { found, tried }
@@ -165,9 +229,12 @@ mod tests {
     use std::fs;
 
     fn touch(root: &std::path::Path, rel: &str) {
+        use std::os::unix::fs::PermissionsExt;
         let p = root.join(rel);
         fs::create_dir_all(p.parent().unwrap()).unwrap();
-        fs::write(p, "x\n").unwrap();
+        fs::write(&p, "x\n").unwrap();
+        // As a web server leaves its logs, whatever the test's umask.
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
     }
 
     fn globs(d: &Discovery) -> Vec<String> {
@@ -285,6 +352,104 @@ mod tests {
         let d = discover(Listener::Nginx, root);
         assert_eq!(d.found.len(), 1);
         assert_eq!(crate::watch::expand_glob(&d.found[0].glob).len(), 1);
+    }
+
+    #[test]
+    fn logs_under_home_are_followed_file_by_file_and_only_if_trusted() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let at = |rel: &str| dir.path().join(rel);
+        // CyberPanel: the web server writes /home/<site>/logs/<site>.access_log.
+        touch(dir.path(), "home/example.com/logs/example.com.access_log");
+        // What a site's owner could plant in their own home instead:
+        // a file others may write,
+        touch(dir.path(), "home/open.net/logs/open.net.access_log");
+        fs::set_permissions(
+            at("home/open.net/logs/open.net.access_log"),
+            fs::Permissions::from_mode(0o666),
+        )
+        .unwrap();
+        // a symlink to some other log,
+        touch(dir.path(), "var/log/other_access.log");
+        fs::create_dir_all(at("home/link.org/logs")).unwrap();
+        symlink(
+            at("var/log/other_access.log"),
+            at("home/link.org/logs/link.org.access_log"),
+        )
+        .unwrap();
+        // a symlinked directory on the way,
+        fs::create_dir_all(at("home/dirlink.io")).unwrap();
+        symlink(at("var/log"), at("home/dirlink.io/logs")).unwrap();
+        // and a hard link to a file they do not own.
+        fs::create_dir_all(at("home/hard.dev/logs")).unwrap();
+        fs::hard_link(
+            at("var/log/other_access.log"),
+            at("home/hard.dev/logs/hard.dev.access_log"),
+        )
+        .unwrap();
+
+        let d = discover(Listener::LiteSpeed, root);
+        assert_eq!(
+            globs(&d),
+            [format!(
+                "{root}/home/example.com/logs/example.com.access_log"
+            )]
+        );
+        assert!(
+            d.tried
+                .iter()
+                .any(|t| t.ends_with("/home/*/logs/*access*log"))
+        );
+        // Apache looks there the same way (older layouts and other panels).
+        assert_eq!(globs(&discover(Listener::Apache, root)), globs(&d));
+
+        // The source names that one file, so a file created there later is not
+        // read before it has been checked.
+        assert_eq!(crate::watch::expand_glob(&d.found[0].glob).len(), 1);
+        touch(dir.path(), "home/example.com/logs/forged.access_log");
+        assert_eq!(crate::watch::expand_glob(&d.found[0].glob).len(), 1);
+
+        // Never by the pattern, whatever the server.
+        for l in [Listener::Apache, Listener::LiteSpeed, Listener::Unknown] {
+            assert!(
+                candidate_globs(l)
+                    .iter()
+                    .filter(|g| g.contains("/home"))
+                    .all(|g| g.starts_with(TENANT_AREA)),
+                "{l:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn virtualmin_logs_are_read_where_the_server_writes_them() {
+        use std::os::unix::fs::symlink;
+        // Virtualmin: the server writes /var/log/virtualmin/<domain>_access_log
+        // and the site's ~/logs/access_log is a symlink to it.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let at = |rel: &str| dir.path().join(rel);
+        touch(dir.path(), "var/log/virtualmin/example.com_access_log");
+        touch(dir.path(), "var/log/virtualmin/example.com_error_log");
+        fs::create_dir_all(at("home/example/logs")).unwrap();
+        symlink(
+            at("var/log/virtualmin/example.com_access_log"),
+            at("home/example/logs/access_log"),
+        )
+        .unwrap();
+
+        for l in [Listener::Apache, Listener::Nginx, Listener::Unknown] {
+            let d = discover(l, root);
+            // Once, from where the server writes it; not again by the symlink.
+            assert_eq!(
+                globs(&d),
+                [format!("{root}/var/log/virtualmin/*_access_log")],
+                "{l:?}"
+            );
+            let files = crate::watch::expand_glob(&d.found[0].glob);
+            assert_eq!(files, [at("var/log/virtualmin/example.com_access_log")]);
+        }
     }
 
     #[test]
