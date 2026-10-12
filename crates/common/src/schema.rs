@@ -345,6 +345,15 @@ pub struct Finding {
     pub sha256: String,
 }
 
+/// Capability of an agent that signs its desired-state pulls. The hub goes by
+/// the pulls themselves: after the first signed one it takes from an agent, it
+/// answers only signed pulls for it, each signed later than the one before.
+pub const CAP_SIGNED_DESIRED: &str = "signed_desired";
+/// Headers of a signed desired-state pull: the unix time it was signed at, and
+/// the hex ed25519 signature over [`crate::crypto::desired_pull_message`].
+pub const HDR_PULL_TS: &str = "x-sn-ts";
+pub const HDR_PULL_SIG: &str = "x-sn-sig";
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DesiredRef {
     pub epoch: u64,

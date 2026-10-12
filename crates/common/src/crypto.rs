@@ -27,6 +27,8 @@ pub enum CryptoError {
     Expired { expires_at: i64, now: i64 },
     #[error("schema version {got} not supported (max {max})")]
     SchemaTooNew { got: u32, max: u32 },
+    #[error("signed at {ts}, too far from now ({now})")]
+    OutOfWindow { ts: i64, now: i64 },
 }
 
 /// Parse a `ed25519:<hex>` public key.
@@ -141,6 +143,49 @@ pub fn verify_detached(
     Err(CryptoError::BadSignature)
 }
 
+// ---------------------------------------------------------------------------
+// Desired-state pull: the agent proves it is the one asking
+// ---------------------------------------------------------------------------
+
+/// How far the time an agent signed its pull at may be from the hub's clock.
+/// Wide on purpose: the pull only reads, and a VPS whose clock drifts must not
+/// lose its orders (envelopes carry no such window, see REVIEW SEC-4). A copied
+/// pull is refused by the hub another way: each one must be signed later than
+/// the last it took from that agent.
+pub const DESIRED_PULL_WINDOW_SECS: u64 = 24 * 3600;
+
+/// The exact bytes an agent signs to fetch its desired state. The text prefix
+/// keeps it from ever reading as a signed JSON envelope (same key).
+#[must_use]
+pub fn desired_pull_message(agent_id: &str, epoch: u64, seq: u64, ts: i64) -> String {
+    format!("sn-desired-v1|{agent_id}|{epoch}|{seq}|{ts}")
+}
+
+/// Sign a desired-state pull; the hex signature travels in a header.
+#[must_use]
+pub fn sign_desired_pull(sk: &SigningKey, agent_id: &str, epoch: u64, seq: u64, ts: i64) -> String {
+    let sig: Signature = sk.sign(desired_pull_message(agent_id, epoch, seq, ts).as_bytes());
+    hex::encode(sig.to_bytes())
+}
+
+/// Check a desired-state pull signed at `ts` by the agent's key, at the hub's `now`.
+pub fn verify_desired_pull(
+    vk: &VerifyingKey,
+    agent_id: &str,
+    epoch: u64,
+    seq: u64,
+    ts: i64,
+    sig_hex: &str,
+    now: i64,
+) -> Result<(), CryptoError> {
+    let msg = desired_pull_message(agent_id, epoch, seq, ts);
+    verify_detached(std::slice::from_ref(vk), msg.as_bytes(), sig_hex)?;
+    if now.abs_diff(ts) > DESIRED_PULL_WINDOW_SECS {
+        return Err(CryptoError::OutOfWindow { ts, now });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,6 +243,58 @@ mod tests {
         let signed = sign(&sk, "hub:1", &mk_env(5)).unwrap();
         let r: Result<Envelope<DesiredBody>, _> = open(&[vk], &signed, 9999);
         assert!(matches!(r, Err(CryptoError::Expired { .. })));
+    }
+
+    #[test]
+    fn a_signed_pull_verifies_only_for_what_was_signed() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let vk = sk.verifying_key();
+        let now = 1_700_000_000;
+        let sig = sign_desired_pull(&sk, "web-01-a1b2c3", 1, 7, now);
+        let id = "web-01-a1b2c3";
+        assert!(verify_desired_pull(&vk, id, 1, 7, now, &sig, now).is_ok());
+        // Another agent id, another (epoch, seq) or another time: not this signature.
+        for (other_id, epoch, seq) in [("web-02-a1b2c3", 1, 7), (id, 2, 7), (id, 1, 8)] {
+            assert!(matches!(
+                verify_desired_pull(&vk, other_id, epoch, seq, now, &sig, now),
+                Err(CryptoError::BadSignature)
+            ));
+        }
+        assert!(verify_desired_pull(&vk, id, 1, 7, now + 1, &sig, now).is_err());
+        // Another key, or no signature at all.
+        let other = SigningKey::generate(&mut OsRng).verifying_key();
+        assert!(verify_desired_pull(&other, id, 1, 7, now, &sig, now).is_err());
+        assert!(verify_desired_pull(&vk, id, 1, 7, now, "zz", now).is_err());
+        assert!(verify_desired_pull(&vk, id, 1, 7, now, "", now).is_err());
+    }
+
+    #[test]
+    fn a_signed_pull_tolerates_a_day_of_clock_skew_either_way() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let vk = sk.verifying_key();
+        let now = 1_700_000_000;
+        let day = DESIRED_PULL_WINDOW_SECS as i64;
+        for ts in [now - day, now - 3600, now + 3600, now + day] {
+            let sig = sign_desired_pull(&sk, "a", 0, 0, ts);
+            assert!(
+                verify_desired_pull(&vk, "a", 0, 0, ts, &sig, now).is_ok(),
+                "{ts}"
+            );
+        }
+        for ts in [now - day - 1, now + day + 1, i64::MIN, i64::MAX] {
+            let sig = sign_desired_pull(&sk, "a", 0, 0, ts);
+            assert!(matches!(
+                verify_desired_pull(&vk, "a", 0, 0, ts, &sig, now),
+                Err(CryptoError::OutOfWindow { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn a_pull_signature_is_not_a_report_signature() {
+        // Same agent key signs both: the pull text can never parse as an envelope.
+        let msg = desired_pull_message("a", 1, 2, 3);
+        assert!(serde_json::from_str::<Envelope<DesiredBody>>(&msg).is_err());
     }
 
     #[test]

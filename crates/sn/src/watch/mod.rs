@@ -202,7 +202,7 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<()> {
     let top_ips = top_ips(&data);
 
     // Can we actually see the web server's traffic?
-    let mut meta = state.meta();
+    let meta = state.meta();
     let (mut alerts, streak) = assess_logs(
         &LogHealth {
             files_matched: data.files_matched,
@@ -218,8 +218,8 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<()> {
     );
     let log_problem = !alerts.is_empty();
     if meta.blind_streak != streak {
-        meta.blind_streak = streak;
-        state.save_meta(&meta)?;
+        // This field only: a hub order applied meanwhile changed others.
+        state.update_meta(|m| m.blind_streak = streak)?;
     }
     if over_cap {
         alerts.push(snsec_common::schema::Alert {
@@ -232,8 +232,7 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<()> {
     // CPU over the interval since the last cycle, and who used it.
     let cpu_now = measure_cpu(state, started, cfg.watch.cpu_alert_pct, meta.cpu_streak);
     if meta.cpu_streak != cpu_now.streak {
-        meta.cpu_streak = cpu_now.streak;
-        state.save_meta(&meta)?;
+        state.update_meta(|m| m.cpu_streak = cpu_now.streak)?;
     }
     let cpu_high = cpu_now.alert.is_some();
     alerts.extend(cpu_now.alert);

@@ -121,12 +121,30 @@ pub struct DesiredQuery {
 
 /// GET /v1/desired?agent_id=..&epoch=..&seq=.. — returns a signed desired body,
 /// or 304 if the agent already has the current version.
+///
+/// The agent signs the pull with its own key (see [`check_pull`]). An unknown
+/// agent, a missing, bad or replayed signature all get the same bare 404 after
+/// the same work, so this endpoint does not tell a stranger which agent ids
+/// exist.
 pub async fn get_desired(
     State(st): State<Arc<AppState>>,
     Query(q): Query<DesiredQuery>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
-    let db = st.db.lock().expect("db mutex");
-    let (epoch, version, body) = match db.get_desired(&q.agent_id) {
+    let at = now();
+    let agent = pull_agent(&st.db.lock().expect("db mutex"), &q.agent_id);
+    // The signature is checked without holding the database.
+    let Some(pull) = check_pull(agent.as_ref(), &q, &headers, at) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let found = {
+        let db = st.db.lock().expect("db mutex");
+        if !record_pull(&db, &q.agent_id, pull) {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        db.get_desired(&q.agent_id)
+    };
+    let (epoch, version, body) = match found {
         Ok(Some(v)) => v,
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
@@ -148,6 +166,144 @@ pub async fn get_desired(
         .body(Body::from(json))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
+
+/// The signed pulls the hub took, one row per agent: the time the last one was
+/// signed at. A row also means the agent signs its pulls, so an unsigned pull
+/// for that id is never answered again.
+const PULLS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS desired_pulls (
+    agent_id TEXT PRIMARY KEY,
+    last_ts INTEGER NOT NULL
+)";
+
+/// What deciding on a pull needs, read in one query: the agent's key, and the
+/// time its last accepted signed pull was signed at (`None`: it never signed).
+/// Never the agent's reports, which are large and slow to parse.
+struct PullAgent {
+    pubkey: String,
+    last_signed: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pull {
+    /// From an agent that predates signing.
+    Unsigned,
+    /// Signed by the agent at this time.
+    Signed(i64),
+}
+
+fn pull_agent(db: &crate::db::Db, agent_id: &str) -> Option<PullAgent> {
+    use rusqlite::OptionalExtension;
+    db.conn.execute_batch(PULLS_SCHEMA).ok()?;
+    db.conn
+        .query_row(
+            "SELECT a.pubkey, p.last_ts FROM agents a \
+             LEFT JOIN desired_pulls p ON p.agent_id = a.id WHERE a.id = ?1",
+            rusqlite::params![agent_id],
+            |r| {
+                Ok(PullAgent {
+                    pubkey: r.get(0)?,
+                    last_signed: r.get(1)?,
+                })
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
+}
+
+/// A key nobody holds: a pull for an unknown id is checked against it, so it
+/// takes as long as one for a real agent with a bad signature.
+static NOBODY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    crypto::encode_pubkey(&ed25519_dalek::SigningKey::from_bytes(&[0x5a; 32]).verifying_key())
+});
+
+/// May this request read the agent's desired state, and as what?
+///
+/// A signed pull (both headers) must verify against the agent's key, be signed
+/// within a day of the hub's clock, and be signed later than the last pull taken
+/// from that agent: a copy of an earlier request (an access log, a proxy) reads
+/// nothing. The agent keeps its times increasing across its processes and clock
+/// steps. An unsigned pull is answered only for an agent that never signed one,
+/// which is an agent older than signing.
+fn check_pull(
+    agent: Option<&PullAgent>,
+    q: &DesiredQuery,
+    headers: &axum::http::HeaderMap,
+    now: i64,
+) -> Option<Pull> {
+    use snsec_common::schema::{HDR_PULL_SIG, HDR_PULL_TS};
+
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    match (header(HDR_PULL_TS), header(HDR_PULL_SIG)) {
+        (None, None) => agent
+            .filter(|a| a.last_signed.is_none())
+            .map(|_| Pull::Unsigned),
+        (Some(ts), Some(sig)) => {
+            let ts: i64 = ts.trim().parse().ok()?;
+            let key = agent.map_or(NOBODY.as_str(), |a| a.pubkey.as_str());
+            let vk = crypto::parse_pubkey(key).ok()?;
+            let verified =
+                crypto::verify_desired_pull(&vk, &q.agent_id, q.epoch, q.seq, ts, sig.trim(), now);
+            let agent = agent?;
+            match verified {
+                Ok(()) => {}
+                Err(crypto::CryptoError::OutOfWindow { .. }) => {
+                    // The agent's own key, so the clock is what is wrong: say so.
+                    tracing::warn!(
+                        "desired pull from {} refused: signed {}s away from the hub's clock (check the VPS clock)",
+                        q.agent_id,
+                        now.saturating_sub(ts)
+                    );
+                    return None;
+                }
+                Err(_) => return None,
+            }
+            if let Some(last) = agent.last_signed.filter(|&last| ts <= last) {
+                tracing::info!(
+                    "desired pull from {} refused: signed at {ts}, not after the last one ({last}); a copied request, or the VPS clock went back",
+                    q.agent_id
+                );
+                return None;
+            }
+            Some(Pull::Signed(ts))
+        }
+        _ => None,
+    }
+}
+
+/// Take a checked pull, under the same lock as the read that answers it. A
+/// signed one moves the agent's last time forward, or is refused when another
+/// pull got there first with the same or a later time; an unsigned one is
+/// refused once any signed pull came in.
+fn record_pull(db: &crate::db::Db, agent_id: &str, pull: Pull) -> bool {
+    use rusqlite::OptionalExtension;
+    if db.conn.execute_batch(PULLS_SCHEMA).is_err() {
+        return false;
+    }
+    match pull {
+        Pull::Unsigned => db
+            .conn
+            .query_row(
+                "SELECT 1 FROM desired_pulls WHERE agent_id = ?1",
+                rusqlite::params![agent_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .is_ok_and(|row| row.is_none()),
+        Pull::Signed(ts) => db
+            .conn
+            .execute(
+                "INSERT INTO desired_pulls (agent_id, last_ts) VALUES (?1, ?2) \
+                 ON CONFLICT(agent_id) DO UPDATE SET last_ts = excluded.last_ts \
+                 WHERE excluded.last_ts > desired_pulls.last_ts",
+                rusqlite::params![agent_id, ts],
+            )
+            .is_ok_and(|changed| changed == 1),
+    }
+}
+
+#[cfg(test)]
+mod desired_pull_tests;
 
 #[derive(Deserialize)]
 pub struct EnrollReq {
