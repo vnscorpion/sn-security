@@ -28,13 +28,14 @@ pub struct IpAgg {
 
 const PATH_CAP: usize = 64;
 
-/// Distinct probe paths that make a scanner on their own.
+/// Distinct probe paths that make a sweep.
 const PROBE_DISTINCT: usize = 3;
-/// 4xx answers over as many distinct paths that, with a probe, make a scanner.
+/// 4xx answers over as many distinct paths that, with a probe, make a sweep.
 const PROBE_MISSES: u64 = 10;
-/// Up to this many requests an uncorroborated probe is reported. Above it the
-/// probe decides nothing, so the request-rate check still applies to the
-/// address (one `/.env` must not buy a flood its way out of a rate ban).
+/// Ban for a sweep from a browser's User-Agent: short, and never escalated.
+const PROBE_SWEEP_TTL: u64 = 600;
+/// Up to this many requests a lone probe is reported. A busy address with one
+/// stray `/.env` is not worth a line in the report.
 const PROBE_REPORT_MAX: u64 = 20;
 
 impl IpAgg {
@@ -68,7 +69,10 @@ impl IpAgg {
 
         if is_probe_path(path) {
             self.probe_hits += 1;
-            let h = fxhash(path.to_ascii_lowercase().as_bytes());
+            // `/.env`, `//.env` and `/.ENV/` are one path.
+            let lower = path.to_ascii_lowercase();
+            let segs: Vec<&str> = lower.split('/').filter(|s| !s.is_empty()).collect();
+            let h = fxhash(segs.join("/").as_bytes());
             if self.probe_paths.len() < PROBE_DISTINCT && !self.probe_paths.contains(&h) {
                 self.probe_paths.push(h);
             }
@@ -81,6 +85,11 @@ impl IpAgg {
         }
     }
 
+    /// A line from this address that could not be parsed: still a request.
+    pub fn observe_unparsed(&mut self) {
+        self.requests += 1;
+    }
+
     #[must_use]
     pub fn distinct_paths(&self) -> usize {
         if self.paths_capped {
@@ -90,14 +99,18 @@ impl IpAgg {
         }
     }
 
-    /// Probe requests plus something that marks a scanner. Any web page can make
-    /// a visitor's browser request `/.env` on this site, with the browser's own
-    /// User-Agent; one such request must not ban the visitor for a day.
-    fn probe_corroborated(&self) -> bool {
+    /// A User-Agent no browser sends: a known tool's, or none at all. A web page
+    /// can make a visitor's browser request any path here (`<img src=/.env>`),
+    /// as often as it likes, but always with the browser's own User-Agent.
+    fn non_browser(&self) -> bool {
+        self.bad_ua || self.empty_ua
+    }
+
+    /// Several probe paths, or a probe among many misses: what a scan looks
+    /// like, and also what such a page can make a visitor's browser do.
+    fn probe_sweep(&self) -> bool {
         self.probe_hits > 0
-            && (self.bad_ua
-                || self.empty_ua
-                || self.probe_paths.len() >= PROBE_DISTINCT
+            && (self.probe_paths.len() >= PROBE_DISTINCT
                 || (self.err4xx >= PROBE_MISSES && self.distinct_paths() >= PROBE_MISSES as usize))
     }
 }
@@ -109,53 +122,45 @@ pub struct PatternHit {
     pub ttl_secs: u64,
     /// `false` for report-only patterns (e.g. xmlrpc pingback).
     pub ban: bool,
+    /// Counts as a strike and grows on the ladder. `false` when nothing in the
+    /// evidence is beyond what a web page can make a visitor's browser send:
+    /// that ban stays as short as `ttl_secs` however often it recurs, or a page
+    /// could keep its visitors out of this site for a week.
+    pub escalate: bool,
 }
 
 /// Evaluate the fixed patterns. A cycle covers roughly one timer interval of
 /// logs, so the plan's per-5-minute windows map onto a single cycle.
 #[must_use]
 pub fn evaluate(a: &IpAgg) -> Option<PatternHit> {
+    let hit = |reason, ttl_secs, ban, escalate| {
+        Some(PatternHit {
+            reason,
+            ttl_secs,
+            ban,
+            escalate,
+        })
+    };
     if a.login_posts + a.xmlrpc_posts > 10 {
-        return Some(PatternHit {
-            reason: "bruteforce",
-            ttl_secs: 3600,
-            ban: true,
-        });
+        return hit("bruteforce", 3600, true, true);
     }
-    if a.probe_corroborated() {
-        return Some(PatternHit {
-            reason: "probe",
-            ttl_secs: 86_400,
-            ban: true,
-        });
+    if a.probe_hits > 0 && a.non_browser() {
+        return hit("probe", 86_400, true, true);
     }
     if a.err404 > 30 && a.distinct_paths() > 20 {
-        return Some(PatternHit {
-            reason: "scanner",
-            ttl_secs: 1800,
-            ban: true,
-        });
+        return hit("scanner", 1800, true, a.non_browser());
     }
     if a.bad_ua || (a.empty_ua && a.requests > 50) {
-        return Some(PatternHit {
-            reason: "bad_ua",
-            ttl_secs: 86_400,
-            ban: true,
-        });
+        return hit("bad_ua", 86_400, true, true);
+    }
+    if a.probe_sweep() {
+        return hit("probe", PROBE_SWEEP_TTL, true, false);
     }
     if a.wp_pingback > 3 {
-        return Some(PatternHit {
-            reason: "xmlrpc_pingback",
-            ttl_secs: 0,
-            ban: false,
-        });
+        return hit("xmlrpc_pingback", 0, false, false);
     }
     if a.probe_hits > 0 && a.requests <= PROBE_REPORT_MAX {
-        return Some(PatternHit {
-            reason: "probe",
-            ttl_secs: 0,
-            ban: false,
-        });
+        return hit("probe", 0, false, false);
     }
     None
 }
@@ -262,24 +267,64 @@ mod tests {
             get(&mut a, "/.env", 404, ua);
             let hit = evaluate(&a).unwrap();
             assert_eq!((hit.reason, hit.ban, hit.ttl_secs), ("probe", true, 86_400));
+            assert!(hit.escalate, "{ua:?}");
         }
     }
 
     #[test]
-    fn several_probe_paths_or_many_misses_ban() {
+    fn a_browser_lured_into_a_probe_sweep_gets_only_a_short_fixed_ban() {
+        // What a page with a few <img> tags makes its visitor's browser send:
+        // three probe paths (or one, spelled three ways) and ten misses.
+        let lures: [&[&str]; 2] = [
+            &["/.env", "/.git/config", "/phpmyadmin/"],
+            &["/.env", "//.env", "/.ENV/", "/.env?x=1"],
+        ];
+        for lure in lures {
+            let mut a = IpAgg::default();
+            for p in lure {
+                get(&mut a, p, 404, BROWSER);
+            }
+            for i in 0..10 {
+                get(&mut a, &format!("/old{i}.php"), 404, BROWSER);
+            }
+            let hit = evaluate(&a).unwrap();
+            assert_eq!(hit.reason, "probe", "{lure:?}");
+            assert!(hit.ttl_secs <= 600, "{lure:?}: {}", hit.ttl_secs);
+            assert!(!hit.escalate, "{lure:?}");
+        }
+
+        // Three spellings of one path are one probe path, not a sweep.
         let mut a = IpAgg::default();
-        for p in ["/.env", "/.git/config", "/phpmyadmin/"] {
+        for p in ["/.env", "//.env", "/.ENV/"] {
             get(&mut a, p, 404, BROWSER);
         }
-        assert!(evaluate(&a).unwrap().ban);
+        assert!(!evaluate(&a).unwrap().ban);
 
+        // The same sweep with a tool's User-Agent is a day, on the ladder.
         let mut a = IpAgg::default();
-        get(&mut a, "/.env", 404, BROWSER);
-        for i in 0..10 {
-            get(&mut a, &format!("/old{i}.php"), 404, BROWSER);
+        for p in ["/.env", "/.git/config", "/phpmyadmin/"] {
+            get(&mut a, p, 404, "Mozilla/5.0 zgrab/0.x");
         }
         let hit = evaluate(&a).unwrap();
-        assert_eq!((hit.reason, hit.ban), ("probe", true));
+        assert_eq!((hit.ttl_secs, hit.escalate), (86_400, true));
+    }
+
+    #[test]
+    fn a_scan_from_a_browser_user_agent_does_not_escalate() {
+        let scan = |ua: &str| {
+            let mut a = IpAgg::default();
+            for i in 0..40 {
+                get(&mut a, &format!("/x{i}"), 404, ua);
+            }
+            evaluate(&a).unwrap()
+        };
+        let hit = scan(BROWSER);
+        assert_eq!(
+            (hit.reason, hit.ban, hit.escalate),
+            ("scanner", true, false)
+        );
+        assert!(hit.ttl_secs <= 3600);
+        assert!(scan("").escalate);
     }
 
     #[test]

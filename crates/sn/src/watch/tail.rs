@@ -55,18 +55,41 @@ fn owner_and_mode_ok(
     Ok(())
 }
 
+/// A log refused for what it is, not for an I/O error.
+#[derive(Debug)]
+struct Refused(String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// Why [`open_log`] refused a file, if that is what `e` says.
+pub(crate) fn refusal(e: &io::Error) -> Option<&str> {
+    e.get_ref()?.downcast_ref::<Refused>().map(|r| r.0.as_str())
+}
+
 /// Open a log only if it is what the web server writes. Never through a symlink
 /// (`O_NOFOLLOW`), never blocking on a FIFO swapped in after the glob matched
 /// (`O_NONBLOCK`, no effect on a regular file), and checked on the open handle,
 /// so a file a site's owner creates or swaps next to the real logs is refused.
+/// The error of a refusal names the reason (see [`refusal`]).
 pub(crate) fn open_log(path: &Path) -> io::Result<File> {
+    let refuse = |why: String| io::Error::new(io::ErrorKind::PermissionDenied, Refused(why));
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK | nix::libc::O_CLOEXEC)
-        .open(path)?;
+        .open(path)
+        .map_err(|e| match e.raw_os_error() {
+            Some(nix::libc::ELOOP) => refuse("a symbolic link".into()),
+            _ => e,
+        })?;
     let m = file.metadata()?;
     owner_and_mode_ok(m.is_file(), m.uid(), m.gid(), m.mode(), &allowed_owners())
-        .map_err(|why| io::Error::new(io::ErrorKind::PermissionDenied, why))?;
+        .map_err(refuse)?;
     Ok(file)
 }
 
@@ -282,21 +305,35 @@ mod tests {
         let real = dir.path().join("real.log");
         write(&real, "a\n");
 
+        // Each refusal says why, and is told apart from an I/O error.
         let link = dir.path().join("link_access.log");
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        assert!(read_new(&link, None, false, 1 << 20).is_err());
+        let err = read_new(&link, None, false, 1 << 20).err().unwrap();
+        assert_eq!(refusal(&err), Some("a symbolic link"), "{err}");
 
         // Opening a FIFO for reading would block until a writer comes.
         let fifo = dir.path().join("fifo_access.log");
         nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
         let err = read_new(&fifo, None, false, 1 << 20).err().unwrap();
-        assert!(err.to_string().contains("regular"), "{err}");
+        assert!(
+            refusal(&err).is_some_and(|w| w.contains("regular")),
+            "{err}"
+        );
 
         let open = dir.path().join("open_access.log");
         write(&open, "a\n");
         std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o646)).unwrap();
         let err = read_new(&open, None, false, 1 << 20).err().unwrap();
+        assert!(
+            refusal(&err).is_some_and(|w| w.contains("writable")),
+            "{err}"
+        );
         assert!(err.to_string().contains("writable"), "{err}");
+
+        let gone = dir.path().join("gone_access.log");
+        let err = read_new(&gone, None, false, 1 << 20).err().unwrap();
+        assert_eq!(refusal(&err), None, "{err}");
+        assert!(read_new(&real, None, false, 1 << 20).is_ok());
     }
 
     #[test]

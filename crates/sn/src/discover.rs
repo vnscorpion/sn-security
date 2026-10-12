@@ -43,16 +43,19 @@ impl Listener {
 // Usual access-log locations per server. A pattern only counts if it matches at
 // least one real access-log file (error logs and archives are filtered out).
 const NGINX: &[&str] = &[
-    "/var/log/nginx/domains/*.log", // DirectAdmin, HestiaCP, VestaCP
-    "/var/log/nginx/*access*.log",  // distro packages
-    "/www/wwwlogs/*.log",           // aaPanel
+    "/var/log/nginx/domains/*.log",     // DirectAdmin, HestiaCP, VestaCP
+    "/var/log/nginx/*access*.log",      // distro packages
+    "/www/wwwlogs/*.log",               // aaPanel
+    "/var/log/virtualmin/*_access_log", // Virtualmin
 ];
 const APACHE: &[&str] = &[
-    "/var/log/httpd/domains/*.log",  // DirectAdmin
-    "/var/log/httpd/*access_log",    // RHEL family
-    "/var/log/apache2/*access*.log", // Debian family
-    "/usr/local/apache/domlogs/*",   // cPanel
-    "/www/wwwlogs/*.log",            // aaPanel
+    "/var/log/httpd/domains/*.log",     // DirectAdmin
+    "/var/log/httpd/*access_log",       // RHEL family
+    "/var/log/apache2/*access*.log",    // Debian family
+    "/usr/local/apache/domlogs/*",      // cPanel
+    "/www/wwwlogs/*.log",               // aaPanel
+    "/var/log/virtualmin/*_access_log", // Virtualmin (~/logs links here)
+    "/home/*/logs/*access*log",         // other panels (see TENANT_AREA)
 ];
 const LITESPEED: &[&str] = &[
     "/var/log/openlitespeed/*access*.log", // OPanel: <domain>.access.log per website
@@ -398,18 +401,55 @@ mod tests {
                 .iter()
                 .any(|t| t.ends_with("/home/*/logs/*access*log"))
         );
+        // Apache looks there the same way (older layouts and other panels).
+        assert_eq!(globs(&discover(Listener::Apache, root)), globs(&d));
+
         // The source names that one file, so a file created there later is not
         // read before it has been checked.
         assert_eq!(crate::watch::expand_glob(&d.found[0].glob).len(), 1);
         touch(dir.path(), "home/example.com/logs/forged.access_log");
         assert_eq!(crate::watch::expand_glob(&d.found[0].glob).len(), 1);
 
-        // Apache does not look under /home at all.
-        assert!(
-            !candidate_globs(Listener::Apache)
-                .iter()
-                .any(|g| g.starts_with(TENANT_AREA))
-        );
+        // Never by the pattern, whatever the server.
+        for l in [Listener::Apache, Listener::LiteSpeed, Listener::Unknown] {
+            assert!(
+                candidate_globs(l)
+                    .iter()
+                    .filter(|g| g.contains("/home"))
+                    .all(|g| g.starts_with(TENANT_AREA)),
+                "{l:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn virtualmin_logs_are_read_where_the_server_writes_them() {
+        use std::os::unix::fs::symlink;
+        // Virtualmin: the server writes /var/log/virtualmin/<domain>_access_log
+        // and the site's ~/logs/access_log is a symlink to it.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let at = |rel: &str| dir.path().join(rel);
+        touch(dir.path(), "var/log/virtualmin/example.com_access_log");
+        touch(dir.path(), "var/log/virtualmin/example.com_error_log");
+        fs::create_dir_all(at("home/example/logs")).unwrap();
+        symlink(
+            at("var/log/virtualmin/example.com_access_log"),
+            at("home/example/logs/access_log"),
+        )
+        .unwrap();
+
+        for l in [Listener::Apache, Listener::Nginx, Listener::Unknown] {
+            let d = discover(l, root);
+            // Once, from where the server writes it; not again by the symlink.
+            assert_eq!(
+                globs(&d),
+                [format!("{root}/var/log/virtualmin/*_access_log")],
+                "{l:?}"
+            );
+            let files = crate::watch::expand_glob(&d.found[0].glob);
+            assert_eq!(files, [at("var/log/virtualmin/example.com_access_log")]);
+        }
     }
 
     #[test]

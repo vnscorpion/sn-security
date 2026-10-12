@@ -108,20 +108,24 @@ fn is_blank(b: u8) -> bool {
 }
 
 /// The next `"..."` field at or after the start of `s`: its contents and what
-/// follows the closing quote. A backslash escapes the next byte (Apache writes
-/// `\"` and `\\`; nginx writes `\x22` and never a raw backslash).
+/// follows the closing quote. A backslash escapes the next byte, before the
+/// field as inside it: Apache writes `\"` and `\\`, in the user field too;
+/// nginx writes `\x22` and `\x5C`, a backslash only ever before an `x`.
 fn quoted(s: &str) -> Option<(&str, &str)> {
-    let open = s.find('"')?;
     let b = s.as_bytes();
-    let mut j = open + 1;
-    while j < b.len() {
-        match b[j] {
-            b'\\' => j += 2,
-            b'"' => return Some((&s[open + 1..j], &s[j + 1..])),
-            _ => j += 1,
+    let unescaped_quote = |mut j: usize| {
+        while j < b.len() {
+            match b[j] {
+                b'\\' => j += 2,
+                b'"' => return Some(j),
+                _ => j += 1,
+            }
         }
-    }
-    None
+        None
+    };
+    let open = unescaped_quote(0)?;
+    let close = unescaped_quote(open + 1)?;
+    Some((&s[open + 1..close], &s[close + 1..]))
 }
 
 /// A quoted field that must come next, after blanks only.
@@ -151,9 +155,9 @@ fn http_status(s: &str) -> Option<u16> {
 /// Only the address is read by position from the start. The user field is
 /// whatever the client sent in `Authorization: Basic` (nginx logs it even where
 /// no auth is configured), spaces and brackets included, so neither it nor the
-/// time is taken to be one token. Both servers escape `"` inside fields, so the
-/// first quote opens the request; status and bytes follow it, then the referer
-/// and user agent as the next two quoted fields.
+/// time is taken to be one token. A `"` in it is escaped (nginx `\x22`, Apache
+/// `\"`), so the first unescaped quote opens the request; status and bytes
+/// follow it, then the referer and user agent as the next two quoted fields.
 fn parse_combined(line: &str) -> Option<LogLine> {
     let line = line.trim_start_matches([' ', '\t']);
     let ip_end = line.bytes().position(is_blank)?;
@@ -209,6 +213,15 @@ fn resolve_client(peer: IpAddr, cf: &str, xff: &str, trusted: &[Cidr]) -> IpAddr
         }
     }
     net::normalize(peer)
+}
+
+/// The address a line starts with (the TCP peer in `combined` and `sn`), for a
+/// line that does not parse: it is still a request from someone.
+#[must_use]
+pub fn leading_ip(line: &str) -> Option<IpAddr> {
+    let line = line.trim_start_matches([' ', '\t']);
+    let end = line.bytes().position(is_blank).unwrap_or(line.len());
+    line[..end].parse().ok().map(net::normalize)
 }
 
 /// Parse one line in the given format. `trusted` are proxy ranges used to
@@ -368,6 +381,46 @@ mod tests {
         assert_eq!(p.path, r#"/q\"x"#);
         assert_eq!(p.status, 200);
         assert_eq!(p.user_agent, r#"Mozilla \"evil\" 1.0"#);
+    }
+
+    #[test]
+    fn combined_apache_user_field_quotes_do_not_open_the_request() {
+        // mod_auth_basic sets the user from the Authorization header before the
+        // password is checked, and Apache logs a quote in it as \" and a
+        // backslash as \\. Neither opens the request.
+        for user in [
+            r#"a\""#,
+            r#"a\" 200 0 \"-\" \"x"#,
+            r#"\"GET /.env HTTP/1.1\" 200 0 \"-\" \"sqlmap\""#,
+            r"a\\",
+            r#"a\\\" b"#,
+            r#"\\\\"#,
+        ] {
+            let p = combined_with_user(user).unwrap_or_else(|| panic!("user {user:?}"));
+            assert_eq!(p.client.to_string(), "203.0.113.9", "user {user:?}");
+            assert_eq!(p.method, "POST", "user {user:?}");
+            assert_eq!(p.path, "/wp-login.php", "user {user:?}");
+            assert_eq!(p.status, 403, "user {user:?}");
+            assert_eq!(p.user_agent, "Mozilla/5.0 (X11)", "user {user:?}");
+        }
+    }
+
+    #[test]
+    fn leading_ip_is_the_first_token() {
+        let ip = |l: &str| leading_ip(l).map(|i| i.to_string());
+        assert_eq!(ip("203.0.113.9 - a\" [x] junk"), Some("203.0.113.9".into()));
+        assert_eq!(ip("  2001:db8::1\t- -"), Some("2001:db8::1".into()));
+        assert_eq!(ip("::ffff:198.51.100.7 x"), Some("198.51.100.7".into()));
+        assert_eq!(ip("203.0.113.9"), Some("203.0.113.9".into()));
+        for bad in [
+            "",
+            "-",
+            "{\"remote_addr\":\"1.2.3.4\"}",
+            "1.2.3.4x - -",
+            "host 1.2.3.4",
+        ] {
+            assert_eq!(ip(bad), None, "{bad:?}");
+        }
     }
 
     #[test]
