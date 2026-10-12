@@ -5,7 +5,7 @@
 
 Một binary Rust tĩnh (`sn`, ~3 MB) cấp cứu VPS Linux đang bị mã độc/traffic bẩn làm full CPU trong vài phút, rồi ở lại theo dõi traffic bằng systemd timer và báo về **hub trung tâm** (`snhub`) trên server của bạn. Không daemon nặng, không mở cổng trên VPS; phụ thuộc ngoài duy nhất của agent là `nftables` và cgroup (có sẵn trên mọi VPS hiện đại).
 
-> **Trạng thái: bản 0.3.x (nền tảng).** Phần lõi đã chạy và biên dịch tĩnh (musl) cho amd64 + arm64: cấp cứu (`triage`/`contain`/`hunt`/`clean`/`undo`), theo dõi (`watch` observe/enforce), và hub (enroll, nhận báo cáo, desired-state ký ed25519, giao diện web). Một số phần là **v1.1/v2** (xem [docs/ROADMAP.md](docs/ROADMAP.md)): AI judgment, MCP, ban qua Cloudflare API, self-update do hub điều khiển, baseline dạng histogram, CloudLinux/OLS đầy đủ. **Bắt buộc test trên VPS thật và chạy `observe` vài ngày trước khi bật `enforce`** — xem [docs/RUNBOOK.md](docs/RUNBOOK.md).
+> **Trạng thái: bản 0.4.x (nền tảng).** Phần lõi đã chạy và biên dịch tĩnh (musl) cho amd64 + arm64: cấp cứu (`triage`/`contain`/`hunt`/`clean`/`undo`), theo dõi (`watch` observe/enforce), và hub (enroll, nhận báo cáo, desired-state ký ed25519, giao diện web). Một số phần là **v1.1/v2** (xem [docs/ROADMAP.md](docs/ROADMAP.md)): AI judgment, MCP, ban qua Cloudflare API, self-update do hub điều khiển, baseline dạng histogram, CloudLinux/OLS đầy đủ. **Bắt buộc test trên VPS thật và chạy `observe` vài ngày trước khi bật `enforce`** — xem [docs/RUNBOOK.md](docs/RUNBOOK.md).
 
 ## Tính năng
 
@@ -29,7 +29,9 @@ Một binary Rust tĩnh (`sn`, ~3 MB) cấp cứu VPS Linux đang bị mã độ
 
 **Hub trung tâm (`snhub`)**
 - Enroll token dùng một lần; nhận báo cáo (kiểm chữ ký); giữ & ký desired-state.
-- Giao diện web tiếng Việt: tổng quan fleet (trạng thái, CPU, **RAM**, IP chặn, cảnh báo), chi tiết từng VPS (traffic, top IP, **danh sách IP đang bị chặn có lọc và phân trang**, triage, file nghi ngờ), nhật ký thao tác.
+- Giao diện web tiếng Việt: tổng quan fleet (trạng thái, CPU, **RAM**, IP chặn, cảnh báo), chi tiết từng VPS (traffic, top IP, **danh sách IP đang bị chặn có lọc, 10 IP mỗi trang**, triage, kết quả quét mã độc), nhật ký thao tác.
+- **Quét mã độc trên hub**: kết quả lần quét cuối (số file đã quét, độc hại/nghi ngờ), danh sách file **10 mỗi trang**, **tải CSV** (tất cả) hoặc **`.txt`** (đường dẫn file độc hại) — xem [Quét mã độc](#quét-mã-độc).
+- **Bot phân tán và CPU**: bảng User-Agent / kiểu request nhiều nhất (số lượt, số IP khác nhau), cảnh báo khi một mục tăng vọt từ nhiều IP, **luật ModSecurity gợi ý** để dán (hub không tự ghi), bảng "Ai đang dùng CPU" — xem [Bot phân tán và CPU cao](#bot-phân-tán-và-cpu-cao).
 - **Ô "Tra cứu IP"** trên thanh đầu trang: một IP đang truy cập/bị chặn ở VPS nào, lịch sử thao tác, nút chặn/gỡ chặn.
 - Nhận biết agent cũ (nhãn "cũ") và hiện sẵn lệnh cập nhật.
 - **Điều khiển từ xa**: ban/unban, đổi observe↔enforce, **chạy hunt**, **undo** — áp ở chu kỳ kế (xem [Điều khiển từ hub](#điều-khiển-từ-hub)).
@@ -119,6 +121,11 @@ curl -fsSL https://HUB/install.sh | sudo sh -s -- --hub https://HUB --upgrade
 (`HUB` = địa chỉ hub của bạn. Trang VPS trên hub cũng hiện sẵn lệnh này khi agent cũ hơn hub.) Quay lại bản cũ nếu cần: `cp /usr/local/bin/sn.bak /usr/local/bin/sn`.
 
 Trên hub, cột "Bản sn" ở Tổng quan có nhãn **"cũ"** cạnh agent chưa cập nhật.
+
+> **Lệnh báo "checksum FAILED" ngay sau khi vừa có bản mới?** `raw.githubusercontent.com` lưu đệm vài phút nên có thể trả `SHA256SUMS` cũ lẫn với binary mới. Đợi vài phút rồi chạy lại, hoặc cố định theo commit (thay `COMMIT` bằng mã commit của bản cần cài):
+> ```sh
+> curl -fsSL https://raw.githubusercontent.com/vnscorpion/sn-security/COMMIT/deploy/update-hub.sh | sudo bash -s -- --repo-raw https://raw.githubusercontent.com/vnscorpion/sn-security/COMMIT
+> ```
 
 ## Kiểm tra nhanh trên VPS
 
