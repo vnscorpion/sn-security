@@ -19,6 +19,11 @@ use snsec_common::schema::{DesiredRef, Mode};
 /// Max bytes of queued reports to keep before dropping the oldest.
 const QUEUE_CAP_BYTES: u64 = 50 * 1024 * 1024;
 
+/// The sandboxed malware scan's own state directory, inside this one: the only
+/// place that scan may write. A watch cycle takes its results in from there
+/// (see `hub::import_scan`).
+pub const SCAN_DIR: &str = "hunt";
+
 #[derive(Debug, Clone)]
 pub struct State {
     pub dir: PathBuf,
@@ -53,6 +58,12 @@ pub struct Meta {
     /// Id of the remediation result the hub already has.
     #[serde(default)]
     pub last_remediation_sent: String,
+    /// Time the last desired-state pull the hub answered was signed at. The
+    /// hub takes each pull only if it is signed later than the one before, so a
+    /// copied request reads nothing; this keeps that true when the clock steps
+    /// back.
+    #[serde(default)]
+    pub last_pull_ts: i64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -187,6 +198,22 @@ impl State {
 
     fn p(&self, name: &str) -> PathBuf {
         self.dir.join(name)
+    }
+
+    /// Write `name` in the state directory atomically, readable by root only.
+    pub fn save_file(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        atomic_write(&self.p(name), bytes)
+    }
+
+    /// The sandboxed scan's directory, created (0700) if it is missing.
+    pub fn scan_dir(&self) -> Result<PathBuf> {
+        let dir = self.p(SCAN_DIR);
+        match fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e).with_context(|| format!("creating {}", dir.display())),
+        }
+        Ok(dir)
     }
 
     // ---- meta -------------------------------------------------------------
@@ -422,6 +449,32 @@ mod tests {
             let mode = fs::metadata(&f).unwrap().mode() & 0o777;
             assert_eq!(mode, 0o600, "{}", f.display());
         }
+    }
+
+    #[test]
+    fn the_scan_dir_and_saved_files_are_private() {
+        let (_g, s) = tmp_state();
+        let dir = s.scan_dir().unwrap();
+        assert_eq!(dir, s.dir.join(SCAN_DIR));
+        assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o7777, 0o700);
+        // Again: already there is fine.
+        assert_eq!(s.scan_dir().unwrap(), dir);
+        s.save_file("hunt.toml", b"[hunt]\n").unwrap();
+        let f = s.dir.join("hunt.toml");
+        assert_eq!(fs::read(&f).unwrap(), b"[hunt]\n");
+        assert_eq!(fs::metadata(&f).unwrap().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn a_meta_file_from_before_signed_pulls_still_loads() {
+        let (_g, s) = tmp_state();
+        fs::write(
+            s.dir.join("meta.json"),
+            br#"{"epoch":1,"next_report_seq":9,"applied_desired":{"epoch":1,"seq":3},"last_desired":{"epoch":1,"seq":3}}"#,
+        )
+        .unwrap();
+        let m = s.meta();
+        assert_eq!((m.next_report_seq, m.last_pull_ts), (9, 0));
     }
 
     #[test]

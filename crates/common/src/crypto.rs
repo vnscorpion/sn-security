@@ -149,7 +149,9 @@ pub fn verify_detached(
 
 /// How far the time an agent signed its pull at may be from the hub's clock.
 /// Wide on purpose: the pull only reads, and a VPS whose clock drifts must not
-/// lose its orders (envelopes carry no such window, see REVIEW SEC-4).
+/// lose its orders (envelopes carry no such window, see REVIEW SEC-4). A copied
+/// pull is refused by the hub another way: each one must be signed later than
+/// the last it took from that agent.
 pub const DESIRED_PULL_WINDOW_SECS: u64 = 24 * 3600;
 
 /// The exact bytes an agent signs to fetch its desired state. The text prefix

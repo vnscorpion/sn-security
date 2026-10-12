@@ -72,17 +72,94 @@ install_binary() {
   echo ">> installed $(/usr/local/bin/sn --version)"
 }
 
+# The two service units. A fresh install writes them and so does --upgrade: a
+# newer agent can need a tighter sandbox than the unit on disk, and the agent
+# cannot rewrite its own units. A test keeps them in step with deploy/systemd
+# and with the scan sandbox in the binary.
+write_service_units() {
+  # The malware scan's own directory, the only place it may write.
+  ( umask 077; mkdir -p /var/lib/sn/hunt )
+  cat > /etc/systemd/system/sn-watch.service <<'EOF'
+[Unit]
+Description=SN Secure traffic watch (one cycle)
+After=network.target nftables.service
+Wants=nftables.service
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/sn watch
+Nice=-5
+IOSchedulingClass=best-effort
+TimeoutStartSec=90
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/sn
+ReadOnlyPaths=/etc/sn
+PrivateTmp=yes
+UMask=0077
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_READ_SEARCH CAP_SYS_PTRACE CAP_SYS_NICE CAP_KILL
+MemoryMax=192M
+[Install]
+WantedBy=multi-user.target
+EOF
+  cat > /etc/systemd/system/sn-hunt.service <<'EOF'
+[Unit]
+Description=SN Secure daily PHP web-shell hunt
+After=network.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/sn hunt --days 1
+Nice=15
+IOSchedulingClass=idle
+CPUQuota=40%
+TimeoutStartSec=30min
+NoNewPrivileges=yes
+ProtectSystem=strict
+Environment=SN_STATE_DIR=/var/lib/sn/hunt
+ReadWritePaths=/var/lib/sn/hunt
+PrivateTmp=yes
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+UMask=0077
+InaccessiblePaths=-/run/dbus/system_bus_socket
+InaccessiblePaths=-/run/systemd/private
+InaccessiblePaths=-/run/user
+InaccessiblePaths=-/run/snapd.socket
+InaccessiblePaths=-/run/docker.sock
+InaccessiblePaths=-/run/containerd
+InaccessiblePaths=-/run/podman
+InaccessiblePaths=-/run/libvirt
+TemporaryFileSystem=/run:ro
+BindReadOnlyPaths=-/run/clamav
+BindReadOnlyPaths=-/run/clamd.scan
+TemporaryFileSystem=/etc/sn:ro
+BindReadOnlyPaths=-/var/lib/sn/hunt.toml:/etc/sn/agent.toml
+PrivateNetwork=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+RestrictSUIDSGID=yes
+MemoryMax=2G
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
 # --upgrade: replace the binary. Config, enrollment and timers are kept; the timers
-# start the new binary on their next run, so no restart is needed. Small
-# adjustments: the daily scan unit gets room for clamscan (it loads a >1 GB
-# database), and the per-order `allow_*` switches of older versions are removed
-# from the config (the hub decides now; see `[remote] hub_orders`).
+# start the new binary on their next run, so no restart is needed. The two
+# service units are written again (the scan's sandbox and memory cap, the
+# private umask), and the per-order `allow_*` switches of older versions are
+# removed from the config (the hub decides now; see `[remote] hub_orders`).
 if [ "$UPGRADE" -eq 1 ]; then
   install_binary
-  if [ -f /etc/systemd/system/sn-hunt.service ] && grep -q '^MemoryMax=256M' /etc/systemd/system/sn-hunt.service; then
-    sed -i 's/^MemoryMax=256M$/MemoryMax=2G/' /etc/systemd/system/sn-hunt.service
+  if [ -d /etc/systemd/system ]; then
+    write_service_units
     systemctl daemon-reload || true
-    echo ">> sn-hunt.service: memory cap raised to 2G (for ClamAV)"
+    echo ">> sn-watch.service, sn-hunt.service rewritten (keep local changes in a drop-in: systemctl edit)"
   fi
   # Older configs carry one switch per order type, all off. They no longer do
   # anything; drop them so nobody reads them as a setting that still applies.
@@ -170,30 +247,7 @@ echo ">> enrolling with hub"
 
 # --- systemd units -----------------------------------------------------------
 echo ">> installing systemd timers"
-cat > /etc/systemd/system/sn-watch.service <<'EOF'
-[Unit]
-Description=SN Secure traffic watch (one cycle)
-After=network.target nftables.service
-Wants=nftables.service
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/sn watch
-Nice=-5
-IOSchedulingClass=best-effort
-TimeoutStartSec=90
-NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=/var/lib/sn
-ReadOnlyPaths=/etc/sn
-PrivateTmp=yes
-UMask=0077
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_READ_SEARCH CAP_SYS_PTRACE CAP_SYS_NICE CAP_KILL
-MemoryMax=192M
-[Install]
-WantedBy=multi-user.target
-EOF
+write_service_units
 
 cat > /etc/systemd/system/sn-watch.timer <<'EOF'
 [Unit]
@@ -205,40 +259,6 @@ RandomizedDelaySec=30
 AccuracySec=15s
 [Install]
 WantedBy=timers.target
-EOF
-
-cat > /etc/systemd/system/sn-hunt.service <<'EOF'
-[Unit]
-Description=SN Secure daily PHP web-shell hunt
-After=network.target
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/sn hunt --days 1
-Nice=15
-IOSchedulingClass=idle
-CPUQuota=40%
-TimeoutStartSec=30min
-NoNewPrivileges=yes
-ProtectSystem=strict
-ReadWritePaths=/var/lib/sn
-ReadOnlyPaths=/etc/sn
-PrivateTmp=yes
-CapabilityBoundingSet=CAP_DAC_READ_SEARCH
-UMask=0077
-InaccessiblePaths=-/run/dbus/system_bus_socket
-InaccessiblePaths=-/run/systemd/private
-PrivateNetwork=yes
-PrivateDevices=yes
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectControlGroups=yes
-RestrictNamespaces=yes
-SystemCallFilter=@system-service
-SystemCallErrorNumber=EPERM
-RestrictSUIDSGID=yes
-MemoryMax=2G
-[Install]
-WantedBy=multi-user.target
 EOF
 
 cat > /etc/systemd/system/sn-hunt.timer <<'EOF'

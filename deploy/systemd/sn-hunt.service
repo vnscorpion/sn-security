@@ -15,18 +15,35 @@ TimeoutStartSec=30min
 
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=/var/lib/sn
-ReadOnlyPaths=/etc/sn
+# It runs ClamAV's parsers over files users control, as root. So it writes
+# only a directory of its own, never what root acts on in /var/lib/sn (undo
+# records, orders, evidence); `sn watch` checks its results before taking
+# them in. The hub-started scan (hub.rs HUNT_SANDBOX) has the same lines; a
+# test keeps them in step.
+Environment=SN_STATE_DIR=/var/lib/sn/hunt
+ReadWritePaths=/var/lib/sn/hunt
 PrivateTmp=yes
 # Hunt only reads files; it needs to traverse all users' webroots.
 CapabilityBoundingSet=CAP_DAC_READ_SEARCH
 UMask=0077
-# It runs ClamAV's parsers over files users control, as root: no way to ask
-# systemd for an unconfined unit, no network (clamd's unix socket still
-# works), no devices or kernel knobs. The hub-started scan (hub.rs
-# HUNT_SANDBOX) has the same lines; a test keeps them in step.
+# No socket where uid 0 gets code run for it (systemd, root's user manager,
+# snapd, container and VM daemons). From systemd 238 /run is empty but for
+# clamd's socket directories; a private network leaves unix sockets alone.
 InaccessiblePaths=-/run/dbus/system_bus_socket
 InaccessiblePaths=-/run/systemd/private
+InaccessiblePaths=-/run/user
+InaccessiblePaths=-/run/snapd.socket
+InaccessiblePaths=-/run/docker.sock
+InaccessiblePaths=-/run/containerd
+InaccessiblePaths=-/run/podman
+InaccessiblePaths=-/run/libvirt
+TemporaryFileSystem=/run:ro
+BindReadOnlyPaths=-/run/clamav
+BindReadOnlyPaths=-/run/clamd.scan
+# agent.toml holds the agent's key: the scan sees only the [hunt] settings,
+# which `sn watch` copies to /var/lib/sn/hunt.toml.
+TemporaryFileSystem=/etc/sn:ro
+BindReadOnlyPaths=-/var/lib/sn/hunt.toml:/etc/sn/agent.toml
 PrivateNetwork=yes
 PrivateDevices=yes
 ProtectKernelTunables=yes

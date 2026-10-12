@@ -13,7 +13,7 @@ use snsec_common::schema::{
     Signed,
 };
 
-use super::{DesiredQuery, get_desired, now, pull_allowed};
+use super::{DesiredQuery, Pull, check_pull, get_desired, now, pull_agent, record_pull};
 use crate::AppState;
 use crate::db::Db;
 
@@ -69,30 +69,93 @@ fn unsigned() -> HeaderMap {
     HeaderMap::new()
 }
 
+/// Check and take a pull, the way `get_desired` does.
+fn pull_allowed(db: &Db, q: &DesiredQuery, headers: &HeaderMap, now: i64) -> bool {
+    check_pull(pull_agent(db, &q.agent_id).as_ref(), q, headers, now)
+        .is_some_and(|p| record_pull(db, &q.agent_id, p))
+}
+
 #[test]
 fn an_agent_that_predates_signing_still_gets_its_orders_unsigned() {
     let db = db();
     let a = enroll(&db, "web-01");
     // Freshly enrolled, no report yet.
     assert!(pull_allowed(&db, &query(&a.id, 0, 0), &unsigned(), now()));
-    // An older agent's report: no `signed_desired`.
+    // An older agent's report.
     report(&db, &a, 1, &["triage", "hunt"]);
+    assert!(pull_allowed(&db, &query(&a.id, 0, 0), &unsigned(), now()));
     assert!(pull_allowed(&db, &query(&a.id, 0, 0), &unsigned(), now()));
 }
 
 #[test]
-fn once_an_agent_says_it_signs_an_unsigned_pull_is_refused() {
+fn once_an_agent_signed_a_pull_an_unsigned_one_is_refused() {
+    let db = db();
+    let a = enroll(&db, "web-01");
+    let t = now();
+    let q = query(&a.id, 1, 1);
+    assert!(pull_allowed(&db, &q, &signed(&a.sk, &a.id, 1, 1, t), t));
+    assert!(!pull_allowed(&db, &q, &unsigned(), t));
+    // Whatever its reports say afterwards: only the agent's key can sign, and a
+    // binary rolled back past signing must be upgraded again, not trusted.
+    report(&db, &a, 1, &["triage"]);
+    assert!(!pull_allowed(&db, &q, &unsigned(), t));
+    assert!(pull_allowed(&db, &q, &signed(&a.sk, &a.id, 1, 1, t + 1), t));
+}
+
+#[test]
+fn the_decision_never_reads_the_agents_reports() {
+    // Reports are large and slow to parse, and a stranger could make the hub do
+    // it at will (and time it). What counts is the first signed pull, which an
+    // agent that signs makes before its first report.
     let db = db();
     let a = enroll(&db, "web-01");
     report(&db, &a, 1, &["triage", CAP_SIGNED_DESIRED]);
-    let q = query(&a.id, 1, 1);
-    assert!(!pull_allowed(&db, &q, &unsigned(), now()));
-    assert!(pull_allowed(
+    assert!(pull_allowed(&db, &query(&a.id, 0, 0), &unsigned(), now()));
+}
+
+#[test]
+fn a_copied_signed_pull_reads_nothing() {
+    let db = db();
+    let a = enroll(&db, "web-01");
+    let t = now();
+    let q = query(&a.id, 1, 4);
+    let h = signed(&a.sk, &a.id, 1, 4, t);
+    assert!(pull_allowed(&db, &q, &h, t));
+    // The same headers again (an access log, a proxy): refused, now and later.
+    assert!(!pull_allowed(&db, &q, &h, t));
+    assert!(!pull_allowed(&db, &q, &h, t + 600));
+    // An older one too, even for another (epoch, seq).
+    assert!(!pull_allowed(
         &db,
-        &q,
-        &signed(&a.sk, &a.id, 1, 1, now()),
-        now()
+        &query(&a.id, 1, 3),
+        &signed(&a.sk, &a.id, 1, 3, t - 300),
+        t
     ));
+    // The agent's next pull is signed later, and goes through.
+    assert!(pull_allowed(&db, &q, &signed(&a.sk, &a.id, 1, 4, t + 1), t));
+}
+
+#[test]
+fn two_pulls_checked_at_once_are_taken_once() {
+    // Both pass the check before either is recorded: only the first is taken.
+    let db = db();
+    let a = enroll(&db, "web-01");
+    let t = now();
+    let q = query(&a.id, 0, 0);
+    let h = signed(&a.sk, &a.id, 0, 0, t);
+    let first = check_pull(pull_agent(&db, &a.id).as_ref(), &q, &h, t);
+    let second = check_pull(pull_agent(&db, &a.id).as_ref(), &q, &h, t);
+    assert_eq!(first, Some(Pull::Signed(t)));
+    assert_eq!(second, first);
+    assert!(record_pull(&db, &a.id, first.unwrap()));
+    assert!(!record_pull(&db, &a.id, second.unwrap()));
+    // And an unsigned pull checked before the first signed one came in.
+    let b = enroll(&db, "web-02");
+    let q = query(&b.id, 0, 0);
+    let old = check_pull(pull_agent(&db, &b.id).as_ref(), &q, &unsigned(), t);
+    assert_eq!(old, Some(Pull::Unsigned));
+    assert!(pull_allowed(&db, &q, &signed(&b.sk, &b.id, 0, 0, t), t));
+    assert!(!record_pull(&db, &b.id, old.unwrap()));
 }
 
 #[test]
@@ -120,6 +183,8 @@ fn a_bad_or_half_signature_is_refused_even_for_an_agent_that_never_signed() {
     let mut h = full.clone();
     h.insert(HDR_PULL_TS, HeaderValue::from_static("soon"));
     assert!(!pull_allowed(&db, &q, &h, t));
+    // None of these counted as a signed pull: unsigned still works.
+    assert!(pull_allowed(&db, &q, &unsigned(), t));
     assert!(pull_allowed(&db, &q, &full, t));
 }
 
@@ -128,7 +193,6 @@ fn a_signature_covers_the_query_and_allows_a_day_of_clock_skew() {
     let db = db();
     let a = enroll(&db, "web-01");
     let b = enroll(&db, "web-02");
-    report(&db, &a, 1, &[CAP_SIGNED_DESIRED]);
     let t = now();
     // Signed for another (epoch, seq), or by another agent for this one's id.
     assert!(!pull_allowed(
@@ -151,29 +215,18 @@ fn a_signature_covers_the_query_and_allows_a_day_of_clock_skew() {
     ));
     // A VPS clock a few hours off still works; one more than a day off does not.
     let q = query(&a.id, 1, 1);
-    for ts in [t - 23 * 3600, t + 23 * 3600] {
-        assert!(
-            pull_allowed(&db, &q, &signed(&a.sk, &a.id, 1, 1, ts), t),
-            "{ts}"
-        );
-    }
     for ts in [t - 25 * 3600, t + 25 * 3600] {
         assert!(
             !pull_allowed(&db, &q, &signed(&a.sk, &a.id, 1, 1, ts), t),
             "{ts}"
         );
     }
-}
-
-#[test]
-fn an_agent_rolled_back_to_an_older_binary_is_answered_after_its_next_report() {
-    let db = db();
-    let a = enroll(&db, "web-01");
-    report(&db, &a, 1, &[CAP_SIGNED_DESIRED]);
-    assert!(!pull_allowed(&db, &query(&a.id, 0, 0), &unsigned(), now()));
-    // `sn.bak` restored: its report no longer lists the capability.
-    report(&db, &a, 2, &["triage"]);
-    assert!(pull_allowed(&db, &query(&a.id, 0, 0), &unsigned(), now()));
+    for ts in [t - 23 * 3600, t + 23 * 3600] {
+        assert!(
+            pull_allowed(&db, &q, &signed(&a.sk, &a.id, 1, 1, ts), t),
+            "{ts}"
+        );
+    }
 }
 
 #[test]
@@ -213,22 +266,32 @@ async fn pull(st: &Arc<AppState>, q: DesiredQuery, headers: HeaderMap) -> (Statu
 }
 
 #[tokio::test]
-async fn an_unknown_id_and_a_bad_signature_get_the_same_answer() {
+async fn an_unknown_id_and_a_bad_or_copied_signature_get_the_same_answer() {
     let st = app(db());
     let (a, legacy) = {
         let db = st.db.lock().unwrap();
-        let a = enroll(&db, "web-01");
-        report(&db, &a, 1, &[CAP_SIGNED_DESIRED]);
-        (a, enroll(&db, "web-02"))
+        (enroll(&db, "web-01"), enroll(&db, "web-02"))
     };
     let t = now();
     let stranger = SigningKey::generate(&mut OsRng);
 
+    // The agent itself gets its desired state, signed by the hub and for it.
+    let first = signed(&a.sk, &a.id, 0, 0, t);
+    let (status, body) = pull(&st, query(&a.id, 0, 0), first.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    let s: Signed = serde_json::from_slice(&body).unwrap();
+    let env: Envelope<DesiredBody> =
+        crypto::open(&[st.hubkey.signing.verifying_key()], &s, t).unwrap();
+    assert_eq!(env.agent_id, a.id);
+
     let unknown = pull(&st, query("web-01-000000", 0, 0), unsigned()).await;
     assert_eq!(unknown.0, StatusCode::NOT_FOUND);
     for (q, h) in [
+        // It signs now, so an unsigned pull is not from it.
         (query(&a.id, 0, 0), unsigned()),
-        (query(&a.id, 0, 0), signed(&stranger, &a.id, 0, 0, t)),
+        (query(&a.id, 0, 0), signed(&stranger, &a.id, 0, 0, t + 1)),
+        // Its own earlier request, replayed.
+        (query(&a.id, 0, 0), first),
         (
             query(&legacy.id, 0, 0),
             signed(&stranger, &legacy.id, 0, 0, t),
@@ -241,20 +304,12 @@ async fn an_unknown_id_and_a_bad_signature_get_the_same_answer() {
         assert_eq!(pull(&st, q, h).await, unknown);
     }
 
-    // The agent itself gets its desired state, signed by the hub and for it.
-    let (status, body) = pull(&st, query(&a.id, 0, 0), signed(&a.sk, &a.id, 0, 0, t)).await;
-    assert_eq!(status, StatusCode::OK);
-    let s: Signed = serde_json::from_slice(&body).unwrap();
-    let env: Envelope<DesiredBody> =
-        crypto::open(&[st.hubkey.signing.verifying_key()], &s, t).unwrap();
-    assert_eq!(env.agent_id, a.id);
-
-    // "Nothing new" is an answer too, so it also needs the signature.
+    // "Nothing new" is an answer too, so it also needs a fresh signature.
     let (epoch, seq) = (env.epoch, env.seq);
     let current = pull(
         &st,
         query(&a.id, epoch, seq),
-        signed(&a.sk, &a.id, epoch, seq, t),
+        signed(&a.sk, &a.id, epoch, seq, t + 1),
     )
     .await;
     assert_eq!(current.0, StatusCode::NOT_MODIFIED);

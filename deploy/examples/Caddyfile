@@ -42,6 +42,13 @@ sec.sgd.ovh {
 
 	log {
 		output file /var/log/caddy/sec.sgd.ovh.log
-		format console
+		# An agent's pull signature reads nothing once the hub has taken it,
+		# but it has no business in a log file either.
+		format filter {
+			wrap console
+			fields {
+				request>headers>X-Sn-Sig delete
+			}
+		}
 	}
 }
