@@ -10,7 +10,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use snsec_common::crypto;
 use snsec_common::schema::{
     ActiveBanInfo, BanEvent, CycleStats, DesiredBody, DesiredRef, Envelope, Finding, HostInfo,
-    HuntSummary, Mode, ReportBody, Signed, TriageSummary,
+    HuntSummary, ReportBody, Signed, TriageSummary,
 };
 use snsec_common::{AGENT_VERSION, SCHEMA_VERSION};
 
@@ -35,10 +35,8 @@ fn capabilities(cfg: &Config) -> Vec<String> {
     .collect();
     // Listed only when this VPS allows them, so the hub offers the AI features
     // exactly where they will work. An agent that predates them lists neither.
-    if cfg.remote.allow_evidence {
+    if cfg.remote.hub_orders {
         caps.push("evidence".into());
-    }
-    if cfg.remote.allow_remediate {
         caps.push("remediate".into());
     }
     caps
@@ -536,6 +534,12 @@ fn fetch_and_apply_desired_unlocked(cfg: &Config, state: &State) -> Result<()> {
 }
 
 fn apply_desired(cfg: &Config, state: &State, d: &DesiredBody) -> Result<()> {
+    // The one local switch: a VPS with `[remote] hub_orders = false` only reports.
+    // Otherwise the hub decides (bans, mode, scans, undo, evidence, ClamAV, orders).
+    if !cfg.remote.hub_orders {
+        eprintln!("hub: orders ignored on this VPS ([remote] hub_orders = false)");
+        return Ok(());
+    }
     // Hard local bounds (SEC-2): the hub can never exceed these.
     let _timer = d.timer_interval_secs.clamp(300, 900);
 
@@ -604,43 +608,22 @@ fn apply_desired(cfg: &Config, state: &State, d: &DesiredBody) -> Result<()> {
             anyhow::bail!("policy signature invalid (not signed by a configured root key)");
         } else {
             // Signature valid; apply only the mode de-escalation here for v1.
-            if cfg.remote.allow_mode_observe {
+            if cfg.remote.hub_orders {
                 eprintln!("hub: root policy accepted (mode/patterns application is v1.1)");
             }
         }
     }
 
-    // Mode: escalation (observe -> enforce) is always honoured; de-escalation
-    // (enforce -> observe) is gated behind `[remote] allow_mode_observe` so a
-    // compromised hub cannot silently disable protection fleet-wide (SEC-2).
-    // The effective mode is stored as an override that `watch` reads.
+    // Mode: the hub decides, both ways. The effective mode is stored as an
+    // override that `watch` reads. (A VPS that must not obey the hub at all sets
+    // `[remote] hub_orders = false`, which returns before this point.)
     {
         let mut meta = state.meta();
         let current = meta.mode_override.unwrap_or(cfg.watch.mode);
-        match d.mode {
-            Mode::Enforce => {
-                if current != Mode::Enforce {
-                    meta.mode_override = Some(Mode::Enforce);
-                    state.save_meta(&meta)?;
-                    eprintln!("hub: mode -> enforce (from hub)");
-                }
-            }
-            Mode::Observe => {
-                if current == Mode::Enforce {
-                    if cfg.remote.allow_mode_observe {
-                        meta.mode_override = Some(Mode::Observe);
-                        state.save_meta(&meta)?;
-                        eprintln!("hub: mode -> observe (allow_mode_observe)");
-                    } else {
-                        eprintln!(
-                            "hub: ignoring observe request (set [remote] allow_mode_observe=true, or run `sn disable` locally)"
-                        );
-                    }
-                } else {
-                    meta.mode_override = Some(Mode::Observe);
-                    state.save_meta(&meta)?;
-                }
-            }
+        if d.mode != current {
+            meta.mode_override = Some(d.mode);
+            state.save_meta(&meta)?;
+            eprintln!("hub: mode -> {} (from hub)", d.mode.as_str());
         }
     }
 
@@ -681,23 +664,23 @@ fn run_job(cfg: &Config, state: &State, job: &snsec_common::schema::Job) {
             }
         }
         Job::Undo => {
-            if cfg.remote.allow_undo {
+            if cfg.remote.hub_orders {
                 match crate::undo::run_all(&state.dir) {
                     Ok(n) => eprintln!("hub: undo reversed {n} action(s)"),
                     Err(e) => eprintln!("hub: undo failed: {e:#}"),
                 }
             } else {
-                eprintln!("hub: ignoring undo job (set [remote] allow_undo=true to permit)");
+                eprintln!("hub: ignoring undo job ([remote] hub_orders = false on this VPS)");
             }
         }
         Job::InstallClamav => {
-            if !cfg.remote.allow_install_clamav {
+            if !cfg.remote.hub_orders {
                 eprintln!(
-                    "hub: ignoring install_clamav job (set [remote] allow_install_clamav=true to permit)"
+                    "hub: ignoring install_clamav job ([remote] hub_orders = false on this VPS)"
                 );
                 crate::clamav_run::record_order(
                     state,
-                    "bỏ qua: VPS này chưa cho phép hub cài ([remote] allow_install_clamav = true)",
+                    "bỏ qua: VPS này đang tắt lệnh từ hub ([remote] hub_orders = false trong agent.toml)",
                 );
                 return;
             }
@@ -735,8 +718,8 @@ fn run_job(cfg: &Config, state: &State, job: &snsec_common::schema::Job) {
             }
         }
         Job::Evidence => {
-            if !cfg.remote.allow_evidence {
-                eprintln!("hub: ignoring evidence job (set [remote] allow_evidence=true)");
+            if !cfg.remote.hub_orders {
+                eprintln!("hub: ignoring evidence job ([remote] hub_orders = false on this VPS)");
                 return;
             }
             match std::process::Command::new("systemd-run")
@@ -749,10 +732,8 @@ fn run_job(cfg: &Config, state: &State, job: &snsec_common::schema::Job) {
             }
         }
         Job::Remediate { id, actions } => {
-            if !cfg.remote.allow_remediate {
-                eprintln!(
-                    "hub: ignoring remediate job (set [remote] allow_remediate=true to permit)"
-                );
+            if !cfg.remote.hub_orders {
+                eprintln!("hub: ignoring remediate job ([remote] hub_orders = false on this VPS)");
                 return;
             }
             if !crate::remediate::is_valid_job_id(id) {

@@ -136,7 +136,7 @@ pub struct ClamavInfo {
     /// This OS has an automatic install recipe.
     #[serde(default)]
     pub can_install: bool,
-    /// `[remote] allow_install_clamav` is on, so the hub's install job will run.
+    /// The VPS obeys hub orders (`[remote] hub_orders`), so the install job will run.
     #[serde(default)]
     pub install_allowed: bool,
     /// `[hunt] clamav = "off"`: installed or not, hunts do not use it.
@@ -421,7 +421,7 @@ pub enum Job {
         path: String,
     },
     /// Install ClamAV with the OS's package manager. Only honoured when the VPS
-    /// opted in with `[remote] allow_install_clamav`. An agent that predates this
+    /// obeys hub orders (`[remote] hub_orders`). An agent that predates this
     /// variant cannot parse a desired-state containing it, so the hub must send
     /// it only to agents that report the `clamav` capability.
     InstallClamav,
@@ -429,7 +429,7 @@ pub enum Job {
     /// Read-only. Only for agents that report the `evidence` capability.
     Evidence,
     /// Carry out a short list of [`Action`]s about an incident. Only honoured
-    /// when the VPS opted in with `[remote] allow_remediate`, and only for agents
+    /// when the VPS obeys hub orders (`[remote] hub_orders`), and only for agents
     /// that report the `remediate` capability.
     Remediate {
         id: String,

@@ -263,15 +263,8 @@ fn knows_clamav(r: &ReportBody) -> bool {
 }
 
 /// ClamAV status for the "Quét mã độc" card, with the install button when it can
-/// work. `hub` is the hub's public address, for the command that lets the VPS
-/// accept the install.
-fn clamav_block(
-    agent_id: &str,
-    hub: &str,
-    r: &ReportBody,
-    flash: &str,
-    install_pending: bool,
-) -> Markup {
+/// work.
+fn clamav_block(agent_id: &str, r: &ReportBody, flash: &str, install_pending: bool) -> Markup {
     html! {
         div class="note" style="margin:0 0 12px" {
             @if !flash.is_empty() {
@@ -310,8 +303,7 @@ fn clamav_block(
                         }
                     } @else if c.can_install {
                         p class="help" style="margin:8px 0 0" {
-                            "VPS này chưa cho phép hub cài phần mềm (mặc định tắt vì nó chạy trình quản lý gói bằng root). Để bật, chạy trên VPS bằng root:"
-                            pre style="margin:8px 0 0" { "curl -fsSL " (hub) "/install.sh | sudo sh -s -- --hub " (hub) " --upgrade --allow-clamav-install" }
+                            "VPS này đang tắt lệnh từ hub (" code { "[remote] hub_orders = false" } " trong " code { "/etc/sn/agent.toml" } "). Đặt lại " code { "true" } " hoặc xoá dòng đó thì hub cài được."
                         }
                     } @else {
                         p class="help" style="margin:8px 0 0" { "Hệ điều hành này chưa có công thức cài tự động (hỗ trợ: Debian, Ubuntu, AlmaLinux, Rocky, CentOS, Fedora). Cài ClamAV thủ công rồi lần quét sau sẽ tự dùng." }
@@ -1044,8 +1036,7 @@ pub async fn agent_detail(
                     label class="f" { span class="t" { "Hoàn tác" } button class="ghost" type="submit" { "Gỡ chặn + thả cách ly" } }
                 }
             }
-            p class="help" { "“Hoàn tác” chỉ chạy nếu VPS bật tuỳ chọn cho phép (" code { "[remote] allow_undo" } ")." }
-        }
+            p class="help" { "“Hoàn tác” gỡ chặn IP và thả nhốt tiến trình do agent đặt; không đụng tới việc của AI." }        }
 
         (crate::web_ai::ai_card(&agent.id, report.as_ref(), &ai_data, if aq.at == "scan" { "" } else { aq.msg.trim() }))
 
@@ -1266,7 +1257,6 @@ pub async fn agent_detail(
 
                 (clamav_block(
                     &agent.id,
-                    &hub_base(&st),
                     r,
                     if aq.at == "scan" { aq.msg.trim() } else { "" },
                     install_pending,

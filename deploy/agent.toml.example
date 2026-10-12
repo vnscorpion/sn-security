@@ -43,6 +43,6 @@ clamav_min_ram_mb = 1536         # clamscan loads a >1 GB database: skipped belo
 clamav_timeout_secs = 1200
 
 [remote]
-allow_mode_observe = false       # let the hub switch this box back to observe
-allow_undo = false               # let the hub trigger undo (jail release + sn bans)
-allow_install_clamav = false     # let the hub install ClamAV with the OS package manager (runs as root)
+# The hub decides what this agent does (bans, mode, scans, undo, evidence, ClamAV,
+# incident response). Set to false to make this one VPS only report.
+hub_orders = true

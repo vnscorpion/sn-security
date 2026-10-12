@@ -14,8 +14,6 @@ NAME=""
 TOKEN=""
 ARCH=""
 UPGRADE=0
-ALLOW_CLAMAV_INSTALL=0
-ALLOW_REMOTE_FIX=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -24,8 +22,9 @@ while [ $# -gt 0 ]; do
     --token) TOKEN="$2"; shift 2;;
     --arch) ARCH="$2"; shift 2;;
     --upgrade) UPGRADE=1; shift;;
-    --allow-clamav-install) ALLOW_CLAMAV_INSTALL=1; shift;;
-    --allow-remote-fix) ALLOW_REMOTE_FIX=1; shift;;
+    # No longer needed: the hub decides what an installed agent does. Accepted so
+    # older install commands keep working.
+    --allow-clamav-install|--allow-remote-fix) shift;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done
@@ -74,10 +73,10 @@ install_binary() {
 }
 
 # --upgrade: replace the binary. Config, enrollment and timers are kept; the timers
-# start the new binary on their next run, so no restart is needed. Two small
-# adjustments for ClamAV support: the daily scan unit gets room for clamscan
-# (it loads a >1 GB database), and `--allow-clamav-install` lets the hub's
-# "Install ClamAV" button work on this VPS.
+# start the new binary on their next run, so no restart is needed. Small
+# adjustments: the daily scan unit gets room for clamscan (it loads a >1 GB
+# database), and the per-order `allow_*` switches of older versions are removed
+# from the config (the hub decides now; see `[remote] hub_orders`).
 if [ "$UPGRADE" -eq 1 ]; then
   install_binary
   if [ -f /etc/systemd/system/sn-hunt.service ] && grep -q '^MemoryMax=256M' /etc/systemd/system/sn-hunt.service; then
@@ -85,25 +84,10 @@ if [ "$UPGRADE" -eq 1 ]; then
     systemctl daemon-reload || true
     echo ">> sn-hunt.service: memory cap raised to 2G (for ClamAV)"
   fi
-  # Turn a [remote] switch on in the existing config (add it if missing).
-  set_remote_flag() {
-    key="$1"
-    [ -f /etc/sn/agent.toml ] || return 0
-    if grep -q "^$key" /etc/sn/agent.toml; then
-      sed -i "s/^$key.*/$key = true/" /etc/sn/agent.toml
-    elif grep -q '^\[remote\]' /etc/sn/agent.toml; then
-      sed -i "/^\[remote\]/a $key = true" /etc/sn/agent.toml
-    else
-      printf '\n[remote]\n%s = true\n' "$key" >> /etc/sn/agent.toml
-    fi
-  }
-  if [ "$ALLOW_CLAMAV_INSTALL" -eq 1 ]; then
-    set_remote_flag allow_install_clamav
-    echo ">> the hub may now install ClamAV on this VPS ([remote] allow_install_clamav = true)"
-  fi
-  if [ "$ALLOW_REMOTE_FIX" -eq 1 ]; then
-    set_remote_flag allow_remediate
-    echo ">> the hub may now carry out incident-response actions on this VPS ([remote] allow_remediate = true)"
+  # Older configs carry one switch per order type, all off. They no longer do
+  # anything; drop them so nobody reads them as a setting that still applies.
+  if [ -f /etc/sn/agent.toml ]; then
+    sed -i -E '/^(allow_mode_observe|allow_undo|allow_install_clamav|allow_evidence|allow_remediate)[[:space:]]*=/d' /etc/sn/agent.toml
   fi
   echo ">> upgraded. Rollback: cp /usr/local/bin/sn.bak /usr/local/bin/sn"
   exit 0
@@ -175,11 +159,9 @@ max_file_mb = 5
 clamav = "auto"
 
 [remote]
-allow_mode_observe = false
-allow_undo = false
-allow_install_clamav = $( [ "$ALLOW_CLAMAV_INSTALL" -eq 1 ] && echo true || echo false )
-allow_evidence = true
-allow_remediate = $( [ "$ALLOW_REMOTE_FIX" -eq 1 ] && echo true || echo false )
+# The hub decides what this agent does (bans, mode, scans, undo, evidence, ClamAV,
+# incident response). Set to false to make this one VPS only report.
+hub_orders = true
 EOF
 chmod 0600 /etc/sn/agent.toml
 

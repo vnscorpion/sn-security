@@ -146,9 +146,9 @@ Có — từ giao diện snhub bạn **đặt lệnh cho VPS mà không cần SS
 | Thao tác trên hub | Hiệu lực | Kiểm soát an toàn |
 | --- | --- | --- |
 | **Ban / Unban IP** (nhập tay hoặc nút cạnh top IP) | Agent áp vào nftables chu kỳ kế, TTL ≤ 24h | Chỉ cổng web; whitelist/trusted_proxies vẫn được loại trừ |
-| **Đổi observe ↔ enforce** | Agent đổi chế độ chu kỳ kế | observe→enforce luôn được; enforce→observe cần `[remote] allow_mode_observe=true` (mặc định tắt) hoặc chữ ký root |
+| **Đổi observe ↔ enforce** | Agent đổi chế độ chu kỳ kế | Hub quyết định cả hai chiều |
 | **Quét ngay** (quét mã độc) | Agent chạy `sn hunt` trong một unit systemd riêng, ưu tiên thấp; kết quả lên hub ở báo cáo sau khi quét xong | Chạy một lần mỗi lần bấm; không chạy chồng hai lần quét |
-| **Undo** (gỡ contain + ban của sn) | Agent chạy `sn undo` chu kỳ kế | Chỉ khi VPS bật `[remote] allow_undo=true` |
+| **Undo** (gỡ contain + ban của sn) | Agent chạy `sn undo` chu kỳ kế | Hub quyết định |
 
 Tier chính sách (đổi `patterns`, `trusted_proxies`, ép observe hàng loạt) cần **chữ ký root key offline** — hub bị chiếm cũng không hạ được bảo vệ. `contain`/`fetch` từ xa là **v1.1** (hiện làm qua SSH). Cần tức thì tại chỗ thì dùng `sn disable` (kill switch) hoặc chạy lệnh qua SSH.
 
@@ -216,11 +216,7 @@ Luật cố định không viết hết được các biến thể kiểu: miner
 
 **3. Mức tự xử lý (từng VPS).** Mặc định **"Duyệt từng bước"**. Bạn có thể chọn: *Tắt* (AI không tự chạy); *Tự xử lý việc hoàn tác được* (cách ly file, khoá shell, gỡ dòng độc, tắt dịch vụ chạy luôn, dừng tiến trình vẫn chờ bạn); *Tự xử lý tất cả* (kể cả dừng tiến trình). Ở hai mức tự xử, khi có sự cố hub tự thu thập bằng chứng, gọi AI và gửi lệnh mà không chờ bạn bấm. Mọi việc đều hiện ở khung AI và Nhật ký. **Nên bật sau khi bạn đã thấy AI đề xuất đúng vài lần ở chế độ duyệt**, vì AI vẫn có thể sai.
 
-**4. Bật trên VPS.** Thu thập bằng chứng (chỉ đọc) bật sẵn (`[remote] allow_evidence = true`). **Thực hiện hành động mặc định tắt** vì nó chạy bằng root theo lệnh từ hub. Bật cho từng VPS:
-```sh
-curl -fsSL https://HUB/install.sh | sudo sh -s -- --hub https://HUB --upgrade --allow-remote-fix
-```
-(hoặc đặt `allow_remediate = true` trong `[remote]` của `/etc/sn/agent.toml`). Agent chỉ báo hỗ trợ khi VPS cho phép, nên hub chỉ hiện nút ở nơi chạy được.
+**4. Trên VPS không cần cài đặt gì thêm.** Agent đã cài thì **hub quyết định**: thu thập bằng chứng, thực hiện hành động của AI, cài ClamAV, quét, hoàn tác, đổi chế độ đều chạy theo lệnh từ hub, không có cờ hay tham số nào phải thêm. (Lệnh vẫn được ký bằng khoá của hub và nằm trong danh sách hành động cố định.) Muốn riêng một VPS chỉ báo cáo mà không nhận lệnh, đặt `hub_orders = false` trong `[remote]` của `/etc/sn/agent.toml`. Các cờ cũ `--allow-clamav-install` và `--allow-remote-fix` không còn tác dụng (vẫn chấp nhận để lệnh cũ không lỗi), và `--upgrade` tự xoá các dòng `allow_*` cũ khỏi cấu hình. **Hệ quả cần biết:** ai điều khiển được hub thì điều khiển được cả đội VPS, nên bảo vệ đăng nhập hub (mật khẩu mạnh, 2FA) là việc quan trọng nhất.
 
 **Giới hạn đã biết:** các luật kiểm tra (đặc biệt "đáng ngờ" của dòng `.bashrc`, tiến trình giả danh) là heuristic nên có thể bỏ sót hoặc báo thừa; chưa chặn IP bằng ipset/firewall toàn cổng (nft của agent chỉ chặn cổng web) và chưa tự chặn bot ở Nginx của DirectAdmin; AI có thể chẩn đoán sai, nên đọc kỹ trước khi duyệt. **Chưa thử trên VPS thật.**
 
@@ -262,7 +258,7 @@ Heuristic bắt được biến thể lạ nhưng không biết tên họ mã đ
 
 - **Dùng khi nào:** `[hunt] clamav = "auto"` (mặc định): có ClamAV và đủ điều kiện thì dùng, không thì bỏ qua. `"off"` để tắt hẳn. Có `clamd` đang chạy thì dùng `clamdscan`; không thì `clamscan`, loại này nạp cả CSDL chữ ký (hơn 1 GB) nên chỉ chạy khi RAM còn trống ≥ `clamav_min_ram_mb` (mặc định 1536), và tối đa `clamav_timeout_secs` (1200). Nếu `clamd` lỗi giữa chừng thì chuyển sang `clamscan`.
 - **Nút "Cài ClamAV" trên hub:** agent đọc `/etc/os-release` rồi cài: Debian/Ubuntu bằng `apt` (chỉ gói `clamav`, không cài daemon để khỏi chiếm ~1 GB RAM thường trực); AlmaLinux/Rocky/CentOS/Fedora bằng `dnf`/`yum` (EPEL + `clamav`, `clamav-update`, tắt dòng `Example` trong `freshclam.conf`, tải chữ ký, đặt timer cập nhật hằng ngày `sn-clamav-update.timer`). Hệ điều hành khác bị từ chối kèm lý do. Cần VPS có tổng RAM ≥ ~1,8 GB và còn ≥ 1,5 GB ổ đĩa ở `/var/lib`. Kết quả (đang cài / xong / lỗi và lý do) hiện ngay trong khung ClamAV của trang VPS.
-- **Mặc định hub không được phép cài**, vì việc này chạy trình quản lý gói bằng root theo lệnh từ hub. Bật cho từng VPS bằng `curl -fsSL https://HUB/install.sh | sudo sh -s -- --hub https://HUB --upgrade --allow-clamav-install` (hoặc tự đặt `allow_install_clamav = true` trong `[remote]`). Hub chỉ gửi lệnh cho agent đã báo hỗ trợ ClamAV.
+- **Hub quyết định việc cài**: nút "Cài ClamAV" chạy trình quản lý gói bằng root trên VPS, không cần bật gì thêm ở VPS. Hub chỉ gửi lệnh cho agent đã báo hỗ trợ ClamAV.
 - **Một file ClamAV báo sẽ thành "độc hại"** (đủ điều kiện để `sn clean --yes` cách ly) trừ chữ ký dạng `Heuristics.*` và `PUA.*` chỉ thành "nghi ngờ". ClamAV vẫn có thể báo nhầm; đọc kết quả trước khi cách ly.
 - **Giới hạn:** ClamAV chỉ nhận các file mà heuristic đã mở (PHP, và file trong `uploads/` có dấu hiệu PHP), không quét cả ổ đĩa. File tên không phải UTF-8, tên có xuống dòng, hay quá 200.000 file được đếm và ghi vào ghi chú ("ClamAV bỏ qua N file"). Cờ dòng lệnh và gói của từng bản phân phối được viết theo tài liệu nhưng **chưa thử trên VPS thật**; hãy thử trên một VPS thử nghiệm trước.
 

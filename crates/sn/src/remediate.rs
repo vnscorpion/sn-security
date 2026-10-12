@@ -69,8 +69,8 @@ pub fn latest_result(state: &State) -> Option<RemediationReport> {
 /// `sn remediate --job <id>`: run the job file the agent wrote when it received
 /// the order, then remove the file.
 pub fn run_job(cfg: &Config, state: &State, id: &str) -> Result<()> {
-    if !cfg.remote.allow_remediate {
-        bail!("remediation is off on this VPS (set [remote] allow_remediate = true)");
+    if !cfg.remote.hub_orders {
+        bail!("hub orders are off on this VPS ([remote] hub_orders = false)");
     }
     if !is_valid_job_id(id) {
         bail!("invalid job id");

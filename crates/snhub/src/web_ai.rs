@@ -193,8 +193,8 @@ pub fn ai_card(agent_id: &str, report: Option<&ReportBody>, d: &AiCardData, msg:
                 }
                 @if !can_remediate {
                     p class="help" {
-                        "VPS này chưa cho phép hub thực hiện hành động (AI vẫn phân tích và đề xuất được). Để bật, chạy trên VPS bằng root: "
-                        code { "curl -fsSL <HUB>/install.sh | sudo sh -s -- --hub <HUB> --upgrade --allow-remote-fix" }
+                        "Agent trên VPS này cũ hoặc đang tắt lệnh từ hub (AI vẫn phân tích và đề xuất được nếu có bằng chứng, nhưng chưa thực hiện được). Cập nhật agent, hoặc kiểm tra "
+                        code { "[remote] hub_orders" } " trong " code { "/etc/sn/agent.toml" } "."
                     }
                 }
             }
@@ -583,7 +583,7 @@ pub async fn settings_page(
             h2 { "Dữ liệu gửi đi và bảo mật" }
             ul {
                 li { "Khi phân tích, hub gửi cho nhà cung cấp bạn chọn phần " b { "bằng chứng" } " của VPS: tên tiến trình và dòng lệnh, đường dẫn file lạ, các dòng đáng ngờ trong file khởi động shell (không gửi toàn bộ file), IP đăng nhập SSH, cổng đang mở. Không gửi nội dung website hay database. Lưu ý: dòng lệnh và các dòng khởi động/cron có thể chứa mật khẩu hoặc token gõ trên dòng lệnh; agent che các dạng phổ biến (" code { "password=…" } ", " code { "--token" } ", " code { "-pMẬT_KHẨU" } ", " code { "user:pass@host" } ", " code { "Bearer …" } ") nhưng không đảm bảo che hết, và bằng chứng cũng được lưu trong database của hub. Nếu không chấp nhận điều đó, hãy dùng model chạy trên máy bạn." }
-                li { "Nếu không muốn gửi ra ngoài, dùng model chạy trên máy bạn (Ollama/vLLM) hoặc tắt thu thập bằng chứng trên VPS (" code { "[remote] allow_evidence = false" } ")." }
+                li { "Nếu không muốn gửi ra ngoài, dùng model chạy trên máy bạn (Ollama/vLLM) hoặc tắt lệnh từ hub trên VPS đó (" code { "[remote] hub_orders = false" } ")." }
                 li { "API key được lưu nguyên văn trong file SQLite của hub (chỉ user chạy hub đọc được) vì hub cần dùng nó; trang này chỉ hiện 4 ký tự cuối." }
                 li { "AI không chạy lệnh. Nó chỉ chọn trong danh sách hành động cố định (dừng tiến trình, khoá shell, cách ly file, gỡ dòng khỏi file khởi động shell, tắt vài dịch vụ), và chỉ nhắm vào thứ có trong bằng chứng. Hub và agent kiểm tra lại, mọi hành động (trừ dừng tiến trình) hoàn tác được." }
                 li { "Nội dung trong bằng chứng do máy có thể đã bị xâm nhập viết ra, kẻ tấn công có thể chèn câu chữ nhằm lừa AI. Vì vậy mức " b { "Tự xử lý" } " chỉ nên bật sau khi bạn đã xem AI đề xuất đúng vài lần ở chế độ duyệt." }
@@ -833,7 +833,7 @@ mod tests {
         )
         .into_string();
         assert!(!h.contains("/agent/a1/ai/7/apply"));
-        assert!(h.contains("--allow-remote-fix"));
+        assert!(h.contains("hub_orders"));
         // A finished proposal has none either.
         let h = ai_card(
             "a1",

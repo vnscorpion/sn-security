@@ -488,7 +488,7 @@ pub fn info(cfg: &Config, state: &State) -> ClamavInfo {
         install_state: inst.state,
         install_message: inst.message,
         can_install: clamav::plan_for(&os_release(), &|n| find_bin(n).is_some()).is_ok(),
-        install_allowed: cfg.remote.allow_install_clamav,
+        install_allowed: cfg.remote.hub_orders,
         disabled: cfg.hunt.clamav == ClamavMode::Off,
     }
 }

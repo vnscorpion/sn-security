@@ -84,7 +84,7 @@ pub fn order(
     };
     if !can(&report, "remediate") {
         bail!(
-            "VPS này chưa cho phép hub sửa sự cố (agent cũ, hoặc chưa bật: chạy lại install.sh --upgrade --allow-remote-fix trên VPS)"
+            "Agent trên VPS này cũ hoặc đang tắt lệnh từ hub ([remote] hub_orders = false): cập nhật agent rồi thử lại"
         );
     }
     match db.latest_evidence(agent_id)? {
@@ -313,7 +313,7 @@ pub fn request(st: &Arc<AppState>, agent_id: &str) -> Result<String> {
     };
     if !can(&report, "evidence") {
         bail!(
-            "Agent trên VPS này cũ hoặc đã tắt thu thập bằng chứng ([remote] allow_evidence): cập nhật agent rồi thử lại"
+            "Agent trên VPS này cũ hoặc đang tắt lệnh từ hub ([remote] hub_orders = false): cập nhật agent rồi thử lại"
         );
     }
     if let Some(ev) = db.latest_evidence(agent_id)?

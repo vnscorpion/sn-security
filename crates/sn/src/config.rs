@@ -189,37 +189,18 @@ impl Default for HuntCfg {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteCfg {
-    /// Allow the hub to switch this VPS back to observe without a root policy.
-    #[serde(default)]
-    pub allow_mode_observe: bool,
-    /// Allow the hub to trigger `undo` (jail release + sn-ban removal only).
-    #[serde(default)]
-    pub allow_undo: bool,
-    /// Allow the hub to have this VPS install ClamAV with its package manager.
-    /// Off by default: it runs a package manager as root on the hub's say-so.
-    #[serde(default)]
-    pub allow_install_clamav: bool,
-    /// Allow the hub to ask for an evidence snapshot (processes, start-up files,
-    /// temp executables, SSH logins, open ports). Read-only; on by default. The
-    /// snapshot goes to the hub, which may show it to an AI the operator set up.
+    /// Obey the hub's orders: ban/unban, mode changes, scans, undo, evidence,
+    /// ClamAV install and incident-response actions. **On by default**: once an
+    /// agent is installed, the hub decides. Set it to `false` to make this VPS
+    /// only report (an emergency switch for one machine). Older versions had one
+    /// `allow_*` switch per order type, all off; those keys are now ignored.
     #[serde(default = "default_true")]
-    pub allow_evidence: bool,
-    /// Allow the hub to order incident-response actions (stop a process, lock a
-    /// shell, quarantine a file, remove a start-up line, disable a service).
-    /// Off by default: it acts as root on the hub's say-so.
-    #[serde(default)]
-    pub allow_remediate: bool,
+    pub hub_orders: bool,
 }
 
 impl Default for RemoteCfg {
     fn default() -> Self {
-        RemoteCfg {
-            allow_mode_observe: false,
-            allow_undo: false,
-            allow_install_clamav: false,
-            allow_evidence: true,
-            allow_remediate: false,
-        }
+        RemoteCfg { hub_orders: true }
     }
 }
 
