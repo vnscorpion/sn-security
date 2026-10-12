@@ -1,6 +1,6 @@
 //! Parse `/proc/net/tcp` and `/proc/net/tcp6` without calling `ss`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -97,6 +97,49 @@ pub fn by_inode(conns: &[Conn]) -> HashMap<u64, Conn> {
         .collect()
 }
 
+/// What listens locally, to tell a connection a local server accepted from one
+/// this host opened. The remote port of an accepted connection is whatever the
+/// client chose, so it says nothing about where the server process connects.
+#[derive(Debug, Default)]
+pub struct Listeners {
+    /// Ports listened on every address (`0.0.0.0`, `::`).
+    any: HashSet<u16>,
+    /// Ports listened on one address.
+    exact: HashSet<(IpAddr, u16)>,
+}
+
+impl Listeners {
+    pub fn new(conns: &[Conn]) -> Self {
+        let mut l = Listeners::default();
+        for c in conns.iter().filter(|c| c.state == ST_LISTEN) {
+            let local = snsec_common::net::normalize(c.local);
+            if local.is_unspecified() {
+                l.any.insert(c.local_port);
+            } else {
+                l.exact.insert((local, c.local_port));
+            }
+        }
+        l
+    }
+
+    /// Was `c` accepted by a local listener (its local end is a listening port)?
+    #[must_use]
+    pub fn accepted(&self, c: &Conn) -> bool {
+        self.any.contains(&c.local_port)
+            || self
+                .exact
+                .contains(&(snsec_common::net::normalize(c.local), c.local_port))
+    }
+
+    /// Is `c` an ESTABLISHED connection this host opened to a non-loopback peer?
+    #[must_use]
+    pub fn outbound(&self, c: &Conn) -> bool {
+        c.state == ST_ESTABLISHED
+            && !snsec_common::net::normalize(c.remote).is_loopback()
+            && !self.accepted(c)
+    }
+}
+
 /// TCP ports currently in LISTEN state (both families).
 pub fn listening_ports(conns: &[Conn]) -> Vec<u16> {
     let mut p: Vec<u16> = conns
@@ -129,4 +172,63 @@ pub fn conns_per_remote(conns: &[Conn]) -> HashMap<String, u32> {
         *m.entry(snsec_common::net::ban_key(c.remote)).or_insert(0) += 1;
     }
     m
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn conn(local: &str, lport: u16, remote: &str, rport: u16, state: u8) -> Conn {
+        Conn {
+            local: local.parse().unwrap(),
+            local_port: lport,
+            remote: remote.parse().unwrap(),
+            remote_port: rport,
+            state,
+            inode: 0,
+        }
+    }
+
+    #[test]
+    fn a_client_connecting_from_a_pool_port_is_inbound_not_outbound() {
+        let conns = vec![
+            conn("0.0.0.0", 443, "0.0.0.0", 0, ST_LISTEN),
+            conn("::", 8080, "::", 0, ST_LISTEN),
+            conn("10.0.0.5", 2222, "0.0.0.0", 0, ST_LISTEN),
+            conn("127.0.0.1", 6379, "0.0.0.0", 0, ST_LISTEN),
+        ];
+        let l = Listeners::new(&conns);
+        // Clients that picked port 4444 as their source port.
+        for c in [
+            conn("10.0.0.5", 443, "198.51.100.7", 4444, ST_ESTABLISHED),
+            conn(
+                "::ffff:10.0.0.5",
+                8080,
+                "::ffff:198.51.100.7",
+                4444,
+                ST_ESTABLISHED,
+            ),
+            conn("2001:db8::5", 8080, "2001:db8::9", 4444, ST_ESTABLISHED),
+            conn("10.0.0.5", 2222, "198.51.100.7", 4444, ST_ESTABLISHED),
+        ] {
+            assert!(l.accepted(&c) && !l.outbound(&c), "{c:?}");
+        }
+        // This host connecting out to a pool.
+        let out = conn("10.0.0.5", 51234, "198.51.100.7", 4444, ST_ESTABLISHED);
+        assert!(!l.accepted(&out) && l.outbound(&out));
+        // Port 2222 is only listened on 10.0.0.5: the same port on another address
+        // is a connection this host opened.
+        let other = conn("10.0.0.6", 2222, "198.51.100.7", 4444, ST_ESTABLISHED);
+        assert!(l.outbound(&other));
+        // Loopback peers and sockets that are not established are never outbound.
+        assert!(!l.outbound(&conn("127.0.0.1", 40000, "127.0.0.1", 4444, ST_ESTABLISHED)));
+        assert!(!l.outbound(&conn(
+            "::ffff:127.0.0.1",
+            40000,
+            "::ffff:127.0.0.1",
+            4444,
+            ST_ESTABLISHED
+        )));
+        assert!(!l.outbound(&conn("10.0.0.5", 51234, "198.51.100.7", 4444, 0x06)));
+    }
 }

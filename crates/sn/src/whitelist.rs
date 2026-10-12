@@ -13,6 +13,7 @@ use std::net::{IpAddr, ToSocketAddrs};
 use snsec_common::net::{self, Cidr};
 
 use crate::config::Config;
+use crate::evidence_parse;
 use crate::sys::{netstat, proc};
 
 /// Ports on which an established peer is treated as an admin and whitelisted,
@@ -179,37 +180,148 @@ fn resolve_hub(url: &str) -> Vec<IpAddr> {
     }
 }
 
-/// Scan the tail of the auth logs for `Accepted ... from <ip>` lines.
+/// Most addresses the auth logs may add, newest first. Any local program can
+/// write a line tagged `sshd` to syslog, so the log must not be able to grow the
+/// whitelist without limit; this is still far more than one admin's logins.
+const MAX_LOG_LOGINS: usize = 64;
+
+/// Addresses of recent successful SSH logins in the tail of the auth logs.
 fn recent_ssh_logins() -> Vec<IpAddr> {
-    let mut out = BTreeSet::new();
-    for path in ["/var/log/auth.log", "/var/log/secure"] {
-        if let Some(text) = read_tail(path, 512 * 1024) {
-            for line in text.lines() {
-                if line.contains("Accepted ")
-                    && let Some(ip) = extract_after(line, " from ")
-                    && let Ok(parsed) = ip.parse::<IpAddr>()
-                {
-                    out.insert(parsed);
+    let texts: Vec<String> = ["/var/log/auth.log", "/var/log/secure"]
+        .iter()
+        .filter_map(|p| read_tail(p, 512 * 1024))
+        .collect();
+    login_addrs(texts.iter().map(String::as_str))
+}
+
+/// The distinct addresses of successful logins, newest first, at most
+/// `MAX_LOG_LOGINS`. Only a line sshd itself wrote as a success counts
+/// (`evidence_parse::accepted_login`): sshd copies a client's chosen user name
+/// into its failure lines, and that name must not be able to whitelist anyone.
+fn login_addrs<'a>(texts: impl IntoIterator<Item = &'a str>) -> Vec<IpAddr> {
+    let mut out: Vec<IpAddr> = Vec::new();
+    for text in texts {
+        for line in text.lines().rev() {
+            if out.len() >= MAX_LOG_LOGINS {
+                return out;
+            }
+            if let Some((_, _, ip)) = evidence_parse::accepted_login(line) {
+                let ip = net::normalize(ip);
+                if !out.contains(&ip) {
+                    out.push(ip);
                 }
             }
         }
     }
-    out.into_iter().collect()
+    out
 }
 
-fn extract_after<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
-    let idx = line.find(marker)? + marker.len();
-    line[idx..].split_whitespace().next()
-}
-
-/// Read up to the last `max` bytes of a file as UTF-8 (lossy). Returns `None`
-/// if the file cannot be opened.
+/// Read up to the last `max` bytes of a file as UTF-8 (lossy), from the first
+/// whole line: a line cut at the start of the window could read as a different
+/// line. Returns `None` if the file cannot be opened.
 fn read_tail(path: &str, max: u64) -> Option<String> {
     let mut f = std::fs::File::open(path).ok()?;
     let len = f.metadata().ok()?.len();
     let start = len.saturating_sub(max);
     f.seek(SeekFrom::Start(start)).ok()?;
     let mut buf = Vec::new();
-    f.read_to_end(&mut buf).ok()?;
+    f.take(max).read_to_end(&mut buf).ok()?;
+    if start > 0 {
+        let first = buf
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(buf.len(), |i| i + 1);
+        buf.drain(..first);
+    }
     Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn a_user_name_that_spells_out_a_login_whitelists_nobody() {
+        // sshd writes the name a client offered verbatim into its failure lines.
+        let log = "Oct 12 02:00:00 h sshd[1]: Invalid user Accepted from 9.9.9.1 port 5\n\
+                   Oct 12 02:00:01 h sshd[1]: Invalid user Accepted x from 6.6.6.6 from 9.9.9.2 port 5\n\
+                   Oct 12 02:00:02 h sshd[1]: Invalid user x Accepted publickey for root from 1.2.3.4 from 9.9.9.3 port 5\n\
+                   Oct 12 02:00:03 h sshd[1]: Failed password for invalid user Accepted password for admin from 9.9.9.4 port 22 ssh2 from 9.9.9.9 port 5 ssh2\n\
+                   Oct 12 02:00:04 h sshd[1]: Failed password for invalid user x sshd[1]: Accepted password for a from 9.9.9.5 port 1 ssh2 from 9.9.9.9 port 5 ssh2\n\
+                   Oct 12 02:00:05 h sshd[1]: Invalid user x: Accepted publickey for admin from 9.9.9.6 port 1 ssh2 from 9.9.9.9 port 5\n\
+                   Oct 12 02:00:06 h vsftpd[3]: sshd[1]: Accepted password for a from 9.9.9.7 port 1 ssh2\n\
+                   Oct 12 02:00:07 h sshd[1]: Connection closed by invalid user Accepted 9.9.9.8 port 5 [preauth]\n";
+        assert!(login_addrs([log]).is_empty(), "{:?}", login_addrs([log]));
+    }
+
+    #[test]
+    fn real_logins_are_whitelisted_newest_first_including_sshd_session() {
+        let log = "Oct 12 02:00:00 h sshd[2]: Accepted publickey for ops from 203.0.113.7 port 50022 ssh2: ED25519 SHA256:k\n\
+                   Oct 12 02:00:01 h sshd[1]: Invalid user Accepted from 9.9.9.1 port 5\n\
+                   2026-10-12T02:00:02+07:00 h sshd-session[3]: Accepted password for dev from 2001:db8::7 port 1 ssh2\n\
+                   Oct 12 02:00:03 h sshd[4]: Accepted password for ops from ::ffff:198.51.100.4 port 1 ssh2\n\
+                   Oct 12 02:00:04 h sshd[5]: Accepted publickey for ops from 203.0.113.7 port 50023 ssh2\n";
+        assert_eq!(
+            login_addrs([log]),
+            [ip("203.0.113.7"), ip("198.51.100.4"), ip("2001:db8::7")]
+        );
+    }
+
+    #[test]
+    fn the_log_adds_a_bounded_number_of_addresses_and_a_flood_of_one_cannot_push_out_another() {
+        // More than the 30 the evidence keeps, all distinct: all of them stay.
+        let some: String = (1..=40)
+            .map(|i| {
+                format!("Oct 12 02:00:00 h sshd[1]: Accepted password for u from 10.0.0.{i} port 1 ssh2\n")
+            })
+            .collect();
+        assert_eq!(login_addrs([some.as_str()]).len(), 40);
+        // Many more: only the newest MAX_LOG_LOGINS.
+        let many: String = (1..=200)
+            .map(|i| {
+                format!("Oct 12 02:00:00 h sshd[1]: Accepted password for u from 10.0.1.{i} port 1 ssh2\n")
+            })
+            .collect();
+        let got = login_addrs([many.as_str()]);
+        assert_eq!(got.len(), MAX_LOG_LOGINS);
+        assert_eq!(got[0], ip("10.0.1.200"));
+        // The admin logged in once, then one address logged in a thousand times.
+        let mut busy = String::from(
+            "Oct 12 01:00:00 h sshd[1]: Accepted publickey for admin from 203.0.113.9 port 1 ssh2\n",
+        );
+        for _ in 0..1000 {
+            busy.push_str(
+                "Oct 12 02:00:00 h sshd[1]: Accepted password for app from 198.51.100.1 port 1 ssh2\n",
+            );
+        }
+        assert_eq!(
+            login_addrs([busy.as_str()]),
+            [ip("198.51.100.1"), ip("203.0.113.9")]
+        );
+    }
+
+    #[test]
+    fn a_line_cut_by_the_tail_window_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.log");
+        let whole =
+            "Oct 12 02:00:01 h sshd[1]: Accepted password for a from 203.0.113.1 port 1 ssh2\n";
+        // The window starts inside the first line, where what is left reads as a
+        // line of its own.
+        let first = "Oct 12 02:00:00 h sshd[1]: Invalid user 2026 h sshd[1]: Accepted password for a from 9.9.9.9 port 1 ssh2\n";
+        std::fs::write(&path, format!("{first}{whole}")).unwrap();
+        let cut = first.find("2026").unwrap();
+        assert!(evidence_parse::accepted_login(&first[cut..first.len() - 1]).is_some());
+        let max = (first.len() - cut + whole.len()) as u64;
+        let text = read_tail(path.to_str().unwrap(), max).unwrap();
+        assert_eq!(text, whole);
+        assert_eq!(login_addrs([text.as_str()]), [ip("203.0.113.1")]);
+        // A file that fits is read whole.
+        let all = read_tail(path.to_str().unwrap(), 1 << 20).unwrap();
+        assert_eq!(all, format!("{first}{whole}"));
+    }
 }

