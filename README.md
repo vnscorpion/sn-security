@@ -84,7 +84,9 @@ curl -fsSL https://raw.githubusercontent.com/vnscorpion/sn-security/main/deploy/
 > ```
 > Agent không bị ảnh hưởng: bộ cài agent do **hub** phục vụ qua `public_url`, không lấy từ GitHub.
 
-Script tải binary (kiểm sha256), tạo user `snhub`, sinh key (in **root secret offline** một lần — lưu ra ngoài server), cài `snhub.service`, và seed bộ cài agent để hub phục vụ cho các VPS. Sau đó:
+Script tải binary (kiểm sha256), tạo user `snhub`, sinh key (in **root secret offline** một lần — lưu ra ngoài server), cài `snhub.service`, và seed bộ cài agent để hub phục vụ cho các VPS.
+
+Quyền file: `/var/lib/snhub` (0700) chỉ user `snhub` vào được, database `snhub.sqlite*` 0600 (chứa API key AI, khoá 2FA, hash mật khẩu admin, token cài đang hiệu lực), `/etc/snhub` 0750. `public/` (binary agent, `install.sh`, `SHA256SUMS` mà mọi VPS chạy bằng root) và `hub.key` thuộc **root**: service chỉ đọc (`ReadOnlyPaths=` trong `snhub.service`), chỉ script cài/cập nhật (chạy bằng root) mới ghi được. Sau đó:
 
 ```sh
 # 1) Đặt mật khẩu admin
@@ -120,11 +122,13 @@ Hub cập nhật từ bản trước: mật khẩu cũ vẫn dùng được (k�
 
 ## Thêm một VPS
 
-Trên giao diện hub bấm **"Thêm VPS"** → nhập tên → copy lệnh cài (token dùng một lần, hết hạn 15 phút), dán vào VPS. Lệnh có dạng (`HUB` = URL hub của bạn):
+Trên giao diện hub bấm **"Thêm VPS"** → nhập tên → copy lệnh cài, dán vào VPS. Lệnh có dạng (`HUB` = URL hub của bạn):
 
 ```sh
-curl -fsSL https://HUB/install.sh | sudo sh -s -- --hub https://HUB --name web-01 --token <TOKEN>
+curl -fsSL https://HUB/install.sh | sudo sh -s -- --hub https://HUB --name web-01
 ```
+
+Bộ cài hỏi **token** (dùng một lần, hết hạn 15 phút, hub hiện cạnh lệnh): dán vào khi được hỏi. Token không nằm trên dòng lệnh nên không lộ qua danh sách tiến trình (`ps`) hay nhật ký sudo cho các user khác trên VPS; bộ cài chuyển nó cho `sn enroll` qua biến môi trường `SN_ENROLL_TOKEN` (chỉ root đọc được). Cài tự động không có terminal: đặt token vào `SN_ENROLL_TOKEN` trong môi trường của bộ cài. Lệnh cũ có `--token <TOKEN>` vẫn chạy nhưng bộ cài cảnh báo, vì token khi đó ai trên máy cũng đọc được trong lúc cài.
 
 Bộ cài ghi `/etc/sn/agent.toml` ở **chế độ observe** (chỉ báo `would_ban`, chưa ban gì), enroll với hub, cài 2 timer (`sn-watch` mỗi 5 phút, `sn-hunt` lúc 3h sáng) và in ra những file log mà agent tự tìm được. Sau vài ngày `would_ban` sạch, bật **enforce** từ hub.
 
@@ -136,9 +140,9 @@ Khi có bản mới, cập nhật **hub trước, rồi từng VPS**. Mọi tả
 ```sh
 curl -fsSL https://raw.githubusercontent.com/vnscorpion/sn-security/main/deploy/update-hub.sh | sudo bash
 ```
-Script giữ bản cũ để quay lại, và tự khôi phục nếu hub không chạy lên được. Cuối cùng nó in sẵn lệnh ở bước 2 với địa chỉ hub của bạn.
+Script giữ bản cũ để quay lại, và tự khôi phục nếu hub không chạy lên được. Cuối cùng nó in sẵn lệnh ở bước 2 với địa chỉ hub của bạn. Hub dừng vài giây trong lúc thay file. Script cũng đưa quyền file của bản cài cũ về như bản cài mới (xem [Cài hub](#cài-hub-server-trung-tâm--ubuntu-2404--debian-12)) và thêm `/etc/systemd/system/snhub.service.d/10-hardening.conf` (`UMask=0077`, `public/` và `hub.key` chỉ đọc với service) mà không ghi đè `snhub.service` bạn đã sửa.
 
-**2. Trên từng VPS đã cài agent** (bằng root) — thay binary, giữ nguyên cấu hình, khoá và timer (chỉ nâng giới hạn RAM của timer quét hằng đêm từ 256 MB lên 2 GB để chạy được ClamAV):
+**2. Trên từng VPS đã cài agent** (bằng root) — thay binary, giữ nguyên cấu hình, khoá và timer (chỉ nâng giới hạn RAM của timer quét hằng đêm từ 256 MB lên 2 GB để chạy được ClamAV, và đặt lại `/var/lib/sn` về 0700 để bằng chứng, báo cáo và file cách ly chỉ root đọc được):
 ```sh
 curl -fsSL https://HUB/install.sh | sudo sh -s -- --hub https://HUB --upgrade
 ```

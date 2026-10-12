@@ -5,10 +5,16 @@ on:
     branches: [main]
   pull_request:
 
+# Nothing here writes to the repository.
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Actions are pinned to a commit, with the tag it had in the comment: a tag can be
+# moved to other code, a commit cannot.
 jobs:
   test:
     name: fmt + clippy + test (native linux)
@@ -16,11 +22,14 @@ jobs:
     env:
       RUSTFLAGS: -D warnings
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: rustfmt
         run: cargo fmt --all -- --check
       - name: clippy
@@ -36,14 +45,17 @@ jobs:
       matrix:
         arch: [x86_64, aarch64]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
           targets: ${{ matrix.arch }}-unknown-linux-musl
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # Sets up the musl cross C toolchain (CC/AR/linker) so the C deps
       # (ring, rusqlite, mimalloc) cross-compile reliably.
-      - uses: taiki-e/setup-cross-toolchain-action@v1
+      - uses: taiki-e/setup-cross-toolchain-action@12b7ad4acfa95a1476779d6c06699b96ec1691f8 # v1.42.0
         with:
           target: ${{ matrix.arch }}-unknown-linux-musl
       - name: build
@@ -51,14 +63,190 @@ jobs:
       - name: size
         run: ls -la target/${{ matrix.arch }}-unknown-linux-musl/release/sn target/${{ matrix.arch }}-unknown-linux-musl/release/snhub
 
+  # Runs the real install/update scripts as root on the runner against a local
+  # "release" (this build of snhub, a stand-in sn) and checks what they leave.
+  deploy:
+    name: deploy scripts (hub install + update, agent installer)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: shell syntax
+        run: |
+          for f in deploy/*.sh; do
+            case "$(head -n 1 "$f")" in
+              *bash*) bash -n "$f" ;;
+              *) dash -n "$f" ;;
+            esac
+          done
+      - name: build snhub
+        run: cargo build -p snhub --locked
+      - name: stage a release and serve it
+        run: |
+          rel="$RUNNER_TEMP/rel"
+          mkdir -p "$rel/dist" "$rel/deploy/systemd"
+          cp target/debug/snhub "$rel/dist/snhub-x86_64"
+          # Stand-in agent: records how install.sh calls `sn enroll`. With
+          # /run/sn-ci-old-agent present it behaves like an sn that only takes --token.
+          cat > "$rel/dist/sn-x86_64" <<'EOF'
+          #!/bin/sh
+          case " $* " in
+            *" --version "*) echo "sn 0.0.0-ci"; exit 0;;
+            *" enroll "*)
+              printf 'argv:%s\nenv:%s\n' "$*" "${SN_ENROLL_TOKEN:-}" >> /run/sn-ci-enroll.log
+              if [ -e /run/sn-ci-old-agent ]; then
+                case " $* " in
+                  *" --token "*) ;;
+                  *) echo "error: the following required arguments were not provided: --token <TOKEN>" >&2; exit 2;;
+                esac
+              fi
+              ;;
+          esac
+          exit 0
+          EOF
+          cp "$rel/dist/sn-x86_64" "$rel/dist/sn-aarch64"
+          chmod 0755 "$rel/dist/sn-x86_64" "$rel/dist/sn-aarch64"
+          cp deploy/install.sh "$rel/dist/install.sh"
+          (cd "$rel/dist" && sha256sum snhub-x86_64 sn-x86_64 sn-aarch64 install.sh > SHA256SUMS)
+          cp deploy/systemd/snhub.service "$rel/deploy/systemd/"
+          nohup python3 -m http.server 8765 --bind 127.0.0.1 --directory "$rel" >/dev/null 2>&1 &
+          for _ in $(seq 20); do curl -fsS -o /dev/null http://127.0.0.1:8765/dist/SHA256SUMS && break; sleep 0.5; done
+          cat > "$RUNNER_TEMP/check.sh" <<'EOF'
+          fail() { echo "::error::$*"; exit 1; }
+          want_mode() {
+            got="$(sudo stat -c '%a %U:%G' "$1")"
+            [ "$got" = "$2" ] || fail "$1 is $got, want $2"
+          }
+          hub_checks() {
+            want_mode /var/lib/snhub "700 snhub:snhub"
+            db="$(sudo find /var/lib/snhub -maxdepth 1 -name 'snhub.sqlite*' -printf '%m %u:%g %p\n')"
+            [ -n "$db" ] || fail "no database"
+            if grep -v '^600 snhub:snhub ' <<<"$db"; then fail "database files are not 0600 snhub"; fi
+            want_mode /var/lib/snhub/hub.key "640 root:snhub"
+            want_mode /var/lib/snhub/public "755 root:root"
+            want_mode /var/lib/snhub/public/sn-x86_64 "755 root:root"
+            want_mode /var/lib/snhub/public/install.sh "644 root:root"
+            want_mode /var/lib/snhub/public/SHA256SUMS "644 root:root"
+            want_mode /etc/snhub "750 snhub:snhub"
+            want_mode /etc/snhub/snhub.toml "640 snhub:snhub"
+            [ "$(systemctl show -p UMask --value snhub)" = 0077 ] || fail "snhub.service UMask is not 0077"
+            # The hub still serves what VPSes download.
+            for _ in $(seq 30); do curl -fsS -o /dev/null http://127.0.0.1:8099/healthz && break; sleep 1; done
+            curl -fsS http://127.0.0.1:8099/install.sh | cmp - deploy/install.sh
+            curl -fsS http://127.0.0.1:8099/sn/sn-x86_64 | cmp - "$RUNNER_TEMP/rel/dist/sn-x86_64"
+            sums="$(curl -fsS http://127.0.0.1:8099/sn/SHA256SUMS)"
+            grep -q ' sn-x86_64$' <<<"$sums" || fail "/sn/SHA256SUMS lacks sn-x86_64"
+            # In the service's mount namespace public/ and hub.key are read-only,
+            # even to root; the rest of the data dir is not.
+            pid="$(systemctl show -p MainPID --value snhub)"
+            [ "$pid" -gt 0 ] || fail "snhub is not running"
+            if sudo nsenter -t "$pid" -m touch /var/lib/snhub/public/probe 2>/dev/null; then fail "public/ is writable by the service"; fi
+            if sudo nsenter -t "$pid" -m sh -c ': >> /var/lib/snhub/hub.key' 2>/dev/null; then fail "hub.key is writable by the service"; fi
+            sudo nsenter -t "$pid" -m touch /var/lib/snhub/probe || fail "the data dir is not writable by the service"
+            sudo rm -f /var/lib/snhub/probe
+          }
+          enrolled_has() {
+            sudo grep -qxF -- "$1" /run/sn-ci-enroll.log || { sudo cat /run/sn-ci-enroll.log; fail "sn enroll was not called with: $1"; }
+          }
+          no_token_in_argv() {
+            if sudo grep '^argv:.*--token' /run/sn-ci-enroll.log; then fail "the token reached sn's arguments"; fi
+          }
+          EOF
+      - name: install-hub.sh
+        run: |
+          . "$RUNNER_TEMP/check.sh"
+          sudo bash deploy/install-hub.sh --repo-raw http://127.0.0.1:8765 --public-url http://127.0.0.1:8099
+          hub_checks
+      - name: update-hub.sh on an install made by older scripts
+        run: |
+          . "$RUNNER_TEMP/check.sh"
+          # What older scripts left: all of it the hub user's, a world-readable
+          # database, and a unit with no UMask or read-only paths.
+          sudo systemctl stop snhub
+          sudo chown -R snhub:snhub /var/lib/snhub
+          sudo chmod 0755 /var/lib/snhub /etc/snhub
+          sudo chmod 0644 /var/lib/snhub/snhub.sqlite
+          sudo chmod 0600 /var/lib/snhub/hub.key
+          sudo sed -i '/^UMask=/d; /^ReadOnlyPaths=.*\/var\/lib\/snhub\//d' /etc/systemd/system/snhub.service
+          sudo systemctl daemon-reload
+          sudo systemctl start snhub
+          # A link the hub's user left in public/: root must replace it, not write through it.
+          echo decoy | sudo tee /opt/sn-ci-decoy >/dev/null
+          sudo -u snhub ln -sfn /opt/sn-ci-decoy /var/lib/snhub/public/SHA256SUMS
+          sudo bash deploy/update-hub.sh --repo-raw http://127.0.0.1:8765
+          [ "$(sudo cat /opt/sn-ci-decoy)" = decoy ] || fail "update-hub.sh wrote through a link in public/"
+          sudo test -f /etc/systemd/system/snhub.service.d/10-hardening.conf || fail "no hardening drop-in"
+          hub_checks
+          # public/ itself swapped for a link (possible while the hub's user could
+          # rename it): the next update builds a real directory again.
+          sudo mkdir -p /opt/sn-ci-decoy-dir
+          sudo -u snhub mv /var/lib/snhub/public /var/lib/snhub/public.old
+          sudo -u snhub ln -s /opt/sn-ci-decoy-dir /var/lib/snhub/public
+          sudo bash deploy/update-hub.sh --repo-raw http://127.0.0.1:8765
+          [ -z "$(sudo ls -A /opt/sn-ci-decoy-dir)" ] || fail "update-hub.sh wrote through a linked public/"
+          sudo test ! -L /var/lib/snhub/public || fail "public/ is still a link"
+          sudo rm -rf /var/lib/snhub/public.old
+          hub_checks
+      - name: install.sh keeps the enrollment token out of argument lists
+        run: |
+          . "$RUNNER_TEMP/check.sh"
+          hub=http://127.0.0.1:8099
+          # Installed here, without a terminal, so the runs below never meet an apt prompt.
+          command -v nft >/dev/null || sudo apt-get install -y -qq nftables
+          # No token and no terminal: stop before changing anything.
+          if cat deploy/install.sh | sudo sh -s -- --hub "$hub" --name ci-01 2>"$RUNNER_TEMP/err"; then
+            fail "install.sh ran without a token"
+          fi
+          grep -q SN_ENROLL_TOKEN "$RUNNER_TEMP/err" || fail "no hint about SN_ENROLL_TOKEN"
+          [ ! -e /usr/local/bin/sn ] || fail "installed before it had a token"
+          # The token typed on the terminal, as under `curl | sudo sh`. An earlier
+          # `sn triage` from a umask-022 root shell left /var/lib/sn 0755.
+          sudo mkdir -p /var/lib/sn
+          sudo chmod 0755 /var/lib/sn
+          printf 'tok-tty-1\n' | sudo script -qec "cat deploy/install.sh | sh -s -- --hub $hub --name ci-01" /dev/null
+          enrolled_has 'env:tok-tty-1'
+          enrolled_has "argv:--config /etc/sn/agent.toml enroll --url $hub --name ci-01"
+          no_token_in_argv
+          want_mode /var/lib/sn "700 root:root"
+          # The old --token form still works, with a warning, and still uses the environment.
+          sudo rm -f /run/sn-ci-enroll.log
+          cat deploy/install.sh | sudo sh -s -- --hub "$hub" --name ci-02 --token tok-arg-1 2>"$RUNNER_TEMP/err"
+          grep -q -- '--token puts the token' "$RUNNER_TEMP/err" || fail "no warning for --token"
+          enrolled_has 'env:tok-arg-1'
+          no_token_in_argv
+          # Automation without a terminal: the token in the environment.
+          sudo rm -f /run/sn-ci-enroll.log
+          cat deploy/install.sh | sudo env SN_ENROLL_TOKEN=tok-env-1 sh -s -- --hub "$hub" --name ci-03
+          enrolled_has 'env:tok-env-1'
+          no_token_in_argv
+          # An sn that only takes --token gets it that way.
+          sudo rm -f /run/sn-ci-enroll.log
+          sudo touch /run/sn-ci-old-agent
+          cat deploy/install.sh | sudo env SN_ENROLL_TOKEN=tok-old-1 sh -s -- --hub "$hub" --name ci-04
+          enrolled_has "argv:--config /etc/sn/agent.toml enroll --url $hub --name ci-04 --token tok-old-1"
+          sudo rm -f /run/sn-ci-old-agent
+          # --upgrade tightens a loose /var/lib/sn too.
+          sudo chmod 0755 /var/lib/sn
+          cat deploy/install.sh | sudo sh -s -- --hub "$hub" --upgrade
+          want_mode /var/lib/sn "700 root:root"
+
   audit:
     name: cargo audit + deny (advisory)
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
         with:
           tool: cargo-audit,cargo-deny
       - name: audit

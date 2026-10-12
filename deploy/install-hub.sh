@@ -89,27 +89,59 @@ echo ">> verifying checksums"
       || { echo "checksum FAILED for $f"; exit 1; }
   done )
 
+# The agent binaries, install.sh and SHA256SUMS that every VPS runs as root are
+# written by root only. Older versions let the hub's user own public/, so a link
+# left in its place must not redirect root's writes.
+refresh_public() {
+  pub="$DATA_DIR/public"
+  if [ -L "$pub" ] || { [ -e "$pub" ] && [ ! -d "$pub" ]; }; then rm -f "$pub"; fi
+  mkdir -p "$pub"
+  for f in sn-x86_64 sn-aarch64 install.sh SHA256SUMS; do rm -f "$pub/$f"; done
+  install -m 0755 "$1/sn-x86_64" "$pub/sn-x86_64"
+  install -m 0755 "$1/sn-aarch64" "$pub/sn-aarch64"
+  install -m 0644 "$1/install.sh" "$pub/install.sh"
+  grep -E ' (sn-x86_64|sn-aarch64|install.sh)$' "$1/SHA256SUMS" > "$TMP/SHA256SUMS.public"
+  install -m 0644 "$TMP/SHA256SUMS.public" "$pub/SHA256SUMS"
+  chown -R root:root "$pub"
+  chmod 0755 "$pub"
+}
+
+# Only the hub's user may enter the data dir: the database holds the AI API keys,
+# the 2FA secret, the admin password hash and live enrollment tokens. hub.key is
+# root's, readable by the service but not replaceable by it.
+lock_down() {
+  chmod 0700 "$DATA_DIR"
+  for f in "$DATA_DIR"/snhub.sqlite*; do
+    if [ -f "$f" ] && [ ! -L "$f" ]; then chmod 0600 "$f"; fi
+  done
+  if [ -f "$DATA_DIR/hub.key" ] && [ ! -L "$DATA_DIR/hub.key" ]; then
+    chown root:snhub "$DATA_DIR/hub.key"
+    chmod 0640 "$DATA_DIR/hub.key"
+  fi
+  chmod 0750 /etc/snhub
+}
+
 echo ">> installing snhub"
+# On a re-run, stop the running hub: nothing may change the files below meanwhile,
+# and `enable --now` then starts the new binary.
+systemctl stop snhub.service 2>/dev/null || true
 install -m 0755 "$STAGE/snhub-$ARCH" /usr/local/bin/snhub
 
 if ! id snhub >/dev/null 2>&1; then
   useradd --system --home "$DATA_DIR" --shell /usr/sbin/nologin snhub || true
 fi
-mkdir -p "$DATA_DIR/public" /etc/snhub
-install -m 0755 "$STAGE/sn-x86_64" "$DATA_DIR/public/sn-x86_64"
-install -m 0755 "$STAGE/sn-aarch64" "$DATA_DIR/public/sn-aarch64"
-install -m 0644 "$STAGE/install.sh" "$DATA_DIR/public/install.sh"
-grep -E ' (sn-x86_64|sn-aarch64|install.sh)$' "$STAGE/SHA256SUMS" > "$DATA_DIR/public/SHA256SUMS"
+mkdir -p "$DATA_DIR" /etc/snhub
 
 echo ">> initialising hub (keys, db, config)"
 PUB_ARG=""
 [ -n "$PUBLIC_URL" ] && PUB_ARG="--public-url $PUBLIC_URL"
 # shellcheck disable=SC2086
-snhub --config "$CONFIG" init --bind "$BIND" --data-dir "$DATA_DIR" $PUB_ARG
+( umask 077; snhub --config "$CONFIG" init --bind "$BIND" --data-dir "$DATA_DIR" $PUB_ARG )
 
 chown -R snhub:snhub "$DATA_DIR" /etc/snhub
 chmod 0640 "$CONFIG"
-chmod 0600 "$DATA_DIR/hub.key" 2>/dev/null || true
+refresh_public "$STAGE"
+lock_down
 
 echo ">> installing systemd service"
 install -m 0644 "$SYSTEMD_SRC" /etc/systemd/system/snhub.service
