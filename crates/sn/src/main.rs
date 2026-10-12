@@ -5,6 +5,8 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod clamav;
+mod clamav_run;
 mod clean;
 mod config;
 mod contain;
@@ -74,6 +76,8 @@ enum Cmd {
         #[arg(long)]
         deep: bool,
     },
+    /// Install ClamAV for this OS (root). Used by the hub's "Install ClamAV" button.
+    InstallClamav,
     /// Quarantine malicious findings from the last hunt (requires --yes).
     Clean {
         #[arg(long)]
@@ -154,6 +158,10 @@ fn run() -> Result<()> {
                 print: true,
             };
             hunt::run(&cfg, &state, &opts)?;
+        }
+        Cmd::InstallClamav => {
+            let state = State::open()?;
+            clamav_run::install(&state)?;
         }
         Cmd::Clean { yes } => {
             let state = State::open()?;

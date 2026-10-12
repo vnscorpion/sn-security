@@ -12,7 +12,7 @@ use snsec_common::heuristic::{self, Verdict};
 use snsec_common::schema::{Finding, HuntSummary};
 use walkdir::WalkDir;
 
-use crate::config::Config;
+use crate::config::{ClamavMode, Config};
 use crate::state::State;
 use crate::util;
 
@@ -20,6 +20,11 @@ const PHP_EXTS: &[&str] = &[
     "php", "phtml", "php5", "php7", "php8", "pht", "phar", "inc", "phps",
 ];
 const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "gif", "webp", "bmp", "ico", "svg"];
+/// Files handed to ClamAV in one hunt.
+const MAX_CLAM_FILES: usize = 200_000;
+/// What a hunt may use in total, a little under the 30 minutes the systemd unit
+/// allows. ClamAV only gets what the file walk leaves.
+const HUNT_BUDGET_SECS: u64 = 28 * 60;
 
 pub struct Options {
     pub days: u32,
@@ -42,6 +47,9 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<Vec<Finding>> 
 
     let mut findings = Vec::new();
     let mut scanned = 0u64;
+    // The files the heuristic opened, handed to ClamAV afterwards as well.
+    let mut clam_files: Vec<String> = Vec::new();
+    let mut clam_skipped = 0u64;
 
     for root in &roots {
         for entry in WalkDir::new(root)
@@ -95,6 +103,13 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<Vec<Finding>> 
             }
 
             scanned += 1;
+            // ClamAV gets the same files. A name that is not valid UTF-8 cannot
+            // go in its text list, and the list is capped: both are counted so
+            // the summary can say the second engine saw fewer files.
+            match path.to_str() {
+                Some(p) if clam_files.len() < MAX_CLAM_FILES => clam_files.push(p.to_string()),
+                _ => clam_skipped += 1,
+            }
             let score = heuristic::score_php(&bytes, is_upload, is_image && !is_php);
             if score.verdict == Verdict::Clean {
                 continue;
@@ -115,27 +130,86 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<Vec<Finding>> 
 
     findings.sort_by_key(|f| std::cmp::Reverse(f.score));
 
-    // Findings first, then the summary: the summary is what marks a scan as
-    // finished, so the report never pairs a fresh summary with stale findings.
-    let _ = std::fs::write(
-        state.dir.join("findings-latest.json"),
-        serde_json::to_vec_pretty(&findings)?,
-    );
-    let summary = summarize(
+    // The heuristic result is complete now: store it before ClamAV starts, so a
+    // unit that is stopped (time limit, out of memory) during the second engine
+    // still leaves today's result. The summary says ClamAV did not finish.
+    let clam_present = crate::clamav_run::find_bin("clamscan").is_some()
+        || crate::clamav_run::find_bin("clamdscan").is_some();
+    let mut summary = summarize(
         &findings,
         scanned,
         util::now_secs(),
         started.elapsed().as_secs(),
     );
-    let _ = std::fs::write(
-        state.dir.join("hunt-latest.json"),
-        serde_json::to_vec_pretty(&summary)?,
+    if clam_present && cfg.hunt.clamav == ClamavMode::Auto && !clam_files.is_empty() {
+        summary.clamav_note =
+            "ClamAV chưa chạy xong (bị dừng giữa chừng hoặc quá thời gian)".into();
+    }
+    store_results(state, &findings, &summary)?;
+
+    // Second opinion from ClamAV, when it is installed and can run. A problem
+    // there never fails the hunt: it becomes a note on the summary. It gets what
+    // is left of the unit's time budget.
+    let budget = HUNT_BUDGET_SECS.saturating_sub(started.elapsed().as_secs());
+    let clam = crate::clamav_run::scan(
+        cfg,
+        state,
+        &clam_files,
+        clam_skipped,
+        opts.max_file_mb,
+        budget,
     );
+    if clam.engine.is_empty() && clam.note.is_empty() {
+        // ClamAV did not take part and there is nothing to say about it.
+        summary.clamav_note.clear();
+    } else {
+        crate::clamav::merge(&mut findings, &clam.detections, |p| {
+            read_capped(Path::new(p), max_bytes)
+                .map(|b| hex::encode(Sha256::digest(&b)))
+                .unwrap_or_default()
+        });
+        findings.sort_by_key(|f| std::cmp::Reverse(f.score));
+        summary = summarize(
+            &findings,
+            scanned,
+            util::now_secs(),
+            started.elapsed().as_secs(),
+        );
+        summary.clamav_engine = clam.engine.clone();
+        summary.clamav_scanned = clam.scanned;
+        summary.clamav_note = clam.note.clone();
+    }
+    store_results(state, &findings, &summary)?;
 
     if opts.print {
         print_findings(&findings, scanned);
+        if !clam.engine.is_empty() {
+            println!(
+                "ClamAV ({}): {} file, {} phát hiện",
+                clam.engine,
+                clam.scanned,
+                clam.detections.len()
+            );
+        }
+        if !clam.note.is_empty() {
+            println!("ClamAV: {}", clam.note);
+        }
     }
     Ok(findings)
+}
+
+/// Write the findings and then the summary. The summary is what marks a scan as
+/// finished, so the report never pairs a fresh summary with stale findings.
+fn store_results(state: &State, findings: &[Finding], summary: &HuntSummary) -> Result<()> {
+    let _ = std::fs::write(
+        state.dir.join("findings-latest.json"),
+        serde_json::to_vec_pretty(findings)?,
+    );
+    let _ = std::fs::write(
+        state.dir.join("hunt-latest.json"),
+        serde_json::to_vec_pretty(summary)?,
+    );
+    Ok(())
 }
 
 /// Count findings by verdict into the scan summary that goes to the hub.
@@ -149,6 +223,8 @@ pub fn summarize(findings: &[Finding], scanned: u64, at: i64, duration_secs: u64
         duration_secs,
         malicious: count("malicious"),
         suspicious: count("suspicious"),
+        // Filled in by `run` once ClamAV has been consulted.
+        ..HuntSummary::default()
     }
 }
 
@@ -273,7 +349,9 @@ mod tests {
     }
 
     fn default_cfg() -> Config {
-        toml::from_str("").unwrap()
+        // ClamAV off: these tests are about the heuristic and must not depend on
+        // what happens to be installed on the machine running them.
+        toml::from_str("[hunt]\nclamav = \"off\"").unwrap()
     }
 
     #[test]

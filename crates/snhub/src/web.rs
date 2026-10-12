@@ -255,6 +255,75 @@ fn alert_kind_vi(k: &str) -> &str {
     }
 }
 
+/// Does the VPS's agent understand the `install_clamav` job? An older agent cannot
+/// even parse a desired-state that contains it, so the hub must not send it.
+fn knows_clamav(r: &ReportBody) -> bool {
+    r.capabilities.iter().any(|c| c == "clamav")
+}
+
+/// ClamAV status for the "Quét mã độc" card, with the install button when it can
+/// work. `hub` is the hub's public address, for the command that lets the VPS
+/// accept the install.
+fn clamav_block(agent_id: &str, hub: &str, r: &ReportBody) -> Markup {
+    html! {
+        div class="note" style="margin:0 0 12px" {
+            b { "ClamAV (engine thứ hai, chữ ký mã độc đã biết)" }
+            br;
+            @if !knows_clamav(r) {
+                "Agent trên VPS này cũ, chưa hỗ trợ ClamAV. Cập nhật agent để dùng."
+            } @else if let Some(c) = &r.clamav {
+                @if c.disabled {
+                    "Đang tắt trên VPS này (" code { "[hunt] clamav = \"off\"" } "). Quét chỉ dùng heuristic."
+                } @else if c.install_state == "running" {
+                    // Before "installed": the package puts its programs on disk early,
+                    // long before the signatures are downloaded.
+                    span class="badge b-warn" { "Đang cài" } " Có thể mất vài phút (gói + tải chữ ký, hàng trăm MB). Tải lại trang sau để xem kết quả."
+                } @else if c.installed {
+                    @match c.db_age_hours {
+                        Some(h) if h <= 72 => { span class="badge b-ok" { "Đã cài" } " chữ ký cập nhật " (h) " giờ trước. Mỗi lần quét, các file PHP được đối chiếu thêm với chữ ký ClamAV." }
+                        Some(h) => { span class="badge b-warn" { "Chữ ký cũ" } " cập nhật " (h) " giờ trước: kiểm tra " code { "freshclam" } " trên VPS." }
+                        None => { span class="badge b-warn" { "Chưa có chữ ký" } " ClamAV đã cài nhưng chưa tải được CSDL chữ ký (cần mạng tới database.clamav.net)." }
+                    }
+                } @else {
+                    "Chưa cài. Cài cần VPS có tổng RAM từ khoảng 1,8 GB (loại 2 GB trở lên), và mỗi lần quét cần khoảng 1,5 GB RAM còn trống."
+                    @if c.can_install && c.install_allowed && r.cycle.mem_total_mb > 0 && r.cycle.mem_total_mb < 1800 {
+                        p class="help" style="margin:8px 0 0" { "VPS này chỉ có " (r.cycle.mem_total_mb) " MB RAM nên không cài ClamAV (agent sẽ từ chối)." }
+                    } @else if c.can_install && c.install_allowed {
+                        form method="post" action={"/agent/" (agent_id) "/job"} style="margin:10px 0 0"
+                             onsubmit="return confirm('Cài ClamAV trên VPS này bằng trình quản lý gói của hệ điều hành (chạy bằng root)?')" {
+                            input type="hidden" name="kind" value="install_clamav";
+                            button type="submit" { "Cài ClamAV" }
+                        }
+                    } @else if c.can_install {
+                        p class="help" style="margin:8px 0 0" {
+                            "VPS này chưa cho phép hub cài phần mềm (mặc định tắt vì nó chạy trình quản lý gói bằng root). Để bật, chạy trên VPS bằng root:"
+                            pre style="margin:8px 0 0" { "curl -fsSL " (hub) "/install.sh | sudo sh -s -- --hub " (hub) " --upgrade --allow-clamav-install" }
+                        }
+                    } @else {
+                        p class="help" style="margin:8px 0 0" { "Hệ điều hành này chưa có công thức cài tự động (hỗ trợ: Debian, Ubuntu, AlmaLinux, Rocky, CentOS, Fedora). Cài ClamAV thủ công rồi lần quét sau sẽ tự dùng." }
+                    }
+                }
+                // Whether or not the programs ended up on disk, a failed attempt
+                // says why. (The message of a success would go stale, so it is
+                // not shown: the live status above is the truth.)
+                @if c.install_state == "failed" {
+                    p style="margin:8px 0 0;color:var(--bad)" { "Lần cài gần nhất thất bại: " (c.install_message) }
+                }
+            } @else {
+                "Chưa có thông tin ClamAV từ VPS này."
+            }
+            @if let Some(h) = &r.hunt {
+                @if !h.clamav_engine.is_empty() {
+                    p class="help" style="margin:8px 0 0" { "Lần quét cuối: ClamAV (" (h.clamav_engine) ") đã đối chiếu " b { (h.clamav_scanned) } " file." }
+                }
+                @if !h.clamav_note.is_empty() {
+                    p class="help" style="margin:8px 0 0;color:var(--warn)" { "ClamAV: " (h.clamav_note) }
+                }
+            }
+        }
+    }
+}
+
 /// One table of the busiest User-Agents or request shapes of the last cycle.
 /// Flagged rows come with a ModSecurity rule to review and the example IPs.
 /// The values come from web logs, so they are attacker-controlled: maud escapes
@@ -1154,6 +1223,8 @@ pub async fn agent_detail(
                     p class="help" style="margin:0 0 12px" { "Chưa có kết quả quét. VPS tự quét lúc 3 giờ sáng mỗi ngày; hoặc bấm “Quét ngay” ở mục Điều khiển phía trên." }
                 }
 
+                (clamav_block(&agent.id, &hub_base(&st), r))
+
                 @if !r.findings.is_empty() {
                     div style="display:flex;gap:14px;flex-wrap:wrap;align-items:center;margin:0 0 12px" {
                         a href={"/agent/" (agent.id) "/findings.csv"} { "Tải danh sách (CSV, tất cả " (r.findings.len()) " file)" }
@@ -1318,6 +1389,26 @@ pub async fn job_post(
             (Job::Hunt { days }, format!("quét mã độc {days} ngày"))
         }
         "undo" => (Job::Undo, "hoàn tác".to_string()),
+        "install_clamav" => {
+            // An agent that predates this job cannot parse it, and the job stays
+            // in its desired-state, so it would stop applying hub orders at all.
+            let ok = st
+                .db
+                .lock()
+                .expect("db")
+                .latest_report(&id)
+                .ok()
+                .flatten()
+                .is_some_and(|r| knows_clamav(&r));
+            if !ok {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "Agent trên VPS này chưa hỗ trợ cài ClamAV: hãy cập nhật agent trước.",
+                )
+                    .into_response();
+            }
+            (Job::InstallClamav, "cài ClamAV".to_string())
+        }
         _ => return (StatusCode::BAD_REQUEST, "unknown job").into_response(),
     };
     let db = st.db.lock().expect("db");
@@ -1862,6 +1953,7 @@ mod tests {
             active_bans: active,
             active_bans_total: total,
             hunt: None,
+            clamav: None,
         }
     }
 

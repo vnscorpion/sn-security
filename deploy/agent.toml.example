@@ -37,7 +37,12 @@ web_ports = [80, 443]            # HTTP-derived bans only touch these ports
 allowed_roots = ["/home", "/var/www"]
 days = 7
 max_file_mb = 5
+# Second engine: use ClamAV when it is installed ("auto") or never ("off").
+clamav = "auto"
+clamav_min_ram_mb = 1536         # clamscan loads a >1 GB database: skipped below this much free RAM
+clamav_timeout_secs = 1200
 
 [remote]
 allow_mode_observe = false       # let the hub switch this box back to observe
 allow_undo = false               # let the hub trigger undo (jail release + sn bans)
+allow_install_clamav = false     # let the hub install ClamAV with the OS package manager (runs as root)

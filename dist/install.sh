@@ -14,6 +14,7 @@ NAME=""
 TOKEN=""
 ARCH=""
 UPGRADE=0
+ALLOW_CLAMAV_INSTALL=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -22,6 +23,7 @@ while [ $# -gt 0 ]; do
     --token) TOKEN="$2"; shift 2;;
     --arch) ARCH="$2"; shift 2;;
     --upgrade) UPGRADE=1; shift;;
+    --allow-clamav-install) ALLOW_CLAMAV_INSTALL=1; shift;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done
@@ -69,10 +71,28 @@ install_binary() {
   echo ">> installed $(/usr/local/bin/sn --version)"
 }
 
-# --upgrade: replace the binary only. Config, enrollment and timers are untouched;
-# the timers start the new binary on their next run, so no restart is needed.
+# --upgrade: replace the binary. Config, enrollment and timers are kept; the timers
+# start the new binary on their next run, so no restart is needed. Two small
+# adjustments for ClamAV support: the daily scan unit gets room for clamscan
+# (it loads a >1 GB database), and `--allow-clamav-install` lets the hub's
+# "Install ClamAV" button work on this VPS.
 if [ "$UPGRADE" -eq 1 ]; then
   install_binary
+  if [ -f /etc/systemd/system/sn-hunt.service ] && grep -q '^MemoryMax=256M' /etc/systemd/system/sn-hunt.service; then
+    sed -i 's/^MemoryMax=256M$/MemoryMax=2G/' /etc/systemd/system/sn-hunt.service
+    systemctl daemon-reload || true
+    echo ">> sn-hunt.service: memory cap raised to 2G (for ClamAV)"
+  fi
+  if [ "$ALLOW_CLAMAV_INSTALL" -eq 1 ] && [ -f /etc/sn/agent.toml ]; then
+    if grep -q '^allow_install_clamav' /etc/sn/agent.toml; then
+      sed -i 's/^allow_install_clamav.*/allow_install_clamav = true/' /etc/sn/agent.toml
+    elif grep -q '^\[remote\]' /etc/sn/agent.toml; then
+      sed -i '/^\[remote\]/a allow_install_clamav = true' /etc/sn/agent.toml
+    else
+      printf '\n[remote]\nallow_install_clamav = true\n' >> /etc/sn/agent.toml
+    fi
+    echo ">> the hub may now install ClamAV on this VPS ([remote] allow_install_clamav = true)"
+  fi
   echo ">> upgraded. Rollback: cp /usr/local/bin/sn.bak /usr/local/bin/sn"
   exit 0
 fi
@@ -140,10 +160,12 @@ web_ports = [80, 443]
 allowed_roots = $ROOTS
 days = 7
 max_file_mb = 5
+clamav = "auto"
 
 [remote]
 allow_mode_observe = false
 allow_undo = false
+allow_install_clamav = $( [ "$ALLOW_CLAMAV_INSTALL" -eq 1 ] && echo true || echo false )
 EOF
 chmod 0600 /etc/sn/agent.toml
 
@@ -205,7 +227,7 @@ ReadWritePaths=/var/lib/sn
 ReadOnlyPaths=/etc/sn
 PrivateTmp=yes
 CapabilityBoundingSet=CAP_DAC_READ_SEARCH
-MemoryMax=256M
+MemoryMax=2G
 [Install]
 WantedBy=multi-user.target
 EOF

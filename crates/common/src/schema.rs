@@ -104,11 +104,51 @@ pub struct ReportBody {
     /// clean" apart from "never scanned". `None` before the first scan.
     #[serde(default)]
     pub hunt: Option<HuntSummary>,
+    /// State of the optional ClamAV engine on this VPS. `None` from agents that
+    /// predate it.
+    #[serde(default)]
+    pub clamav: Option<ClamavInfo>,
+}
+
+/// What the hub needs to know about ClamAV on a VPS, to show its state and to
+/// decide whether to offer "install".
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ClamavInfo {
+    /// A `clamscan` or `clamdscan` binary is present.
+    #[serde(default)]
+    pub installed: bool,
+    /// Hours since the signature database was last updated; `None` = no database.
+    #[serde(default)]
+    pub db_age_hours: Option<u32>,
+    /// `""` (never tried), `running`, `ok` or `failed`.
+    #[serde(default)]
+    pub install_state: String,
+    /// Short human-readable result of the last install attempt.
+    #[serde(default)]
+    pub install_message: String,
+    /// This OS has an automatic install recipe.
+    #[serde(default)]
+    pub can_install: bool,
+    /// `[remote] allow_install_clamav` is on, so the hub's install job will run.
+    #[serde(default)]
+    pub install_allowed: bool,
+    /// `[hunt] clamav = "off"`: installed or not, hunts do not use it.
+    #[serde(default)]
+    pub disabled: bool,
 }
 
 /// Outcome of one `sn hunt` run.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HuntSummary {
+    /// Which ClamAV engine scanned the files (`clamscan` / `clamdscan`), or empty.
+    #[serde(default)]
+    pub clamav_engine: String,
+    /// Files ClamAV was asked to scan.
+    #[serde(default)]
+    pub clamav_scanned: u64,
+    /// Why ClamAV did not run, or a problem it hit, or empty.
+    #[serde(default)]
+    pub clamav_note: String,
     /// Unix time the scan finished.
     pub at: i64,
     /// Files actually opened and scored.
@@ -366,6 +406,15 @@ pub enum Job {
     Fetch {
         path: String,
     },
+    /// Install ClamAV with the OS's package manager. Only honoured when the VPS
+    /// opted in with `[remote] allow_install_clamav`. An agent that predates this
+    /// variant cannot parse a desired-state containing it, so the hub must send
+    /// it only to agents that report the `clamav` capability.
+    InstallClamav,
+    /// A job kind from a newer hub that this agent does not know: ignored, but
+    /// the rest of the desired-state still applies.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Policy changes carry their own root/admin signature, verified separately
@@ -385,4 +434,40 @@ pub struct PolicyBody {
     pub patterns_yaml: Option<String>,
     /// Allow a remote switch back to observe (defaults off; agent config gates).
     pub allow_mode_observe: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_install_job_round_trips() {
+        let j = serde_json::to_string(&Job::InstallClamav).unwrap();
+        assert_eq!(j, r#"{"kind":"install_clamav"}"#);
+        assert!(matches!(
+            serde_json::from_str::<Job>(&j).unwrap(),
+            Job::InstallClamav
+        ));
+    }
+
+    #[test]
+    fn a_job_kind_from_a_newer_hub_does_not_break_the_desired_state() {
+        // Without the catch-all, one unknown job would make the whole
+        // desired-state unparseable and the agent would stop obeying the hub.
+        let j: Job = serde_json::from_str(r#"{"kind":"some_future_job","x":1}"#).unwrap();
+        assert!(matches!(j, Job::Unknown));
+    }
+
+    #[test]
+    fn a_report_and_a_hunt_summary_from_an_older_agent_still_parse() {
+        // No `clamav` anywhere: what agents before this feature send.
+        let s: HuntSummary = serde_json::from_str(
+            r#"{"at":1,"scanned":2,"duration_secs":3,"malicious":0,"suspicious":0}"#,
+        )
+        .unwrap();
+        assert_eq!(s.clamav_engine, "");
+        assert_eq!(s.clamav_scanned, 0);
+        let c: ClamavInfo = serde_json::from_str("{}").unwrap();
+        assert!(!c.installed && c.db_age_hours.is_none() && !c.install_allowed);
+    }
 }

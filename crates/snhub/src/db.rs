@@ -264,6 +264,20 @@ impl Db {
         let (epoch, version, mut body) =
             self.get_desired(agent_id)?
                 .unwrap_or((1, 0, DesiredBody::default()));
+        // A job the agent has already run need not ride along in every later
+        // desired-state. Dropping it keeps a rolled-back (older) agent from
+        // meeting a job kind it cannot parse. `jobs_seq` stays, so the agent's
+        // run-once logic is unchanged.
+        if !body.jobs.is_empty() {
+            let applied = self
+                .latest_report(agent_id)
+                .ok()
+                .flatten()
+                .map_or(0, |r| r.applied_desired.seq);
+            if job_already_applied(&body, applied) {
+                body.jobs.clear();
+            }
+        }
         edit(&mut body);
         let json = serde_json::to_string(&body)?;
         self.conn.execute(
@@ -361,4 +375,31 @@ fn agent_id(name: &str) -> String {
         if slug.is_empty() { "vps" } else { slug },
         hex::encode(buf)
     )
+}
+
+/// Has the agent applied the desired-state that carried this body's jobs?
+fn job_already_applied(body: &DesiredBody, agent_applied_seq: u64) -> bool {
+    body.jobs_seq > 0 && agent_applied_seq >= body.jobs_seq
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn body(jobs_seq: u64) -> DesiredBody {
+        DesiredBody {
+            jobs_seq,
+            ..DesiredBody::default()
+        }
+    }
+
+    #[test]
+    fn a_job_is_dropped_only_once_the_agent_has_applied_it() {
+        // Queued at version 7: not yet applied while the agent is at 6.
+        assert!(!job_already_applied(&body(7), 6));
+        assert!(job_already_applied(&body(7), 7));
+        assert!(job_already_applied(&body(7), 9));
+        // No job ever queued: nothing to drop.
+        assert!(!job_already_applied(&body(0), 5));
+    }
 }

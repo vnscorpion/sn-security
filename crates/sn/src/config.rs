@@ -154,6 +154,24 @@ pub struct HuntCfg {
     pub days: u32,
     #[serde(default = "default_max_file_mb")]
     pub max_file_mb: u64,
+    /// Use ClamAV as a second engine when it is installed (`auto`), or never (`off`).
+    #[serde(default)]
+    pub clamav: ClamavMode,
+    /// `clamscan` loads the whole signature database (over 1 GB). It is skipped
+    /// when less than this much RAM is available.
+    #[serde(default = "default_clamav_min_ram_mb")]
+    pub clamav_min_ram_mb: u64,
+    /// Longest a ClamAV scan may run before it is stopped.
+    #[serde(default = "default_clamav_timeout_secs")]
+    pub clamav_timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClamavMode {
+    #[default]
+    Auto,
+    Off,
 }
 
 impl Default for HuntCfg {
@@ -162,6 +180,9 @@ impl Default for HuntCfg {
             allowed_roots: default_roots(),
             days: default_days(),
             max_file_mb: default_max_file_mb(),
+            clamav: ClamavMode::default(),
+            clamav_min_ram_mb: default_clamav_min_ram_mb(),
+            clamav_timeout_secs: default_clamav_timeout_secs(),
         }
     }
 }
@@ -174,6 +195,10 @@ pub struct RemoteCfg {
     /// Allow the hub to trigger `undo` (jail release + sn-ban removal only).
     #[serde(default)]
     pub allow_undo: bool,
+    /// Allow the hub to have this VPS install ClamAV with its package manager.
+    /// Off by default: it runs a package manager as root on the hub's say-so.
+    #[serde(default)]
+    pub allow_install_clamav: bool,
 }
 
 fn default_format() -> String {
@@ -214,6 +239,12 @@ fn default_days() -> u32 {
 }
 fn default_max_file_mb() -> u64 {
     5
+}
+fn default_clamav_min_ram_mb() -> u64 {
+    1536
+}
+fn default_clamav_timeout_secs() -> u64 {
+    1200
 }
 
 impl Config {

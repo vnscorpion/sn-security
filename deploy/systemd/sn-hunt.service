@@ -20,7 +20,7 @@ ReadOnlyPaths=/etc/sn
 PrivateTmp=yes
 # Hunt only reads files; it needs to traverse all users' webroots.
 CapabilityBoundingSet=CAP_DAC_READ_SEARCH
-MemoryMax=256M
+MemoryMax=2G
 
 [Install]
 WantedBy=multi-user.target

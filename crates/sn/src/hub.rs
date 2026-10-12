@@ -32,6 +32,8 @@ fn capabilities() -> Vec<String> {
         "watch".into(),
         "ban".into(),
         "undo".into(),
+        // Understands the `install_clamav` job (older agents cannot parse it).
+        "clamav".into(),
     ]
 }
 
@@ -128,6 +130,7 @@ pub fn sync(
         active_bans: active_list,
         active_bans_total: active_total,
         hunt,
+        clamav: Some(crate::clamav_run::info(cfg, state)),
     };
 
     let body_json = serde_json::to_vec(&body)?;
@@ -210,7 +213,20 @@ fn hunt_unit_args(days: u32) -> Vec<String> {
         "--property=Nice=15",
         "--property=IOSchedulingClass=idle",
         "--property=CPUQuota=40%",
-        "--property=MemoryMax=512M",
+        // Room for ClamAV's `clamscan`, which loads its whole signature database.
+        "--property=MemoryMax=2G",
+        // The same confinement as the nightly unit (deploy/systemd/sn-hunt.service):
+        // this process reads files that users control, and may run ClamAV's
+        // parsers over them. A test keeps the two lists in step.
+        "--property=NoNewPrivileges=yes",
+        "--property=ProtectSystem=strict",
+        "--property=ReadWritePaths=/var/lib/sn",
+        "--property=ReadOnlyPaths=/etc/sn",
+        "--property=PrivateTmp=yes",
+        "--property=CapabilityBoundingSet=CAP_DAC_READ_SEARCH",
+        // Same 30-minute ceiling as the timer's unit (that one is Type=oneshot,
+        // where TimeoutStartSec bounds the run; this one is a plain service).
+        "--property=RuntimeMaxSec=30min",
         "/usr/local/bin/sn",
         "hunt",
         "--days",
@@ -220,6 +236,28 @@ fn hunt_unit_args(days: u32) -> Vec<String> {
     .collect();
     args.push(days.to_string());
     args
+}
+
+/// `systemd-run` arguments for the ClamAV install: root, low priority, no limit on
+/// memory (a package manager and `freshclam` need what they need), one at a time.
+fn install_clamav_unit_args() -> Vec<String> {
+    [
+        "--quiet",
+        "--no-block",
+        "--collect",
+        "--unit=sn-install-clamav",
+        "--description=SN Secure ClamAV install (requested from the hub)",
+        "--property=Nice=10",
+        "--property=IOSchedulingClass=idle",
+        // A hard stop: TimeoutStartSec does not limit how long a running
+        // service may go on, RuntimeMaxSec does.
+        "--property=RuntimeMaxSec=90min",
+        "/usr/local/bin/sn",
+        "install-clamav",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect()
 }
 
 /// At most this many bans are listed per report (the full count is always sent).
@@ -501,6 +539,29 @@ fn run_job(cfg: &Config, state: &State, job: &snsec_common::schema::Job) {
                 eprintln!("hub: ignoring undo job (set [remote] allow_undo=true to permit)");
             }
         }
+        Job::InstallClamav => {
+            if !cfg.remote.allow_install_clamav {
+                eprintln!(
+                    "hub: ignoring install_clamav job (set [remote] allow_install_clamav=true to permit)"
+                );
+                return;
+            }
+            // Its own systemd unit, like the scan: a package install outlives this
+            // one-shot cycle, and the fixed unit name stops two from overlapping.
+            match std::process::Command::new("systemd-run")
+                .args(install_clamav_unit_args())
+                .status()
+            {
+                Ok(s) if s.success() => eprintln!("hub: started ClamAV install"),
+                Ok(s) => eprintln!(
+                    "hub: could not start the ClamAV install ({s}); one may already be running (`systemctl status sn-install-clamav`)"
+                ),
+                Err(e) => eprintln!("hub: could not start the ClamAV install: {e}"),
+            }
+        }
+        Job::Unknown => {
+            eprintln!("hub: ignoring a job kind this agent does not know (upgrade the agent)");
+        }
         Job::Contain { .. } => {
             eprintln!("hub: remote contain is not supported in v1 (use SSH + `sn contain`)");
         }
@@ -682,6 +743,7 @@ mod tests {
             duration_secs: 31,
             malicious: 1,
             suspicious: 1,
+            ..HuntSummary::default()
         };
         std::fs::write(
             state.dir.join("hunt-latest.json"),
@@ -766,5 +828,42 @@ mod tests {
             .rev()
             .collect();
         assert_eq!(tail, ["/usr/local/bin/sn", "hunt", "--days", "7"]);
+    }
+
+    #[test]
+    fn a_hub_requested_scan_is_as_sandboxed_as_the_nightly_one() {
+        // The scan can run ClamAV's parsers over files users control, so the
+        // hub-started unit must not be less confined than the timer's.
+        let args = hunt_unit_args(1);
+        for p in [
+            "NoNewPrivileges=yes",
+            "ProtectSystem=strict",
+            "ReadWritePaths=/var/lib/sn",
+            "ReadOnlyPaths=/etc/sn",
+            "PrivateTmp=yes",
+            "CapabilityBoundingSet=CAP_DAC_READ_SEARCH",
+        ] {
+            assert!(args.contains(&format!("--property={p}")), "missing {p}");
+        }
+        // And every one of them is also in the timer's unit file.
+        let unit = include_str!("../../../deploy/systemd/sn-hunt.service");
+        for p in [
+            "NoNewPrivileges=yes",
+            "ProtectSystem=strict",
+            "ReadWritePaths=/var/lib/sn",
+            "ReadOnlyPaths=/etc/sn",
+            "PrivateTmp=yes",
+            "CapabilityBoundingSet=CAP_DAC_READ_SEARCH",
+        ] {
+            assert!(unit.contains(p), "sn-hunt.service lacks {p}");
+        }
+    }
+
+    #[test]
+    fn the_clamav_install_unit_is_bounded_and_runs_one_at_a_time() {
+        let args = install_clamav_unit_args();
+        assert!(args.contains(&"--unit=sn-install-clamav".to_string()));
+        assert!(args.contains(&"--property=RuntimeMaxSec=90min".to_string()));
+        assert_eq!(args.last().map(String::as_str), Some("install-clamav"));
     }
 }

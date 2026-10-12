@@ -13,6 +13,7 @@ Một binary Rust tĩnh (`sn`, ~3 MB) cấp cứu VPS Linux đang bị mã độ
 - `triage` — ảnh chụp chỉ-đọc: top process theo CPU (đo delta 2 mẫu), exe thật/`(deleted)`, cwd, kết nối ra, persistence (cron/`ld.so.preload`/rc.local), disk/inode; gắn nhãn `miner`/`php-bot`/`ddos-l7`/`bruteforce`/`disk-full`/`mixed`/`unknown`.
 - `contain` — nhốt process nghi ngờ vào cgroup 5% CPU (**cả cgroup v2 lẫn v1**), tuỳ chọn `--freeze`; **không bao giờ kill**; loại trừ dịch vụ hệ thống theo exe thật (miner đội tên `nginx` ở `/tmp` không thoát).
 - `hunt` — quét webshell PHP bằng heuristic (source→sink, decode→eval, dropper, `preg_replace /e`, entropy, file PHP trong uploads/đuôi ảnh); nhận diện encoder thương mại (ionCube...) để tránh báo nhầm.
+- **ClamAV tuỳ chọn** làm engine thứ hai cho `hunt`; hub có nút **Cài ClamAV** (agent tự chọn công thức theo hệ điều hành, mặc định tắt vì chạy trình quản lý gói bằng root) — xem [ClamAV](#clamav-engine-thứ-hai-tuỳ-chọn).
 - `clean`/`quarantine`/`restore` — cách ly file giữ nguyên owner/mode/mtime, phục hồi được.
 - `undo` — đảo ngược mọi contain/ban đã làm (log có cấu trúc `undo.jsonl`, không chạy shell).
 
@@ -114,7 +115,7 @@ curl -fsSL https://raw.githubusercontent.com/vnscorpion/sn-security/main/deploy/
 ```
 Script giữ bản cũ để quay lại, và tự khôi phục nếu hub không chạy lên được. Cuối cùng nó in sẵn lệnh ở bước 2 với địa chỉ hub của bạn.
 
-**2. Trên từng VPS đã cài agent** (bằng root) — chỉ thay binary, không đụng cấu hình và timer:
+**2. Trên từng VPS đã cài agent** (bằng root) — thay binary, giữ nguyên cấu hình, khoá và timer (chỉ nâng giới hạn RAM của timer quét hằng đêm từ 256 MB lên 2 GB để chạy được ClamAV):
 ```sh
 curl -fsSL https://HUB/install.sh | sudo sh -s -- --hub https://HUB --upgrade
 ```
@@ -207,6 +208,17 @@ Ba cách chạy: **tự động lúc 3 giờ sáng** (timer `sn-hunt`, ưu tiên
 - **Phát hiện:** mới kiểm trên các mẫu tự dựng của những dạng web shell phổ biến. **Chưa kiểm trên bộ mã độc thật**, nên không có số liệu tỷ lệ bắt được. Kết quả "sạch" không phải bằng chứng máy không bị nhiễm.
 
 **Giới hạn:** chỉ quét file PHP (không quét database, không quét mã JavaScript bị chèn, không đối chiếu checksum lõi/plugin của WordPress); web shell dựng tên hàm bằng cách nối chuỗi (`$f = 'ev'.'al'; $f($x)`) chưa bắt được; file lớn hơn `max_file_mb` (5 MB) bị bỏ qua. `sn clean --yes` chỉ cách ly file "độc hại"; file "nghi ngờ" luôn để bạn xem tay. Heuristic có thể sai, nên đọc đoạn mã trích ra trước khi cách ly.
+
+### ClamAV (engine thứ hai, tuỳ chọn)
+
+Heuristic bắt được biến thể lạ nhưng không biết tên họ mã độc; chữ ký ClamAV thì ngược lại. Khi VPS có ClamAV, mỗi lần `sn hunt` đối chiếu thêm **cùng các file PHP** với chữ ký của nó, và hiện hai nguồn cạnh nhau (cột "Dấu hiệu khớp" có `clamav:Php.Webshell...`). Hub **không** lấy chữ ký về hay phân phối lại: mỗi VPS tự cập nhật bằng `freshclam` từ máy chủ chữ ký của ClamAV.
+
+- **Dùng khi nào:** `[hunt] clamav = "auto"` (mặc định): có ClamAV và đủ điều kiện thì dùng, không thì bỏ qua. `"off"` để tắt hẳn. Có `clamd` đang chạy thì dùng `clamdscan`; không thì `clamscan`, loại này nạp cả CSDL chữ ký (hơn 1 GB) nên chỉ chạy khi RAM còn trống ≥ `clamav_min_ram_mb` (mặc định 1536), và tối đa `clamav_timeout_secs` (1200). Nếu `clamd` lỗi giữa chừng thì chuyển sang `clamscan`.
+- **Nút "Cài ClamAV" trên hub:** agent đọc `/etc/os-release` rồi cài: Debian/Ubuntu bằng `apt` (chỉ gói `clamav`, không cài daemon để khỏi chiếm ~1 GB RAM thường trực); AlmaLinux/Rocky/CentOS/Fedora bằng `dnf`/`yum` (EPEL + `clamav`, `clamav-update`, tắt dòng `Example` trong `freshclam.conf`, tải chữ ký, đặt timer cập nhật hằng ngày `sn-clamav-update.timer`). Hệ điều hành khác bị từ chối kèm lý do. Cần VPS có tổng RAM ≥ ~1,8 GB và còn ≥ 1,5 GB ổ đĩa ở `/var/lib`. Kết quả (đang cài / xong / lỗi và lý do) hiện ngay trong khung ClamAV của trang VPS.
+- **Mặc định hub không được phép cài**, vì việc này chạy trình quản lý gói bằng root theo lệnh từ hub. Bật cho từng VPS bằng `curl -fsSL https://HUB/install.sh | sudo sh -s -- --hub https://HUB --upgrade --allow-clamav-install` (hoặc tự đặt `allow_install_clamav = true` trong `[remote]`). Hub chỉ gửi lệnh cho agent đã báo hỗ trợ ClamAV.
+- **Một file ClamAV báo sẽ thành "độc hại"** (đủ điều kiện để `sn clean --yes` cách ly) trừ chữ ký dạng `Heuristics.*` và `PUA.*` chỉ thành "nghi ngờ". ClamAV vẫn có thể báo nhầm; đọc kết quả trước khi cách ly.
+- **Giới hạn:** ClamAV chỉ nhận các file mà heuristic đã mở (PHP, và file trong `uploads/` có dấu hiệu PHP), không quét cả ổ đĩa. File tên không phải UTF-8, tên có xuống dòng, hay quá 200.000 file được đếm và ghi vào ghi chú ("ClamAV bỏ qua N file"). Cờ dòng lệnh và gói của từng bản phân phối được viết theo tài liệu nhưng **chưa thử trên VPS thật**; hãy thử trên một VPS thử nghiệm trước.
+
 
 ## Cấp cứu một VPS đang bị (chạy tay)
 
