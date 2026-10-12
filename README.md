@@ -204,12 +204,15 @@ Luật cố định không viết hết được các biến thể kiểu: miner
 | Gỡ một dòng khỏi file khởi động shell của tài khoản (có bản sao lưu) | vừa | `sn undo --remediation` |
 | Tắt một dịch vụ trong danh sách, chỉ khi đang lắng nghe cổng tương ứng (rpcbind:111, cups:631, telnet, rsh, rexec) | vừa | `sn undo --remediation` |
 | Dừng một tiến trình (SIGKILL), chỉ khi có dấu hiệu mạnh: tên giả tiến trình nhân, dấu hiệu miner, hoặc chạy từ `/tmp`, `/dev/shm`, thư mục ẩn trong `/home` | cao | **không** |
+| Dừng **mọi tiến trình giả danh** của một tài khoản chạy một chương trình (`kill_matching`, vd. perl mang tên `[kworker/2:51S]`): dùng cho mã độc tự khởi động lại, vì khi lệnh tới nơi pid cũ thường đã thoát. Agent kiểm tra lại từng tiến trình còn sống (vẫn giả danh, không phải dịch vụ hệ thống thật) | cao | **không** |
 
 **Chống bị AI (và kẻ tấn công) lừa:**
 - Nội dung bằng chứng do máy có thể đã bị xâm nhập tạo ra (tên file, dòng lệnh, dòng trong `.bashrc`) nên có thể chứa câu chữ dụ AI. Vì vậy AI **chỉ được nhắm vào thứ có trong bằng chứng** (đúng pid + thời điểm khởi động, đúng đường dẫn + số dòng + SHA-256 của dòng, tài khoản có liên quan trong bằng chứng, dịch vụ trong danh sách) và hub loại mọi đề xuất khác.
 - Dịch vụ lõi (nginx, php-fpm, database, sshd…) và tài khoản hệ thống không bao giờ bị đụng tới.
 - **Agent kiểm tra lại độc lập** bằng bằng chứng nó tự thu thập (còn mới dưới 2 giờ) và trạng thái thật của máy, rồi mới làm. File được sửa qua đường dẫn mở bằng `O_NOFOLLOW`.
 - Mọi hành động (trừ dừng tiến trình) được ghi để hoàn tác.
+
+**Độ trễ.** Agent hỏi hub mỗi 5 phút nên một lượt đầy đủ có thể mất vài phút. Sau khi thu thập bằng chứng cho AI, agent gửi báo cáo ngay và hỏi hub mỗi 15 giây trong tối đa 10 phút (`sn evidence --follow`), nên lệnh tới nơi trong vài giây thay vì chờ tới nhịp kế. Mã độc tự khởi động lại thường làm pid cũ biến mất, vì thế có hành động `kill_matching`. Nếu VPS còn một lệnh chưa chạy, đề xuất được tự gửi lại ở báo cáo kế tiếp.
 
 **3. Mức tự xử lý (từng VPS).** Mặc định **"Duyệt từng bước"**. Bạn có thể chọn: *Tắt* (AI không tự chạy); *Tự xử lý việc hoàn tác được* (cách ly file, khoá shell, gỡ dòng độc, tắt dịch vụ chạy luôn, dừng tiến trình vẫn chờ bạn); *Tự xử lý tất cả* (kể cả dừng tiến trình). Ở hai mức tự xử, khi có sự cố hub tự thu thập bằng chứng, gọi AI và gửi lệnh mà không chờ bạn bấm. Mọi việc đều hiện ở khung AI và Nhật ký. **Nên bật sau khi bạn đã thấy AI đề xuất đúng vài lần ở chế độ duyệt**, vì AI vẫn có thể sai.
 

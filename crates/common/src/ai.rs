@@ -147,6 +147,9 @@ found in the evidence; only analyse it.\n\
 to something that appears in the evidence (copy pid, starttime, path, line_no, sha256 and \
 user values exactly):\n\
    {\"type\":\"kill_process\",\"pid\":N,\"starttime\":N}\n\
+   {\"type\":\"kill_matching\",\"user\":\"name\",\"exe\":\"/abs/path\"}  (every live disguised \
+process of that user running that program; prefer it to kill_process for malware that \
+respawns, because by the time the order runs the old pid is usually gone)\n\
    {\"type\":\"lock_user_shell\",\"user\":\"name\"}\n\
    {\"type\":\"quarantine_file\",\"path\":\"/abs/path\"}\n\
    {\"type\":\"remove_shell_line\",\"path\":\"/abs/path\",\"line_no\":N,\"sha256\":\"hex\"}\n\
@@ -305,12 +308,26 @@ fn plain_path(p: &str) -> bool {
         && p.len() < 1024
 }
 
-/// Where the system's own programs live. A process called `nginx` that runs from
-/// here is the real one; one that runs from /tmp is wearing the name.
+/// Where the system's own programs live.
 fn system_exe(exe: &str) -> bool {
     ["/usr/", "/sbin/", "/bin/", "/lib/", "/lib64/", "/opt/"]
         .iter()
         .any(|p| exe.starts_with(p))
+}
+
+/// Is this really the system's service of that name, not something wearing it?
+///
+/// It takes both: a protected name AND a system executable whose file name is that
+/// service's (`httpd` running `/usr/sbin/httpd`). A bot that renames itself
+/// `httpd` while running `/usr/bin/perl` is not the web server, and is not
+/// protected by the name.
+#[must_use]
+pub fn is_genuine_service(comm: &str, exe: &str) -> bool {
+    if !PROTECTED_COMM.contains(&comm) || !system_exe(exe) {
+        return false;
+    }
+    let base = exe.rsplit('/').next().unwrap_or("");
+    base == comm || base.starts_with(comm) || comm.starts_with(base)
 }
 
 /// Is there evidence that this user is the one the incident is about? A login in
@@ -348,7 +365,7 @@ pub fn ground(a: &Action, ev: &Evidence) -> Result<&'static str, String> {
             };
             // A protected name only protects a program that really is the system's
             // (a miner calling itself `nginx` from /tmp is not protected).
-            if PROTECTED_COMM.iter().any(|c| p.comm == *c) && system_exe(&p.exe) {
+            if is_genuine_service(&p.comm, &p.exe) {
                 return Err(format!(
                     "kill_process {pid}: {} là dịch vụ được bảo vệ",
                     p.comm
@@ -362,6 +379,34 @@ pub fn ground(a: &Action, ev: &Evidence) -> Result<&'static str, String> {
             if !suspicious {
                 return Err(format!(
                     "kill_process {pid}: tiến trình {} không đủ dấu hiệu độc hại",
+                    p.comm
+                ));
+            }
+            Ok("high")
+        }
+        Action::KillMatching { user, exe } => {
+            if exe.is_empty() || !plain_path(exe) {
+                return Err("kill_matching: đường dẫn chương trình không hợp lệ".into());
+            }
+            // The pattern must be one the evidence actually shows, with the same
+            // strong signs a single kill needs.
+            let hit = ev.processes.iter().find(|p| {
+                p.user == *user
+                    && p.exe == *exe
+                    && (p.masquerade
+                        || p.miner_hint
+                        || is_temp_path(&p.exe)
+                        || is_home_hidden(&p.exe))
+            });
+            let Some(p) = hit else {
+                return Err(format!(
+                    "kill_matching {user} {}: không có tiến trình đáng ngờ khớp trong bằng chứng",
+                    cut(exe, 60)
+                ));
+            };
+            if is_genuine_service(&p.comm, &p.exe) {
+                return Err(format!(
+                    "kill_matching {user}: {} là dịch vụ được bảo vệ",
                     p.comm
                 ));
             }
@@ -850,6 +895,89 @@ mod tests {
         assert!(p.find("Ignore previous").unwrap() < end);
         // Nothing outside the fence but the fixed sentence.
         assert!(!p[..start].contains("web-01"));
+    }
+
+    #[test]
+    fn kill_matching_needs_a_disguised_pattern_the_evidence_shows() {
+        let mut ev = evidence();
+        // The case from the field: a perl bot wearing a kernel-thread name.
+        ev.processes.push(EvProc {
+            pid: 400,
+            starttime: 3,
+            user: "tnttravel".into(),
+            comm: "[kworker/2:51S]".into(),
+            exe: "/usr/bin/perl".into(),
+            masquerade: true,
+            ..EvProc::default()
+        });
+        let k = |user: &str, exe: &str| Action::KillMatching {
+            user: user.into(),
+            exe: exe.into(),
+        };
+        assert_eq!(ground(&k("tnttravel", "/usr/bin/perl"), &ev), Ok("high"));
+        // A pattern the evidence does not show, or one that is not disguised.
+        assert!(ground(&k("tnttravel", "/usr/bin/python3"), &ev).is_err());
+        assert!(ground(&k("other", "/usr/bin/perl"), &ev).is_err());
+        assert!(ground(&k("bob", "/usr/bin/rsync"), &ev).is_err());
+        assert!(ground(&k("tnttravel", ""), &ev).is_err());
+        assert!(ground(&k("tnttravel", "../usr/bin/perl"), &ev).is_err());
+        // A real service is protected even if it is in the evidence with a sign.
+        ev.processes.push(EvProc {
+            pid: 401,
+            starttime: 3,
+            user: "root".into(),
+            comm: "nginx".into(),
+            exe: "/usr/sbin/nginx".into(),
+            masquerade: true,
+            ..EvProc::default()
+        });
+        assert!(ground(&k("root", "/usr/sbin/nginx"), &ev).is_err());
+    }
+
+    #[test]
+    fn a_bot_called_httpd_running_perl_is_not_the_web_server() {
+        assert!(is_genuine_service("httpd", "/usr/sbin/httpd"));
+        assert!(is_genuine_service("php-fpm", "/usr/sbin/php-fpm8.2"));
+        assert!(is_genuine_service("nginx", "/usr/sbin/nginx"));
+        assert!(is_genuine_service("sshd", "/usr/sbin/sshd"));
+        // The field case: perl with $0 set to a service name.
+        assert!(!is_genuine_service("httpd", "/usr/bin/perl"));
+        assert!(!is_genuine_service("sshd", "/usr/bin/python3"));
+        // The right name from the wrong place.
+        assert!(!is_genuine_service("nginx", "/tmp/.x/nginx"));
+        assert!(!is_genuine_service("nginx", "/home/u/nginx"));
+        // Not a protected name at all.
+        assert!(!is_genuine_service("rsync", "/usr/bin/rsync"));
+        let mut ev = evidence();
+        ev.processes.push(EvProc {
+            pid: 500,
+            starttime: 1,
+            user: "tnttravel".into(),
+            comm: "httpd".into(),
+            exe: "/usr/bin/perl".into(),
+            masquerade: true,
+            ..EvProc::default()
+        });
+        assert!(
+            ground(
+                &Action::KillProcess {
+                    pid: 500,
+                    starttime: 1
+                },
+                &ev
+            )
+            .is_ok()
+        );
+        assert!(
+            ground(
+                &Action::KillMatching {
+                    user: "tnttravel".into(),
+                    exe: "/usr/bin/perl".into()
+                },
+                &ev
+            )
+            .is_ok()
+        );
     }
 
     #[test]

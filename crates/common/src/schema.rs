@@ -606,6 +606,11 @@ pub struct EvUser {
 pub enum Action {
     /// SIGKILL one process, identified by pid and start time.
     KillProcess { pid: i32, starttime: u64 },
+    /// SIGKILL every live process of `user` running `exe` that is disguised (a
+    /// kernel-thread name, a temp or hidden executable, a miner marker). For
+    /// malware that respawns: by the time an order arrives the pid it had when
+    /// the evidence was taken is usually gone, but the pattern is not.
+    KillMatching { user: String, exe: String },
     /// Set a user's login shell to a non-login one (undoable).
     LockUserShell { user: String },
     /// Move a file into the quarantine vault (restorable with `sn restore`).

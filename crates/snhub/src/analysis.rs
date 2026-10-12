@@ -241,29 +241,58 @@ pub fn run(st: &Arc<AppState>, agent_id: &str) {
 
     // Unattended: order what the VPS's autonomy level allows. The rest waits for a click.
     if auto && let Ok(Some(proposal)) = db.get_proposal(id) {
-        let indices: Vec<usize> = proposal
-            .plan
-            .proposed
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| ai::auto_allows(&autonomy, &p.risk))
-            .map(|(i, _)| i)
-            .collect();
-        if !indices.is_empty() {
-            match order(&db, agent_id, &proposal, &indices, "ai-auto", at) {
-                Ok(job) => tracing::info!(
-                    "ai-auto: {agent_id} ordered {} action(s), job {job}",
-                    indices.len()
-                ),
-                Err(e) => {
-                    let _ = db.set_proposal_status(
-                        id,
-                        "proposed",
-                        &format!("Không tự thực hiện được: {e:#}"),
-                    );
-                }
-            }
+        auto_order(&db, agent_id, &proposal, &autonomy, at);
+    }
+}
+
+/// Marks a proposal whose unattended order could not be sent yet; the next report
+/// from the VPS retries it (see [`retry_waiting`]).
+const WAITING_NOTE: &str =
+    "Chưa gửi được lệnh tự động (VPS còn lệnh khác chưa chạy), sẽ tự thử lại";
+
+/// Order what the VPS's autonomy level allows without a click. If the VPS still has
+/// an unrun job (one slot per VPS), the proposal is left waiting and retried when
+/// the VPS next reports, instead of being dropped.
+fn auto_order(db: &Db, agent_id: &str, proposal: &ProposalRow, autonomy: &str, at: i64) {
+    let indices: Vec<usize> = proposal
+        .plan
+        .proposed
+        .iter()
+        .enumerate()
+        .filter(|(i, p)| !proposal.applied.contains(i) && ai::auto_allows(autonomy, &p.risk))
+        .map(|(i, _)| i)
+        .collect();
+    if indices.is_empty() {
+        return;
+    }
+    match order(db, agent_id, proposal, &indices, "ai-auto", at) {
+        Ok(job) => tracing::info!(
+            "ai-auto: {agent_id} ordered {} action(s), job {job}",
+            indices.len()
+        ),
+        Err(e) => {
+            tracing::warn!("ai-auto: {agent_id}: {e:#}");
+            let _ =
+                db.set_proposal_status(proposal.id, "proposed", &format!("{WAITING_NOTE} ({e:#})"));
         }
+    }
+}
+
+/// A proposal that was waiting for the job slot gets another try. Called with each
+/// report from the VPS, which is when the slot frees up.
+pub fn retry_waiting(db: &Db, agent_id: &str, at: i64) {
+    let Ok(Some(p)) = db.latest_proposal(agent_id) else {
+        return;
+    };
+    // Only a proposal that was waiting, for a couple of hours: evidence ages out.
+    if p.status != "proposed" || !p.note.starts_with(WAITING_NOTE) || at - p.created > 2 * 3600 {
+        return;
+    }
+    let Ok(state) = db.ai_state(agent_id) else {
+        return;
+    };
+    if state.autonomy == ai::AUTONOMY_AUTO_SAFE || state.autonomy == ai::AUTONOMY_AUTO_ALL {
+        auto_order(db, agent_id, &p, &state.autonomy, at);
     }
 }
 

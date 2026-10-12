@@ -72,6 +72,9 @@ pub async fn post_report(State(st): State<Arc<AppState>>, body: String) -> impl 
     if let Some(rem) = &env.body.remediation {
         let _ = db.attach_remediation(&agent_id, rem);
     }
+    // This report shows what the VPS has run, so a job slot may have freed up: let a
+    // proposal that was waiting for it be ordered now.
+    analysis::retry_waiting(&db, &agent_id, at);
     if !analyse_now {
         let has_provider = db.default_provider().ok().flatten().is_some();
         // A proposal still waiting for an answer (or for the VPS) means the last

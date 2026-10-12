@@ -26,7 +26,7 @@ use snsec_common::ai;
 use snsec_common::schema::{Action, ActionResult, Evidence, RemediationReport};
 
 use crate::config::Config;
-use crate::contain;
+
 use crate::evidence;
 use crate::evidence_parse::{is_safe_username, line_sha};
 use crate::state::State;
@@ -143,6 +143,7 @@ fn save_result(state: &State, report: &RemediationReport) {
 fn apply(state: &State, action: &Action, ev: &Evidence) -> Result<String> {
     match action {
         Action::KillProcess { pid, starttime } => kill_process(*pid, *starttime),
+        Action::KillMatching { user, exe } => kill_matching(user, exe),
         Action::LockUserShell { user } => lock_user_shell(state, user),
         Action::QuarantineFile { path } => {
             // The owner the evidence recorded: a file that has since been replaced
@@ -169,19 +170,105 @@ fn apply(state: &State, action: &Action, ev: &Evidence) -> Result<String> {
 // The actions
 // ---------------------------------------------------------------------------
 
+/// Why a process must not be killed here, if so: pid 1, the agent itself, or the
+/// system's own service of that name. A process that merely *wears* a service
+/// name (perl called `httpd`) is not protected by it.
+fn protected(pid: i32, comm: &str, exe: &str) -> Option<&'static str> {
+    if pid <= 1 {
+        Some("init")
+    } else if pid == std::process::id() as i32 {
+        Some("chính agent")
+    } else if ai::is_genuine_service(comm, exe) {
+        Some("dịch vụ hệ thống")
+    } else {
+        None
+    }
+}
+
 fn kill_process(pid: i32, starttime: u64) -> Result<String> {
     let Some(st) = proc::read_stat(pid) else {
-        bail!("tiến trình {pid} đã thoát");
+        bail!("tiến trình {pid} đã thoát (mã độc có thể tự khởi động lại: dùng kill_matching)");
     };
     if st.starttime != starttime {
         bail!("pid {pid} nay là một tiến trình khác (đã bị dùng lại)");
     }
     let (exe, _deleted) = proc::exe(pid);
-    if let Some(why) = contain::protected_reason(pid, &st, &exe) {
+    if let Some(why) = protected(pid, &st.comm, &exe) {
         bail!("không dừng pid {pid} ({}): {why}", st.comm);
     }
     kill(Pid::from_raw(pid), Signal::SIGKILL).with_context(|| format!("kill {pid}"))?;
     Ok(format!("đã dừng pid {pid} ({}, {exe})", st.comm))
+}
+
+/// Most processes one `kill_matching` will stop.
+const MAX_KILL_MATCHING: usize = 200;
+
+/// Stop every live process of `user` running `exe` that is disguised *right now*
+/// (a kernel-thread name on a real program, a temp or hidden executable, or a
+/// miner marker in its command line). The pid in the evidence is not needed: the
+/// pattern is what matters for malware that respawns.
+fn kill_matching(user: &str, exe: &str) -> Result<String> {
+    if !is_safe_username(user) {
+        bail!("tên tài khoản không hợp lệ");
+    }
+    let uid = nix::unistd::User::from_name(user)
+        .ok()
+        .flatten()
+        .with_context(|| format!("không tìm thấy tài khoản {user}"))?
+        .uid
+        .as_raw();
+    let mut killed: Vec<i32> = Vec::new();
+    let mut spared = 0usize;
+    for pid in proc::list_pids() {
+        if proc::uid(pid) != Some(uid) {
+            continue;
+        }
+        let Some(st) = proc::read_stat(pid) else {
+            continue;
+        };
+        let (pexe, _deleted) = proc::exe(pid);
+        if pexe != exe {
+            continue;
+        }
+        let cmd = proc::cmdline(pid).join(" ").to_ascii_lowercase();
+        let miner = crate::triage::MINER_HINTS.iter().any(|h| cmd.contains(h));
+        let disguised =
+            (crate::evidence_parse::looks_like_kthread(&st.comm) && st.ppid != 2 && pid != 2)
+                || miner
+                || pexe.starts_with("/dev/shm/")
+                || pexe.starts_with("/tmp/")
+                || pexe.starts_with("/var/tmp/");
+        if !disguised {
+            spared += 1;
+            continue;
+        }
+        if protected(pid, &st.comm, &pexe).is_some() {
+            spared += 1;
+            continue;
+        }
+        if killed.len() >= MAX_KILL_MATCHING {
+            break;
+        }
+        if kill(Pid::from_raw(pid), Signal::SIGKILL).is_ok() {
+            killed.push(pid);
+        }
+    }
+    Ok(if killed.is_empty() {
+        format!(
+            "không còn tiến trình nào của {user} chạy {exe} đang giả danh (đã thoát hoặc đã bị dừng); {spared} tiến trình khác của chương trình này được giữ nguyên"
+        )
+    } else {
+        format!(
+            "đã dừng {} tiến trình của {user} chạy {exe} (pid {}); {spared} tiến trình khác được giữ nguyên",
+            killed.len(),
+            killed
+                .iter()
+                .take(10)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })
 }
 
 /// The current login shell of `user` from `/etc/passwd`.

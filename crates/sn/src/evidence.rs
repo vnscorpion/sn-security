@@ -137,10 +137,10 @@ pub fn collect(state: &State) -> Result<Evidence> {
         .into_iter()
         .filter(|u| Path::new(&u.home).is_dir())
         .collect();
-    // The only regular account on the box is its owner.
-    let only_one = shell_users.len() == 1;
+    // Administrator = can use sudo. (An account being the only regular one proves
+    // nothing: on a hosting server it is a customer, and the one most likely hacked.)
     for u in &mut shell_users {
-        u.admin = only_one || admins.contains(&u.name);
+        u.admin = admins.contains(&u.name);
     }
 
     let mut persistence = triage_persistence(&triage.persistence);

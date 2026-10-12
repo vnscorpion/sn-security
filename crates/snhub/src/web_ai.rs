@@ -86,6 +86,12 @@ fn action_vi(a: &Action, ev: Option<&Evidence>) -> Markup {
                 }
             }
         }
+        Action::KillMatching { user, exe } => {
+            html! {
+                "Dừng mọi tiến trình đang giả danh của tài khoản " b { (user) } " chạy " code { (exe) }
+                " (kể cả bản tự khởi động lại, không cần đúng pid)"
+            }
+        }
         Action::LockUserShell { user } => {
             html! { "Khoá shell đăng nhập của tài khoản " b { (user) } " (đổi sang nologin)" }
         }

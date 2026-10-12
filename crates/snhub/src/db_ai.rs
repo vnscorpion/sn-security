@@ -409,7 +409,7 @@ impl Db {
     /// index ordered so far.
     pub fn mark_proposal_ordered(&self, id: i64, job_id: &str, applied: &[usize]) -> Result<()> {
         self.conn.execute(
-            "UPDATE proposals SET status = 'executing', job_id = ?1, applied_json = ?2 WHERE id = ?3",
+            "UPDATE proposals SET status = 'executing', note = '', job_id = ?1, applied_json = ?2 WHERE id = ?3",
             params![job_id, serde_json::to_string(applied)?, id],
         )?;
         Ok(())

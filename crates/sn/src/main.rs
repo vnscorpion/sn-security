@@ -83,7 +83,12 @@ enum Cmd {
     InstallClamav,
     /// Take a read-only incident snapshot (processes, start-up files, temp
     /// executables, SSH logins, open ports) and keep it for the hub.
-    Evidence,
+    Evidence {
+        /// After collecting, send the report at once and keep asking the hub for
+        /// orders for a few minutes (used by the hub-requested snapshot).
+        #[arg(long)]
+        follow: bool,
+    },
     /// Carry out an incident-response order the hub gave (root). Reads the job
     /// file the agent wrote when it received the order.
     Remediate {
@@ -177,10 +182,13 @@ fn run() -> Result<()> {
             };
             hunt::run(&cfg, &state, &opts)?;
         }
-        Cmd::Evidence => {
+        Cmd::Evidence { follow } => {
             let state = State::open()?;
             let ev = evidence::collect(&state)?;
             evidence::print(&ev);
+            if follow {
+                hub::follow_incident(&cfg, &state);
+            }
         }
         Cmd::Remediate { job } => {
             let state = State::open()?;

@@ -285,10 +285,11 @@ fn evidence_unit_args() -> Vec<String> {
         "--description=SN Secure evidence snapshot (requested from the hub)",
         "--property=Nice=10",
         "--property=IOSchedulingClass=idle",
-        "--property=RuntimeMaxSec=5min",
+        "--property=RuntimeMaxSec=15min",
         "--property=MemoryMax=512M",
         "/usr/local/bin/sn",
         "evidence",
+        "--follow",
     ]
     .iter()
     .map(|s| (*s).to_string())
@@ -427,7 +428,66 @@ fn root_keys(cfg: &Config) -> Vec<VerifyingKey> {
         .collect()
 }
 
+/// Fetch the hub's desired state and apply it, one caller at a time.
+///
+/// The watch timer and an incident follow-up (below) can both ask at once; two
+/// that both see a new order would both run its job. A lock file in the state
+/// directory makes the second wait and then see the first one's result.
 fn fetch_and_apply_desired(cfg: &Config, state: &State) -> Result<()> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(state.dir.join("desired.lock"))
+        .context("opening desired.lock")?;
+    let guard = nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive)
+        .map_err(|(_, e)| anyhow::anyhow!("locking desired.lock: {e}"))?;
+    let result = fetch_and_apply_desired_unlocked(cfg, state);
+    // Released here (and if the process dies, by the kernel).
+    drop(guard);
+    result
+}
+
+/// Start the watch service now, so a report (with fresh evidence or a result) is
+/// sent at once instead of at the next five-minute tick.
+fn start_watch_now() {
+    if let Some(sc) = util::find_bin("systemctl") {
+        let _ = std::process::Command::new(sc)
+            .args(["start", "--no-block", "sn-watch.service"])
+            .stdin(std::process::Stdio::null())
+            .status();
+    }
+}
+
+/// How long an incident follow-up keeps polling the hub, and how often.
+const FOLLOW_SECS: u64 = 10 * 60;
+const FOLLOW_EVERY: Duration = Duration::from_secs(15);
+
+/// After evidence was collected for an incident: send it now, then ask the hub
+/// for orders every few seconds for a while (instead of waiting for the next
+/// timer tick), and send the result as soon as a remediation has run. An order
+/// arrives within seconds of the analysis, and the process it targets is less
+/// likely to be gone. Bounded in time; stops early once a result exists.
+pub fn follow_incident(cfg: &Config, state: &State) {
+    if cfg.hub.url.is_empty() || cfg.hub.agent_key.is_empty() {
+        return;
+    }
+    let started = util::now_secs();
+    start_watch_now();
+    let deadline = std::time::Instant::now() + Duration::from_secs(FOLLOW_SECS);
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(FOLLOW_EVERY);
+        if let Err(e) = fetch_and_apply_desired(cfg, state) {
+            eprintln!("follow: desired fetch failed: {e:#}");
+        }
+        if crate::remediate::latest_result(state).is_some_and(|r| r.at >= started) {
+            start_watch_now();
+            return;
+        }
+    }
+}
+
+fn fetch_and_apply_desired_unlocked(cfg: &Config, state: &State) -> Result<()> {
     let keys = hub_keys(cfg);
     if keys.is_empty() {
         return Ok(()); // no hub keys configured; cannot trust desired
