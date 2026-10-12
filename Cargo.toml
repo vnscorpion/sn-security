@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/common", "crates/sn", "crates/snhub"]
 
 [workspace.package]
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
@@ -38,6 +38,13 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 maud = "0.26"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+hmac = "0.12"
+sha1 = "0.10"
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+ciborium = "0.2"
+argon2 = "0.5"
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+base64 = "0.22"
 
 mimalloc = "0.1"
 

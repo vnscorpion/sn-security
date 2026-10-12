@@ -124,7 +124,7 @@ Listening: $BIND  (public: ${PUBLIC_URL:-<set --public-url>})
 
 Next:
   1) Set the admin password:
-       sudo -u snhub snhub --config $CONFIG set-admin-password --password 'YOUR_PASSWORD'
+       sudo -u snhub snhub --config $CONFIG set-admin-password --password 'YOUR_PASSWORD'   (at least 10 characters)
        sudo systemctl restart snhub
 
   2) Put a TLS reverse proxy / VPN in front of $BIND, then open the UI and

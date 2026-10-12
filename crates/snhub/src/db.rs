@@ -78,6 +78,8 @@ impl Db {
         conn.execute_batch(SCHEMA).context("applying schema")?;
         conn.execute_batch(crate::db_ai::SCHEMA_AI)
             .context("applying AI schema")?;
+        conn.execute_batch(crate::db_auth::SCHEMA_AUTH)
+            .context("applying auth schema")?;
         Ok(Db { conn })
     }
 

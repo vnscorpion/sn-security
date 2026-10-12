@@ -13,7 +13,11 @@ public_url = "https://a.example.net"
 # is printed once by `snhub init` and must be stored off this server.
 root_pubkey = "ed25519:..."
 
-# Admin login — set via `snhub set-admin-password`.
+# Admin login — set via `snhub set-admin-password`. Two-factor sign-in (app,
+# passkeys) is set up in the web UI under "Bảo mật"; passkeys need https:// above.
+# Argon2id hash of the password (set by `snhub set-admin-password`); older
+# installs may still have the salted SHA-256 pair below, which keeps working.
+admin_password_hash = ""
 admin_salt = ""
 admin_password_sha256 = ""
 

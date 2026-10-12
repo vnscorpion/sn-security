@@ -104,6 +104,7 @@ pub(crate) fn shell(title: &str, body: Markup) -> Markup {
                         a href="/add-vps" { "Thêm VPS" }
                         a href="/log" { "Nhật ký" }
                         a href="/settings" { "Cài đặt AI" }
+                        a href="/security" { "Bảo mật" }
                     }
                     span class="sp" {}
                     form class="ipcheck" method="get" action="/check-ip" {
@@ -119,7 +120,7 @@ pub(crate) fn shell(title: &str, body: Markup) -> Markup {
 
 pub(crate) fn guard(st: &AppState, headers: &HeaderMap) -> Option<Response> {
     match auth::session_from_headers(headers) {
-        Some(tok) if st.sessions.valid(&tok) => None,
+        Some(tok) if st.sessions.valid(&tok, now()) => None,
         _ => Some(Redirect::to("/login").into_response()),
     }
 }
@@ -639,95 +640,6 @@ fn severity_vi(s: &str) -> &'static str {
     }
 }
 
-// ---- login ----------------------------------------------------------------
-
-fn login_shell(title: &str, inner: Markup) -> String {
-    shell(
-        title,
-        html! {
-            div class="card" style="max-width:380px;margin:8vh auto" {
-                (inner)
-            }
-        },
-    )
-    .into_string()
-}
-
-pub async fn login_page() -> Html<String> {
-    Html(login_shell(
-        "Đăng nhập",
-        html! {
-            h1 { "Đăng nhập" }
-            p class="sub" { "Trung tâm quản lý bảo mật VPS." }
-            form method="post" action="/login" {
-                label class="f" {
-                    span class="t" { "Mật khẩu quản trị" }
-                    input type="password" name="password" style="width:100%" autofocus;
-                }
-                p { button type="submit" { "Đăng nhập" } }
-            }
-        },
-    ))
-}
-
-#[derive(Deserialize)]
-pub struct LoginForm {
-    password: String,
-}
-
-pub async fn login_post(State(st): State<Arc<AppState>>, Form(f): Form<LoginForm>) -> Response {
-    if st.cfg.admin_password_sha256.is_empty() {
-        return Html(login_shell(
-            "Đăng nhập",
-            html! {
-                h1 { "Chưa đặt mật khẩu" }
-                p class="help" { "Trên máy chủ chạy: " code { "snhub set-admin-password --password '...'" } " rồi " code { "systemctl restart snhub" } "." }
-            },
-        ))
-        .into_response();
-    }
-    let got = auth::hash_password(&st.cfg.admin_salt, &f.password);
-    if !auth::ct_eq(&got, &st.cfg.admin_password_sha256) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Html(login_shell(
-                "Đăng nhập",
-                html! {
-                    h1 { "Sai mật khẩu" }
-                    p { a href="/login" { "← Thử lại" } }
-                },
-            )),
-        )
-            .into_response();
-    }
-    let token = auth::new_session_token();
-    st.sessions.insert(token.clone());
-    let cookie = format!(
-        "{}={}; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400",
-        auth::COOKIE,
-        token
-    );
-    Response::builder()
-        .status(StatusCode::SEE_OTHER)
-        .header(header::LOCATION, "/")
-        .header(header::SET_COOKIE, cookie)
-        .body(axum::body::Body::empty())
-        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
-}
-
-pub async fn logout(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if let Some(tok) = auth::session_from_headers(&headers) {
-        st.sessions.remove(&tok);
-    }
-    let clear = format!("{}=; Path=/; Max-Age=0", auth::COOKIE);
-    Response::builder()
-        .status(StatusCode::SEE_OTHER)
-        .header(header::LOCATION, "/login")
-        .header(header::SET_COOKIE, clear)
-        .body(axum::body::Body::empty())
-        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
-}
-
 // ---- overview --------------------------------------------------------------
 
 pub async fn overview(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -765,6 +677,7 @@ pub async fn overview(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Re
             }
         })
         .collect();
+    let two_factor = db.second_factor_enrolled();
     drop(db);
 
     let total = rows.len();
@@ -776,6 +689,14 @@ pub async fn overview(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Re
     let body = html! {
         h1 { "Tổng quan" }
         p class="sub" { "Toàn bộ VPS đang được bảo vệ và theo dõi." }
+
+        @if !two_factor {
+            div class="note" style="border-left-color:var(--warn)" {
+                b { "Đăng nhập hub mới chỉ có mật khẩu. " }
+                "Hub điều khiển được mọi VPS, nên hãy bật xác thực hai bước (Google Authenticator hoặc passkey) ở "
+                a href="/security" { "trang Bảo mật" } "."
+            }
+        }
 
         div class="stats" {
             div class="stat" { div class="n" { (total) } div class="l" { "VPS" } }

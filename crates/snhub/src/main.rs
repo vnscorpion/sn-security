@@ -12,10 +12,14 @@ mod auth;
 mod config;
 mod db;
 mod db_ai;
+mod db_auth;
 mod desired;
 mod keys;
+mod totp;
 mod web;
 mod web_ai;
+mod web_auth;
+mod webauthn;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -39,6 +43,9 @@ pub struct AppState {
     pub hubkey: HubKey,
     pub cfg: HubConfig,
     pub sessions: auth::Sessions,
+    /// Logins that passed the password and wait for their second factor.
+    pub pending: auth::Pending,
+    pub limiter: auth::Limiter,
 }
 
 #[derive(Parser)]
@@ -79,6 +86,10 @@ enum Cmd {
         #[arg(long)]
         password: Option<String>,
     },
+    /// Forget the authenticator app, every passkey and the recovery codes (when
+    /// the second factor is lost). The password stays; sign in with it, then
+    /// enrol again on the Bảo mật page.
+    Reset2fa,
 }
 
 fn now() -> i64 {
@@ -109,6 +120,7 @@ fn real_main() -> Result<()> {
         Cmd::Serve => cmd_serve(&cli.config),
         Cmd::AddVps { name } => cmd_add_vps(&cli.config, &name),
         Cmd::SetAdminPassword { password } => cmd_set_password(&cli.config, password),
+        Cmd::Reset2fa => cmd_reset_2fa(&cli.config),
     }
 }
 
@@ -156,17 +168,40 @@ fn cmd_set_password(config_path: &Path, password: Option<String>) -> Result<()> 
     let pw = password
         .or_else(|| std::env::var("SNHUB_ADMIN_PASSWORD").ok())
         .context("provide --password or set SNHUB_ADMIN_PASSWORD")?;
-    if pw.len() < 8 {
-        anyhow::bail!("password must be at least 8 characters");
+    if let Some(problem) = auth::password_problem(&pw) {
+        anyhow::bail!("{problem}");
     }
-    use rand::RngCore;
-    let mut salt = [0u8; 16];
-    rand::rngs::OsRng.fill_bytes(&mut salt);
-    let salt_hex = hex::encode(salt);
-    cfg.admin_password_sha256 = auth::hash_password(&salt_hex, &pw);
-    cfg.admin_salt = salt_hex;
+    let hash = auth::hash_password_argon2(&pw);
+    if hash.is_empty() {
+        anyhow::bail!("could not hash the password");
+    }
+    // Argon2id from now on; the old salted SHA-256 pair is dropped.
+    cfg.admin_password_hash = hash.clone();
+    cfg.admin_password_sha256.clear();
+    cfg.admin_salt.clear();
     cfg.save(config_path)?;
-    println!("admin password set.");
+    // A password changed from the web UI lives in the database and would
+    // otherwise win over this one: replace it too. No restart needed.
+    let db = Db::open(&cfg.data_path().join("snhub.sqlite"))?;
+    db.set_admin_pw_hash(&hash, now())?;
+    println!("admin password set (Argon2id).");
+    Ok(())
+}
+
+fn cmd_reset_2fa(config_path: &Path) -> Result<()> {
+    let cfg = HubConfig::load(config_path)?;
+    let db = Db::open(&cfg.data_path().join("snhub.sqlite"))?;
+    db.reset_2fa()?;
+    db.log_login(
+        now(),
+        "console",
+        true,
+        "reset 2FA",
+        "bằng dòng lệnh trên máy chủ",
+    );
+    println!(
+        "Two-factor sign-in removed (app, passkeys, recovery codes). The password is unchanged."
+    );
     Ok(())
 }
 
@@ -197,6 +232,8 @@ fn cmd_serve(config_path: &Path) -> Result<()> {
         hubkey,
         cfg: cfg.clone(),
         sessions: auth::Sessions::default(),
+        pending: auth::Pending::default(),
+        limiter: auth::Limiter::default(),
     });
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -218,8 +255,46 @@ async fn serve(cfg: HubConfig, state: Arc<AppState>) -> Result<()> {
         .route("/v1/enroll", post(api::post_enroll))
         // admin UI
         .route("/", get(web::overview))
-        .route("/login", get(web::login_page).post(web::login_post))
-        .route("/logout", get(web::logout))
+        .route(
+            "/login",
+            get(web_auth::login_page).post(web_auth::login_post),
+        )
+        .route(
+            "/login/2fa",
+            get(web_auth::login_2fa_page).post(web_auth::login_2fa_post),
+        )
+        .route(
+            "/login/passkey/options",
+            post(web_auth::login_passkey_options),
+        )
+        .route(
+            "/login/passkey/verify",
+            post(web_auth::login_passkey_verify),
+        )
+        .route("/logout", get(web_auth::logout))
+        .route("/security", get(web_auth::security_page))
+        .route("/security/password", post(web_auth::change_password))
+        .route("/security/totp/start", post(web_auth::totp_start))
+        .route("/security/totp/confirm", post(web_auth::totp_confirm))
+        .route("/security/totp/disable", post(web_auth::totp_disable))
+        .route("/security/recovery/new", post(web_auth::recovery_new))
+        .route(
+            "/security/passkey/options",
+            post(web_auth::passkey_register_options),
+        )
+        .route(
+            "/security/passkey/register",
+            post(web_auth::passkey_register),
+        )
+        .route(
+            "/security/passkey/{id}/delete",
+            post(web_auth::passkey_delete),
+        )
+        .route("/security/session/{id}/end", post(web_auth::session_end))
+        .route(
+            "/security/sessions/others",
+            post(web_auth::sessions_end_others),
+        )
         .route("/agent/{id}", get(web::agent_detail))
         .route("/agent/{id}/ban", post(web::ban_post))
         .route("/agent/{id}/unban", post(web::unban_post))
@@ -253,6 +328,10 @@ async fn serve(cfg: HubConfig, state: Arc<AppState>) -> Result<()> {
         .route("/install.sh", get(serve_install))
         .route("/sn/{file}", get(serve_sn))
         .route("/healthz", get(|| async { "ok" }))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            web_auth::browser_guard,
+        ))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&cfg.bind)

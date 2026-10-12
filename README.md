@@ -96,6 +96,19 @@ sudo systemctl restart snhub
 
 > Hub mặc định bind `127.0.0.1`. **Đừng expose giao diện admin thẳng ra internet** — đặt sau VPN hoặc reverse proxy TLS có giới hạn IP. Giữ **root secret** ngoài server này (YubiKey / máy air-gapped).
 
+### Bảo mật đăng nhập hub
+
+Hub điều khiển được mọi VPS, nên đăng nhập hub được bảo vệ nhiều lớp. Mở **Bảo mật** trên thanh menu:
+
+- **Xác thực hai bước**: ứng dụng xác thực (Google Authenticator, Authy, 1Password… quét mã QR) và/hoặc **passkey** (vân tay, khuôn mặt, khoá bảo mật). Đã bật thì mật khẩu đúng vẫn chưa vào được hub: phải qua bước hai (5 phút, tối đa 5 lần thử). Mã ứng dụng dùng một lần (không dùng lại được trong cùng 30 giây).
+- **Mã khôi phục** (8 mã dạng `xxxxx-xxxxx-xxxxx`, mỗi mã một lần, chỉ hiện đúng một lần) cho lúc mất điện thoại. Mất cả mã: trên máy chủ chạy `sudo -u snhub snhub --config /etc/snhub/snhub.toml reset-2fa` (xoá mọi cách xác thực thứ hai, giữ mật khẩu).
+- **Passkey cần HTTPS**: đặt `public_url = "https://..."` trong `/etc/snhub/snhub.toml` (đúng tên miền bạn mở hub). Chỉ hỗ trợ khoá ES256 (hầu hết thiết bị hiện nay), không đòi chứng thực thiết bị.
+- **Mật khẩu**: băm Argon2id; tối thiểu 10 ký tự; đổi ngay trong trang Bảo mật (đăng xuất mọi phiên khác). Mọi thay đổi (đổi mật khẩu, thêm/xoá passkey, bật/tắt 2FA, mã khôi phục mới) đều hỏi lại mật khẩu hiện tại.
+- **Chống dò mật khẩu**: sai quá 5 lần (tính ngay khi nhận yêu cầu, kể cả gửi song song) thì khoá theo địa chỉ IP 30 giây, tăng gấp đôi mỗi lần sai tiếp (tối đa 15 phút); nếu bị dò từ nhiều nơi cùng lúc, hub tạm dừng mọi đăng nhập vài phút. Hub lấy IP khách từ mục cuối của `X-Forwarded-For` (mục do reverse proxy của bạn thêm; IPv6 gộp theo /64), nên chỉ để hub sau đúng một proxy tin cậy (Caddy/Nginx), đừng mở cổng hub thẳng ra internet. Nếu bị dò từ nhiều nơi cùng lúc, bước nhập mật khẩu tạm dừng vài phút, còn bước hai của người đã đúng mật khẩu vẫn vào được.
+- **Phiên đăng nhập** hết hạn sau 24 giờ (hoặc 8 giờ không hoạt động), cookie `HttpOnly`, `SameSite=Strict`, thêm `Secure` khi `public_url` là HTTPS; trang Bảo mật liệt kê các phiên đang mở và nhật ký đăng nhập gần đây để đăng xuất từng phiên. Các yêu cầu ghi từ trình duyệt phải cùng nguồn (kiểm tra `Origin`).
+
+Hub cập nhật từ bản trước: mật khẩu cũ vẫn dùng được (kể cả kiểu băm cũ); đặt lại bằng `set-admin-password` sẽ chuyển sang Argon2id.
+
 ## Thêm một VPS
 
 Trên giao diện hub bấm **"Thêm VPS"** → nhập tên → copy lệnh cài (token dùng một lần, hết hạn 15 phút), dán vào VPS. Lệnh có dạng (`HUB` = URL hub của bạn):

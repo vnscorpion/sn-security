@@ -25,6 +25,10 @@ pub struct HubConfig {
     pub admin_salt: String,
     #[serde(default)]
     pub admin_password_sha256: String,
+    /// Admin login: Argon2id hash (PHC string) of the password. Preferred over the
+    /// SHA-256 pair above, and itself overridden by a password changed in the UI.
+    #[serde(default)]
+    pub admin_password_hash: String,
     /// Optional Telegram alerting.
     #[serde(default)]
     pub telegram: Option<Telegram>,
@@ -52,6 +56,7 @@ impl Default for HubConfig {
             root_pubkey: String::new(),
             admin_salt: String::new(),
             admin_password_sha256: String::new(),
+            admin_password_hash: String::new(),
             telegram: None,
         }
     }
