@@ -22,9 +22,11 @@ mode         = "observe"         # observe (report only) | enforce (ban). Start 
 k            = 5.0               # threshold multiplier over the baseline
 min_requests = 120              # never ban below this many requests/cycle
 trusted_proxies = ["cloudflare"] # "cloudflare" expands to CF ranges; or list CIDRs
-load_alert   = 4.0
-cpu_alert_pct = 85.0
-auto_contain = false             # keep OFF in observe; enable only after tuning
+cpu_alert_pct = 85.0              # cpu_high alert when average CPU since the last cycle reaches this %
+bot_detection = true            # alert when ONE User-Agent / request shape floods in from many IPs
+bot_min_ips = 25                 # ...from at least this many distinct IPs in a cycle
+bot_min_requests = 50            # ...making at least this many dynamic requests
+bot_surge = 5.0                  # ...and at least this many times its usual volume
 
 [fw]
 whitelist = []                   # admin/office CIDRs — only editable here, never remotely

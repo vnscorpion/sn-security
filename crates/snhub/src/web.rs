@@ -246,9 +246,76 @@ fn alert_kind_vi(k: &str) -> &str {
         "log_unreadable" => "Có file log nhưng agent không đọc được",
         "log_format" => "Đọc được log nhưng sai định dạng",
         "mem_high" => "RAM gần đầy",
+        "cpu_high" => "CPU cao liên tục",
+        "bot_ua" => "Nhiều IP khác nhau cùng dùng một User-Agent (nghi bot phân tán)",
+        "bot_shape" => "Nhiều IP khác nhau cùng gửi một kiểu request (nghi bot phân tán)",
         "malware_found" => "Phát hiện file mã độc",
         "malware_suspect" => "Có file nghi ngờ cần xem",
         _ => k,
+    }
+}
+
+/// One table of the busiest User-Agents or request shapes of the last cycle.
+/// Flagged rows come with a ModSecurity rule to review and the example IPs.
+/// The values come from web logs, so they are attacker-controlled: maud escapes
+/// them, and the rule text is escaped again by `snsec_common::waf`.
+fn pattern_table(
+    heading: &str,
+    key_head: &str,
+    rows: &[snsec_common::schema::PatternStat],
+    rule_for: fn(&str) -> Option<String>,
+) -> Markup {
+    html! {
+        h2 style="margin-top:6px" { (heading) }
+        div class="wrap" {
+            table {
+                thead { tr { th { (key_head) } th { "Lượt" } th { "IP khác nhau" } th {} } }
+                tbody {
+                    @if rows.is_empty() { tr { td colspan="4" { div class="empty" { "Chưa có dữ liệu" } } } }
+                    @for p in rows {
+                        tr {
+                            td { code style="word-break:break-all" { (p.key) } }
+                            td { (p.requests) }
+                            td { (p.ips) @if p.ips_capped { "+" } }
+                            td { @if p.flagged { span class="badge b-bad" { "Bất thường" } } }
+                        }
+                        @if p.flagged {
+                            tr { td colspan="4" {
+                                details open {
+                                    summary { "Cách xử lý mục này" }
+                                    @if snsec_common::waf::claims_crawler(&p.key) {
+                                        p class="help" style="color:var(--warn)" {
+                                            "Mục này tự nhận là crawler của công cụ tìm kiếm (Googlebot, Bingbot…), chưa được xác minh. "
+                                            "Crawler thật cũng đến từ nhiều IP. Chặn nhầm sẽ ảnh hưởng SEO, nên hãy kiểm tra bằng reverse DNS trước khi chặn."
+                                        }
+                                    }
+                                    @if let Some(rule) = rule_for(&p.key) {
+                                        p class="help" {
+                                            "Nếu VPS chạy ModSecurity (cPanel, Plesk, DirectAdmin, OPanel), thêm luật dưới đây rồi để chế độ "
+                                            code { "DetectionOnly" } " một lúc, xem nó có chặn nhầm khách thật không, sau đó mới bật chặn. "
+                                            "Hub không tự ghi luật vào VPS."
+                                        }
+                                        pre style="white-space:pre-wrap;word-break:break-all;margin:0 0 10px" { (rule) }
+                                    } @else {
+                                        p class="help" { "Hub không tạo được luật an toàn cho giá trị này (quá dài, có ký tự đặc biệt/mã hoá %, hoặc quá chung chung nên sẽ chặn nhầm). Hãy tự viết luật nếu cần." }
+                                    }
+                                    @if !p.sample_ips.is_empty() {
+                                        p class="help" style="margin:0" {
+                                            "Một vài IP mẫu (" (p.sample_ips.len()) "): "
+                                            span style="font-family:monospace" { (p.sample_ips.join(", ")) }
+                                        }
+                                    }
+                                    p class="help" style="margin:6px 0 0" {
+                                        "Nếu không có WAF thì chỉ chặn được theo IP/CIDR bằng ô chặn IP ở trên. Với bot phân tán, "
+                                        "IP đổi liên tục nên cách này gần như không hiệu quả."
+                                    }
+                                }
+                            } }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -880,6 +947,42 @@ pub async fn agent_detail(
                 p class="help" { "“Đăng nhập thử” = số lần POST vào wp-login.php/xmlrpc.php (dấu hiệu dò mật khẩu)." }
             }
 
+            @if !r.cycle.top_cpu.is_empty() {
+                div class="card" {
+                    h2 { "Ai đang dùng CPU" }
+                    div class="wrap" {
+                        table {
+                            thead { tr { th { "Tài khoản" } th { "Chương trình" } th { "Số tiến trình" } th { "% CPU của cả máy" } } }
+                            tbody { @for g in &r.cycle.top_cpu {
+                                tr { td { (g.user) } td { code { (g.comm) } } td { (g.procs) } td { (format!("{:.1}", g.cpu_pct)) } }
+                            }}
+                        }
+                    }
+                    p class="help" {
+                        "Trung bình từ lần quét trước đến nay (không phải một thời điểm), gộp theo tài khoản và chương trình. "
+                        "Tiến trình chạy xong trước khi agent kịp nhìn sẽ không có ở đây nên tổng có thể nhỏ hơn mức CPU chung. "
+                        "Tài khoản chiếm CPU thường là site bị tấn công hoặc có mã độc: xem thêm mục “Truy cập lặp lại” và “Quét mã độc”."
+                    }
+                }
+            }
+
+            // Old agents do not send these; say so rather than show an empty table.
+            div class="card" {
+                h2 { "Truy cập lặp lại từ nhiều IP" }
+                @if agent_outdated(&agent.version) && r.cycle.top_shapes.is_empty() && r.cycle.top_user_agents.is_empty() {
+                    p class="help" style="margin:0" { "Chưa có số liệu: agent trên VPS này cũ (chưa gửi mục này) hoặc lần quét gần nhất chưa có truy cập động nào. Cập nhật agent nếu nghi là bản cũ." }
+                } @else {
+                    p class="help" style="margin:0 0 12px" {
+                        "Trong lần quét gần nhất có " b { (r.cycle.dynamic_requests) } " lượt truy cập động (không tính ảnh, CSS, JS). "
+                        "Bot phân tán dùng hàng trăm IP, mỗi IP chỉ vài lượt nên không bị luật theo IP bắt; điểm chung của chúng là cùng User-Agent "
+                        "hoặc cùng kiểu request (đường dẫn + tên tham số, không lưu giá trị). Mục nào tăng vọt so với bình thường sẽ có nhãn “Bất thường”."
+                    }
+                    (pattern_table("User-Agent nhiều nhất", "User-Agent", &r.cycle.top_user_agents, snsec_common::waf::rule_for_user_agent))
+                    div style="height:14px" {}
+                    (pattern_table("Kiểu request nhiều nhất", "Kiểu request", &r.cycle.top_shapes, snsec_common::waf::rule_for_shape))
+                }
+            }
+
             @if let Some(t) = &r.triage {
                 div class="card" {
                     h2 { "Khám nhanh — kết luận: " span class="badge b-bad" { (label_vi(&t.label)) } }
@@ -1475,6 +1578,52 @@ mod tests {
         assert!(note("fd00::1").is_some());
         assert!(note("203.0.113.7").is_none());
         assert!(note("2001:db8::1").is_none());
+    }
+
+    fn stat(key: &str, flagged: bool) -> snsec_common::schema::PatternStat {
+        snsec_common::schema::PatternStat {
+            key: key.into(),
+            requests: 400,
+            ips: 190,
+            ips_capped: false,
+            flagged,
+            sample_ips: vec!["203.0.113.5".into(), "198.51.100.9".into()],
+        }
+    }
+
+    #[test]
+    fn a_flagged_pattern_shows_a_rule_and_sample_ips_but_a_normal_one_does_not() {
+        let rows = [
+            stat("GET /?tss-sc&tsscat", true),
+            stat("GET /shop?page", false),
+        ];
+        let html = pattern_table("t", "k", &rows, snsec_common::waf::rule_for_shape).into_string();
+        assert!(html.contains("Bất thường"));
+        assert!(html.contains("SecRule REQUEST_METHOD"));
+        assert!(html.contains("203.0.113.5"));
+        // Only one row is flagged, so only one rule is offered.
+        assert_eq!(html.matches("SecRule REQUEST_METHOD").count(), 1);
+    }
+
+    #[test]
+    fn log_values_cannot_inject_markup_into_the_table() {
+        let evil = "<script>alert(1)</script>";
+        let html = pattern_table(
+            "t",
+            "k",
+            &[stat(evil, true)],
+            snsec_common::waf::rule_for_user_agent,
+        )
+        .into_string();
+        assert!(!html.contains("<script>alert(1)"), "{html}");
+        assert!(html.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn the_new_alert_kinds_have_vietnamese_labels() {
+        for k in ["cpu_high", "bot_ua", "bot_shape"] {
+            assert_ne!(alert_kind_vi(k), k, "{k} has no label");
+        }
     }
 
     fn report_with(active: Vec<snsec_common::schema::ActiveBanInfo>) -> ReportBody {

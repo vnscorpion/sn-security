@@ -23,6 +23,8 @@ Một binary Rust tĩnh (`sn`, ~3 MB) cấp cứu VPS Linux đang bị mã độ
 - Mẫu cố định: bruteforce, probe, scanner, bad_ua, xmlrpc_pingback; cộng ngưỡng truy cập tự học theo khung 15 phút (xem [Ngưỡng chặn IP](#ngưỡng-chặn-ip)).
 - Ban nftables **chỉ cổng web**, TTL + leo thang theo số lần vi phạm (10 phút → 1 giờ → 24 giờ → 7 ngày); IPv6 gộp /64.
 - Đo **RAM/swap** mỗi chu kỳ, cảnh báo khi RAM ≥ 90%.
+- **CPU cao liên tục** (≥ `cpu_alert_pct`, mặc định 85%, 2 chu kỳ liền) kèm **tài khoản và chương trình đang dùng CPU**.
+- **Bot phân tán**: cùng một User-Agent hoặc kiểu request tăng vọt từ nhiều IP khác nhau (xem [Bot phân tán](#bot-phân-tán-và-cpu-cao)).
 - Hai chế độ **observe** (chỉ `would_ban`) / **enforce**; báo cáo ký số lên hub mỗi chu kỳ.
 
 **Hub trung tâm (`snhub`)**
@@ -166,6 +168,19 @@ Mỗi chu kỳ (~5 phút) agent đếm các dòng log mới theo **từng IP** (
 > - Luật `rate` đếm **mọi** request, kể cả ảnh/CSS/JS. Một trang WordPress có thể kéo 30–100 file, nên 120 request/5 phút dễ bị khách bình thường vượt qua, nhất là nhiều người dùng chung một IP (văn phòng, mạng di động). Hãy xem `would_ban` ở chế độ observe ít nhất vài ngày trước khi bật chặn.
 > - `/config.json` và `/phpmyadmin` trong luật `probe` cũng là đường dẫn hợp lệ của một số ứng dụng và của admin.
 > - Chưa có danh sách bot tự miễn chặn: Googlebot, Bingbot... cần thêm tay vào `[fw] whitelist` (ví dụ `66.249.64.0/19` cho Googlebot).
+
+## Bot phân tán và CPU cao
+
+Luật theo IP ở trên **không chặn được** bot chạy qua hàng trăm IP dân dụng, mỗi IP chỉ vài request và trông như trình duyệt thường (ví dụ vụ `?tss-sc=…&tsscat=…` kéo CPU lên 100%). Với loại này agent **chỉ cảnh báo và cho bạn thấy**, không tự chặn:
+
+- **Hub hiện** mục "Truy cập lặp lại từ nhiều IP": User-Agent nhiều nhất và kiểu request nhiều nhất (`METHOD /đường-dẫn?tên-tham-số`; **giá trị tham số không được lưu**, số/token trong đường dẫn gộp thành `{id}`), kèm số lượt và số IP khác nhau. Ảnh/CSS/JS không tính.
+- **Cảnh báo** (`bot_ua` / `bot_shape`) khi trong một chu kỳ một mục có ≥ `bot_min_ips` IP khác nhau (25), ≥ `bot_min_requests` request (50), mỗi IP trung bình ≤ 8 request, và gấp ≥ `bot_surge` lần mức thường của chính mục đó (5). Mức thường là trung bình trượt riêng từng mục, **đóng băng trong lúc đang bị cảnh báo** (một vụ tấn công kéo dài không tự thành "bình thường"; tối đa 1 ngày, sau đó coi là bình thường). Một giờ đầu sau khi cài chỉ học, chưa cảnh báo. Khi CPU cũng cao thì cảnh báo thành khẩn.
+- **Cách xử lý**: mục bất thường kèm sẵn **luật ModSecurity gợi ý** và vài IP mẫu. Với panel chính (cPanel, Plesk, DirectAdmin, OPanel) hãy dùng WAF: dán luật, để `DetectionOnly` xem có chặn nhầm khách thật không rồi mới bật. **Hub không tự ghi luật vào VPS**, và luật chưa được thử trên ModSecurity thật. VPS không có WAF thì chỉ chặn được theo IP/CIDR, và với bot phân tán cách đó gần như vô ích vì IP đổi liên tục.
+- **Có thể báo nhầm:** một chiến dịch quảng cáo, crawler thật (Googlebot, Bing… cũng đến từ nhiều IP), hoặc tính năng mới cũng tạo ra đúng dấu hiệu này. Cảnh báo ghi chú khi UA tự nhận là crawler nhưng điều đó chưa được xác minh (cần reverse DNS).
+- **Tắt** bằng `bot_detection = false` trong `[watch]`.
+- **Giới hạn đã biết:** (1) mục mới hoàn toàn (bản Chrome mới, crawler bắt đầu quét) cũng bị gắn "bất thường" cho tới khi đủ lâu để được coi là bình thường (tối đa ~1 ngày); cảnh báo ghi "not seen recently". (2) Mỗi chu kỳ chỉ theo dõi tối đa 2.000 User-Agent và 2.000 kiểu request đầu tiên; ai đó cố tình gửi hàng nghìn UA lạ có thể che mục thật. (3) Chỉ kiểu request **có tham số** mới được cảnh báo; bot phân tán dò `wp-login.php` không tham số chỉ bị bắt nếu User-Agent của nó bất thường. (4) IP của proxy tin cậy (Cloudflare) bị bỏ qua vì không phải IP khách, nên sau Cloudflare với log dạng `combined` (không có IP thật) tính năng này gần như không thấy gì. (5) Request bị server từ chối (403/429/444) không được tính, nên cảnh báo tự tắt sau khi luật WAF có tác dụng. (6) Chu kỳ không có dòng log mới, hoặc đọc bù sau khi agent tắt một thời gian, không được dùng để cảnh báo hay để học mức bình thường. (7) Luật gợi ý khớp **đúng** đường dẫn (không có dấu `/` cuối) và không được tạo cho giá trị bị cắt ngắn hay có mã hoá `%`.
+
+**CPU cao:** mỗi chu kỳ agent lưu bộ đếm CPU và chu kỳ sau lấy hiệu số, nên con số là **trung bình cả khoảng ~5 phút** chứ không phải một thời điểm. Khi ≥ `cpu_alert_pct` hai chu kỳ liền, cảnh báo `cpu_high` nêu tên các tài khoản/chương trình chiếm CPU nhiều nhất (cũng hiện ở bảng "Ai đang dùng CPU", tính theo % của cả máy). Tiến trình chạy xong giữa hai chu kỳ không thấy được nên tổng các dòng có thể nhỏ hơn mức CPU chung. Hai tuỳ chọn cũ `load_alert` và `auto_contain` đã bị bỏ vì không có tác dụng; file cấu hình cũ còn chúng vẫn chạy bình thường.
 
 ## Quét mã độc
 

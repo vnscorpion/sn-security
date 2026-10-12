@@ -42,6 +42,9 @@ pub struct Meta {
     /// open. One quiet cycle is normal (idle keep-alives); a streak is a symptom.
     #[serde(default)]
     pub blind_streak: u32,
+    /// Consecutive cycles with CPU at or above `cpu_alert_pct`.
+    #[serde(default)]
+    pub cpu_streak: u32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -133,6 +136,24 @@ impl State {
 
     pub fn save_offsets(&self, o: &HashMap<String, Offset>) -> Result<()> {
         atomic_write(&self.p("offsets.json"), &serde_json::to_vec(o)?)
+    }
+
+    // ---- cpu counters and bot baseline ------------------------------------
+
+    pub fn cpu_sample(&self) -> crate::watch::cpu::Sample {
+        load_json(&self.p("cpu.json"))
+    }
+
+    pub fn save_cpu_sample(&self, s: &crate::watch::cpu::Sample) -> Result<()> {
+        atomic_write(&self.p("cpu.json"), &serde_json::to_vec(s)?)
+    }
+
+    pub fn bot_baseline(&self) -> crate::watch::bots::BotBaseline {
+        load_json(&self.p("bots.json"))
+    }
+
+    pub fn save_bot_baseline(&self, b: &crate::watch::bots::BotBaseline) -> Result<()> {
+        atomic_write(&self.p("bots.json"), &serde_json::to_vec(b)?)
     }
 
     // ---- strikes ----------------------------------------------------------

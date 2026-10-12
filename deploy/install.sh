@@ -125,9 +125,7 @@ mode         = "observe"
 k            = 5.0
 min_requests = 120
 trusted_proxies = ["cloudflare"]
-load_alert   = 4.0
 cpu_alert_pct = 85.0
-auto_contain = false
 # auto = detect the web server's logs each cycle (recommended); manual = only the
 # [[watch.sources]] listed in this file. A [[watch.sources]] table must come after
 # every plain key of [watch]: keys placed below it belong to that entry.

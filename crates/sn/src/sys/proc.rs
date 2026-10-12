@@ -162,7 +162,10 @@ pub fn cpu_total_idle() -> Option<(u64, u64)> {
         return None;
     }
     let idle = vals[3] + vals[4]; // idle + iowait
-    let total: u64 = vals.iter().sum();
+    // user nice system idle iowait irq softirq steal. The two guest columns that
+    // follow are already counted inside user/nice, so adding them would inflate
+    // the total and under-report the busy percentage on hosts running VMs.
+    let total: u64 = vals.iter().take(8).sum();
     Some((total, idle))
 }
 
@@ -263,6 +266,22 @@ pub fn cpu_snapshot() -> HashMap<(i32, u64), u64> {
         }
     }
     m
+}
+
+/// Every process with its accumulated CPU time, for per-interval accounting.
+pub fn cpu_procs() -> Vec<crate::watch::cpu::Proc> {
+    list_pids()
+        .into_iter()
+        .filter_map(|pid| {
+            let st = read_stat(pid)?;
+            Some(crate::watch::cpu::Proc {
+                pid,
+                start: st.starttime,
+                comm: st.comm,
+                jiffies: st.utime + st.stime,
+            })
+        })
+        .collect()
 }
 
 /// Does a path live under a suspicious directory (tmpfs / world-writable)?

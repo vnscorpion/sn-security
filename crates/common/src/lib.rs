@@ -13,6 +13,7 @@ pub mod labels;
 pub mod logfmt;
 pub mod net;
 pub mod schema;
+pub mod waf;
 
 /// Wire schema version. Bump the minor when adding optional fields (all new
 /// fields must be `#[serde(default)]`), the major only for a breaking change.

@@ -4,6 +4,8 @@
 //! and sync with the hub. Designed to run for 1–3 seconds and exit.
 
 pub mod baseline;
+pub mod bots;
+pub mod cpu;
 pub mod patterns;
 pub mod tail;
 
@@ -43,6 +45,11 @@ struct CycleData {
     unreadable: u32,
     /// First read error, for the alert text.
     first_error: Option<String>,
+    /// What the dynamic requests looked like (User-Agents, request shapes).
+    bots: bots::Aggregates,
+    /// A read hit its byte cap, so this cycle holds more than one cycle's worth
+    /// of traffic.
+    catch_up: bool,
 }
 
 const MAX_TRACKED_IPS: usize = 100_000;
@@ -221,7 +228,43 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<()> {
             severity: "urgent".into(),
         });
     }
-    let (cpu_busy, _load1) = quick_cpu_busy();
+
+    // CPU over the interval since the last cycle, and who used it.
+    let cpu_now = measure_cpu(state, started, cfg.watch.cpu_alert_pct, meta.cpu_streak);
+    if meta.cpu_streak != cpu_now.streak {
+        meta.cpu_streak = cpu_now.streak;
+        state.save_meta(&meta)?;
+    }
+    let cpu_high = cpu_now.alert.is_some();
+    alerts.extend(cpu_now.alert);
+
+    // Distributed bots: one User-Agent or request shape from many addresses.
+    // Only a cycle that looks like ordinary traffic is judged and learned from:
+    // not one with no lines, not a catch-up read after the agent was off (hours
+    // of traffic in one cycle look like a surge of everything).
+    let representative = data.lines_read > 0 && !data.catch_up && !cpu_now.gap;
+    let mut base_bots = state.bot_baseline();
+    let (flagged_ua, flagged_shape) = if cfg.watch.bot_detection && representative {
+        let verdict = bots::assess(
+            &data.bots,
+            &base_bots,
+            &bots::BotCfg {
+                min_ips: cfg.watch.bot_min_ips,
+                min_requests: cfg.watch.bot_min_requests,
+                surge: cfg.watch.bot_surge,
+            },
+            cpu_high,
+        );
+        alerts.extend(verdict.alerts);
+        base_bots.update(&data.bots, &verdict.flagged_ua, &verdict.flagged_shape);
+        if let Err(e) = state.save_bot_baseline(&base_bots) {
+            eprintln!("watch: save bot baseline: {e:#}");
+        }
+        (verdict.flagged_ua, verdict.flagged_shape)
+    } else {
+        Default::default()
+    };
+    let (top_user_agents, top_shapes) = data.bots.top_patterns(&flagged_ua, &flagged_shape);
     let mem = crate::sys::proc::meminfo().unwrap_or_default();
 
     let cycle = CycleStats {
@@ -231,11 +274,15 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<()> {
         parse_errors: data.parse_errors,
         requests: data.requests,
         load1: crate::sys::proc::loadavg1(),
-        cpu_busy_pct: (cpu_busy * 10.0).round() / 10.0,
+        cpu_busy_pct: (cpu_now.busy * 10.0).round() / 10.0,
         mem_total_mb: mem.total_mb(),
         mem_used_pct: (mem.used_pct() * 10.0).round() / 10.0,
         swap_used_pct: (mem.swap_used_pct() * 10.0).round() / 10.0,
         log_files: data.files_matched,
+        dynamic_requests: data.bots.dynamic,
+        top_user_agents,
+        top_shapes,
+        top_cpu: cpu_now.groups,
         top_ips,
         baseline_ready,
         watch_blind: log_problem,
@@ -293,6 +340,8 @@ fn collect(state: &State, trusted: &[Cidr], sources: &[LogSource]) -> Result<Cyc
         files_known: 0,
         unreadable: 0,
         first_error: None,
+        bots: bots::Aggregates::default(),
+        catch_up: false,
     };
 
     let mut total_bytes: u64 = 0;
@@ -301,6 +350,7 @@ fn collect(state: &State, trusted: &[Cidr], sources: &[LogSource]) -> Result<Cyc
         let fmt = LogFormat::from_str_opt(&src.format).unwrap_or(LogFormat::Combined);
         for path in expand_glob(&src.glob) {
             if total_bytes >= CYCLE_BYTE_BUDGET {
+                data.catch_up = true;
                 break 'outer; // offsets already saved advance next cycle
             }
             data.files_matched += 1;
@@ -323,6 +373,9 @@ fn collect(state: &State, trusted: &[Cidr], sources: &[LogSource]) -> Result<Cyc
                 }
             };
             total_bytes += read.bytes;
+            if read.bytes >= MAX_BYTES_PER_FILE {
+                data.catch_up = true;
+            }
             offsets.insert(key, read.new_offset);
             for line in &read.lines {
                 data.lines_read += 1;
@@ -333,6 +386,15 @@ fn collect(state: &State, trusted: &[Cidr], sources: &[LogSource]) -> Result<Cyc
                         }
                         data.requests += 1;
                         let bankey = net::ban_key(parsed.client);
+                        // A trusted proxy (Cloudflare...) is not a client: counting
+                        // distinct "IPs" there would count the proxy's own edges.
+                        if !net::in_any(trusted, parsed.client) {
+                            data.bots.observe(
+                                &parsed,
+                                bots::hash64(bankey.as_bytes()),
+                                parsed.client,
+                            );
+                        }
                         data.ip_of_key
                             .entry(bankey.clone())
                             .or_insert(parsed.client);
@@ -552,17 +614,83 @@ fn has_web_traffic(conns: &[netstat::Conn]) -> bool {
         .any(|c| c.state == netstat::ST_ESTABLISHED && matches!(c.local_port, 80 | 443))
 }
 
-fn quick_cpu_busy() -> (f64, f64) {
+/// A 120 ms look at the CPU, used only when there is no earlier sample to
+/// compare with (the first cycle, or after a reboot or a long gap).
+fn quick_cpu_busy() -> f64 {
     use crate::sys::proc;
     let (t0, i0) = proc::cpu_total_idle().unwrap_or((0, 0));
     std::thread::sleep(std::time::Duration::from_millis(120));
     let (t1, i1) = proc::cpu_total_idle().unwrap_or((0, 0));
-    let busy = if t1 > t0 {
+    if t1 > t0 {
         100.0 * (1.0 - (i1.saturating_sub(i0)) as f64 / (t1 - t0).max(1) as f64)
     } else {
         0.0
+    }
+}
+
+struct CpuReading {
+    /// Busy % averaged since the previous cycle (a short sample the first time).
+    busy: f64,
+    groups: Vec<snsec_common::schema::CpuGroup>,
+    streak: u32,
+    alert: Option<snsec_common::schema::Alert>,
+    /// A long time passed since the previous cycle (agent was off or stalled).
+    gap: bool,
+}
+
+/// Compare the CPU counters with the ones stored last cycle, store the new ones,
+/// and name who used the CPU. Never fails the cycle: a missing or unreadable
+/// `/proc` just means no reading.
+fn measure_cpu(state: &State, now: i64, threshold: f64, prev_streak: u32) -> CpuReading {
+    use crate::sys::proc;
+    let prev = state.cpu_sample();
+    let (total, idle) = proc::cpu_total_idle().unwrap_or((0, 0));
+    let procs = proc::cpu_procs();
+    let busy_opt = cpu::busy_pct(&prev, now, total, idle);
+
+    let groups = if busy_opt.is_some_and(|b| b >= cpu::GROUPS_MIN_BUSY) {
+        let mut users: HashMap<i32, String> = HashMap::new();
+        let rows: Vec<(String, String, u64)> = cpu::deltas(&prev, &procs)
+            .into_iter()
+            .map(|(p, d)| {
+                let user = users
+                    .entry(p.pid)
+                    .or_insert_with(|| {
+                        proc::uid(p.pid)
+                            .map(proc::username)
+                            .unwrap_or_else(|| "?".to_string())
+                    })
+                    .clone();
+                (user, p.comm.clone(), d)
+            })
+            .collect();
+        cpu::group(&rows, total.saturating_sub(prev.total))
+    } else {
+        Vec::new()
     };
-    (busy, proc::loadavg1())
+
+    if total > 0
+        && let Err(e) = state.save_cpu_sample(&cpu::make_sample(now, total, idle, &procs))
+    {
+        eprintln!("watch: save cpu sample: {e:#}");
+    }
+
+    let busy = busy_opt.unwrap_or_else(quick_cpu_busy);
+    let streak = cpu::next_streak(prev_streak, busy_opt, threshold);
+    let alert = (busy_opt.is_some() && streak >= cpu::CPU_STREAK_ALERT).then(|| {
+        snsec_common::schema::Alert {
+            kind: "cpu_high".into(),
+            message: cpu::describe(busy, streak, &groups),
+            severity: "warn".into(),
+        }
+    });
+    CpuReading {
+        busy,
+        groups,
+        streak,
+        alert,
+        gap: cpu::is_gap(&prev, now),
+    }
 }
 
 fn load_baseline(state: &State) -> Baseline {

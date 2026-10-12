@@ -78,14 +78,23 @@ pub struct WatchCfg {
     pub min_requests: u32,
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
-    /// 1-min load alert (kept for compatibility); CPU% is the real trigger.
-    #[serde(default = "default_load_alert")]
-    pub load_alert: f64,
+    /// Raise a `cpu_high` alert when the machine's average CPU since the last
+    /// cycle reaches this percent (all cores together).
     #[serde(default = "default_cpu_alert")]
     pub cpu_alert_pct: f64,
-    /// Auto-containment is OFF by default; production observe never contains.
-    #[serde(default)]
-    pub auto_contain: bool,
+    /// Detect distributed bots: one User-Agent or request shape that suddenly
+    /// arrives from many different IPs. Alerts only; it never bans by itself.
+    #[serde(default = "default_true")]
+    pub bot_detection: bool,
+    /// A pattern must come from at least this many distinct IPs in one cycle...
+    #[serde(default = "default_bot_min_ips")]
+    pub bot_min_ips: u32,
+    /// ...make at least this many dynamic requests...
+    #[serde(default = "default_bot_min_requests")]
+    pub bot_min_requests: u32,
+    /// ...and be at least this many times its usual volume.
+    #[serde(default = "default_bot_surge")]
+    pub bot_surge: f64,
 }
 
 impl Default for WatchCfg {
@@ -99,9 +108,11 @@ impl Default for WatchCfg {
             k: default_k(),
             min_requests: default_min_requests(),
             trusted_proxies: Vec::new(),
-            load_alert: default_load_alert(),
             cpu_alert_pct: default_cpu_alert(),
-            auto_contain: false,
+            bot_detection: true,
+            bot_min_ips: default_bot_min_ips(),
+            bot_min_requests: default_bot_min_requests(),
+            bot_surge: default_bot_surge(),
         }
     }
 }
@@ -174,11 +185,20 @@ fn default_k() -> f64 {
 fn default_min_requests() -> u32 {
     120
 }
-fn default_load_alert() -> f64 {
-    4.0
-}
 fn default_cpu_alert() -> f64 {
     85.0
+}
+fn default_true() -> bool {
+    true
+}
+fn default_bot_min_ips() -> u32 {
+    25
+}
+fn default_bot_min_requests() -> u32 {
+    50
+}
+fn default_bot_surge() -> f64 {
+    5.0
 }
 fn default_max_bans() -> u32 {
     200
@@ -289,7 +309,6 @@ mode         = "observe"
 k            = 5.0
 min_requests = 120
 trusted_proxies = ["cloudflare"]
-auto_contain = false
 
 [[watch.sources]]
 glob   = "/var/log/nginx/domains/*.log"

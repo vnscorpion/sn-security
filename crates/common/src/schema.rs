@@ -167,6 +167,22 @@ pub struct CycleStats {
     /// configured globs match nothing, so the agent is blind.
     #[serde(default)]
     pub log_files: u32,
+    /// Requests that are not static assets (pages, APIs, forms). The denominator
+    /// for the shares below: images and scripts would drown the signal.
+    #[serde(default)]
+    pub dynamic_requests: u64,
+    /// The busiest User-Agent strings this cycle, with how many distinct IPs
+    /// sent them. A distributed bot shows up as one UA spread over many IPs.
+    #[serde(default)]
+    pub top_user_agents: Vec<PatternStat>,
+    /// The busiest request *shapes* (method + path + parameter NAMES, never the
+    /// values), e.g. `GET /?tss-sc&tsscat&tst10_filter`.
+    #[serde(default)]
+    pub top_shapes: Vec<PatternStat>,
+    /// Who is using the CPU, grouped by user + program. Only filled while the
+    /// server is notably busy (at least 50% over the interval); empty otherwise.
+    #[serde(default)]
+    pub top_cpu: Vec<CpuGroup>,
     pub top_ips: Vec<IpCount>,
     /// True once the sliding baseline has enough data to be trusted.
     pub baseline_ready: bool,
@@ -174,6 +190,37 @@ pub struct CycleStats {
     pub watch_blind: bool,
     /// Set when the agent fell back to sampling under overload.
     pub overload: bool,
+}
+
+/// One User-Agent or request shape as seen in a cycle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PatternStat {
+    pub key: String,
+    pub requests: u64,
+    /// Distinct client addresses (IPv6 counted per /64). Saturates at the
+    /// agent's tracking cap; see `ips_capped`.
+    pub ips: u32,
+    /// True when `ips` hit the tracking cap, so the real figure is higher.
+    #[serde(default)]
+    pub ips_capped: bool,
+    /// The agent considers this a distributed-bot signature right now.
+    #[serde(default)]
+    pub flagged: bool,
+    /// A few of the addresses involved (only for flagged patterns), for panels
+    /// without a WAF where an IP block is the only tool left.
+    #[serde(default)]
+    pub sample_ips: Vec<String>,
+}
+
+/// CPU used by one program of one user (a hosted site's Linux user, usually).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CpuGroup {
+    pub user: String,
+    pub comm: String,
+    /// Percent of the whole server (all cores), the same scale as
+    /// `cpu_busy_pct`, so the groups add up to at most 100.
+    pub cpu_pct: f64,
+    pub procs: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
