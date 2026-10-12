@@ -87,6 +87,7 @@ pub fn request_body(kind: &str, model: &str, system: &str, user: &str) -> Value 
                 { "role": "system", "content": system },
                 { "role": "user", "content": user },
             ],
+            "stream": false,
         })
     }
 }
@@ -138,18 +139,118 @@ fn describe_error(e: ureq::Error, key: &str) -> String {
     }
 }
 
+/// First characters of a reply, one line, for an error message.
+fn snippet(body: &str, max: usize) -> String {
+    let one: String = body
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let one = one.split_whitespace().collect::<Vec<_>>().join(" ");
+    match one.char_indices().nth(max) {
+        Some((i, _)) => format!("{}…", &one[..i]),
+        None => one,
+    }
+}
+
+/// The text one server-sent-events chunk carries, in either provider's shape.
+fn chunk_text(v: &Value) -> Option<String> {
+    // OpenAI: choices[0].delta.content (streaming) or .message.content.
+    if let Some(c) = v.get("choices").and_then(|c| c.get(0)) {
+        let t = c
+            .get("delta")
+            .and_then(|d| d.get("content"))
+            .or_else(|| c.get("message").and_then(|m| m.get("content")))
+            .and_then(Value::as_str)?;
+        return Some(t.to_string());
+    }
+    // Anthropic: delta.text.
+    v.get("delta")?.get("text")?.as_str().map(str::to_string)
+}
+
+/// Read a reply body into the model's text.
+///
+/// Accepts a normal JSON reply, and also a server-sent-events stream
+/// (`data: {...}` lines) in case a gateway streams although it was asked not to.
+/// A JSON error object is reported with its own message.
+///
+/// # Errors
+/// A Vietnamese description of what came back instead, with a hint when it looks
+/// like a web page (the usual sign of a wrong URL).
+pub fn parse_body(kind: &str, body: &str) -> Result<String, String> {
+    let trimmed = body.trim();
+    if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+        if let Some(t) = reply_text(kind, &v) {
+            return Ok(t);
+        }
+        let why = v
+            .get("error")
+            .and_then(|e| {
+                e.get("message")
+                    .and_then(Value::as_str)
+                    .or_else(|| e.as_str())
+            })
+            .or_else(|| v.get("message").and_then(Value::as_str))
+            .unwrap_or("không có trường nội dung");
+        return Err(format!(
+            "máy chủ trả về JSON nhưng không có câu trả lời: {}",
+            snippet(why, 200)
+        ));
+    }
+    // A stream: collect the text of every chunk.
+    if trimmed.lines().any(|l| l.trim_start().starts_with("data:")) {
+        let mut text = String::new();
+        for line in trimmed.lines() {
+            let Some(d) = line.trim_start().strip_prefix("data:") else {
+                continue;
+            };
+            let d = d.trim();
+            if d.is_empty() || d == "[DONE]" {
+                continue;
+            }
+            if let Some(t) = serde_json::from_str::<Value>(d)
+                .ok()
+                .as_ref()
+                .and_then(chunk_text)
+            {
+                text.push_str(&t);
+            }
+        }
+        if !text.is_empty() {
+            return Ok(text);
+        }
+    }
+    let hint = if trimmed.starts_with('<') {
+        " Máy chủ trả về một trang web (HTML), thường do endpoint sai hoặc thiếu đường dẫn như /v1."
+    } else if trimmed.is_empty() {
+        " Phản hồi rỗng."
+    } else {
+        ""
+    };
+    Err(format!(
+        "phản hồi không phải JSON.{hint} Đầu phản hồi: «{}»",
+        snippet(trimmed, 160)
+    ))
+}
+
 /// Send one exchange to the provider and return the model's text.
 ///
 /// # Errors
 /// A Vietnamese message when the endpoint is invalid, the call fails, or the
-/// reply has no text.
+/// reply has no text. The message names the URL that was called, the HTTP status
+/// and the start of what came back, never the key.
 pub fn complete(p: &Provider, system: &str, user: &str) -> Result<String> {
     let url = request_url(&p.kind, &p.endpoint)?;
+    // No redirects: a POST that is redirected is rarely what the operator meant,
+    // and following one would send the Authorization header to another host.
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(CONNECT_TIMEOUT)
         .timeout(TOTAL_TIMEOUT)
+        .redirects(0)
         .build();
-    let mut req = agent.post(&url).set("content-type", "application/json");
+    let mut req = agent
+        .post(&url)
+        .set("content-type", "application/json")
+        .set("accept", "application/json");
     if p.kind == KIND_ANTHROPIC {
         req = req
             .set("x-api-key", &p.api_key)
@@ -160,15 +261,35 @@ pub fn complete(p: &Provider, system: &str, user: &str) -> Result<String> {
     let body = request_body(&p.kind, &p.model, system, user);
     let resp = req
         .send_string(&body.to_string())
-        .map_err(|e| anyhow::anyhow!(describe_error(e, &p.api_key)))?;
+        .map_err(|e| anyhow::anyhow!("{} (đã gọi: {url})", describe_error(e, &p.api_key)))?;
+    let status = resp.status();
+    let content_type = resp.content_type().to_string();
+    let location = resp.header("location").unwrap_or("").to_string();
+    if (300..400).contains(&status) {
+        bail!(
+            "endpoint chuyển hướng (HTTP {status}) tới «{}». Hãy nhập địa chỉ đích làm endpoint (đã gọi: {url})",
+            snippet(&location, 120)
+        );
+    }
     let mut text = String::new();
     resp.into_reader()
         .take(MAX_REPLY_BYTES)
         .read_to_string(&mut text)
         .map_err(|e| anyhow::anyhow!("không đọc được phản hồi: {e}"))?;
-    let v: Value = serde_json::from_str(&text)
-        .map_err(|_| anyhow::anyhow!("phản hồi không phải JSON (endpoint có đúng không?)"))?;
-    reply_text(&p.kind, &v).ok_or_else(|| anyhow::anyhow!("phản hồi không có nội dung văn bản"))
+    match parse_body(&p.kind, &text) {
+        Ok(t) => Ok(t),
+        Err(why) => {
+            let msg = format!("{why} [HTTP {status}, {content_type}; đã gọi: {url}]");
+            bail!(
+                "{}",
+                if p.api_key.len() >= 8 {
+                    msg.replace(&p.api_key, "***")
+                } else {
+                    msg
+                }
+            )
+        }
+    }
 }
 
 /// `…1234` for display; nothing for a short or empty key.
@@ -280,6 +401,55 @@ mod tests {
             assert!(reply_text(KIND_OPENAI, &bad).is_none());
         }
         assert!(reply_text(KIND_ANTHROPIC, &json!({"content":[]})).is_none());
+    }
+
+    #[test]
+    fn a_normal_json_reply_is_read() {
+        let body = r#"{"choices":[{"message":{"content":"OK"}}]}"#;
+        assert_eq!(parse_body(KIND_OPENAI, body).unwrap(), "OK");
+        let a = r#"{"content":[{"type":"text","text":"hi"}]}"#;
+        assert_eq!(parse_body(KIND_ANTHROPIC, a).unwrap(), "hi");
+    }
+
+    #[test]
+    fn a_stream_is_collected_when_a_gateway_streams_anyway() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"O\"}}]}\n\n\
+                   data: {\"choices\":[{\"delta\":{\"content\":\"K\"}}]}\n\n\
+                   data: [DONE]\n";
+        assert_eq!(parse_body(KIND_OPENAI, sse).unwrap(), "OK");
+        let a = "event: content_block_delta\ndata: {\"delta\":{\"text\":\"Xin\"}}\n\ndata: {\"delta\":{\"text\":\" chao\"}}\n";
+        assert_eq!(parse_body(KIND_ANTHROPIC, a).unwrap(), "Xin chao");
+    }
+
+    #[test]
+    fn a_web_page_is_called_a_web_page_and_the_start_of_it_is_shown() {
+        let html = "<!doctype html><html><head><title>Antigravity Manager</title></head><body>...";
+        let e = parse_body(KIND_OPENAI, html).unwrap_err();
+        assert!(e.contains("HTML") && e.contains("/v1"), "{e}");
+        assert!(e.contains("Antigravity Manager"), "{e}");
+        assert!(parse_body(KIND_OPENAI, "").unwrap_err().contains("rỗng"));
+        let long = "x".repeat(1000);
+        let e = parse_body(KIND_OPENAI, &long).unwrap_err();
+        assert!(e.chars().count() < 400, "{}", e.chars().count());
+    }
+
+    #[test]
+    fn a_json_error_object_is_shown_with_its_own_message() {
+        let e = parse_body(
+            KIND_OPENAI,
+            r#"{"error":{"message":"model not found","type":"x"}}"#,
+        )
+        .unwrap_err();
+        assert!(e.contains("model not found"), "{e}");
+        let e = parse_body(KIND_OPENAI, r#"{"error":"bad key"}"#).unwrap_err();
+        assert!(e.contains("bad key"), "{e}");
+        assert!(parse_body(KIND_OPENAI, "{}").is_err());
+    }
+
+    #[test]
+    fn the_request_asks_for_a_plain_non_streamed_reply() {
+        let o = request_body(KIND_OPENAI, "m", "S", "U");
+        assert_eq!(o["stream"], false);
     }
 
     #[test]

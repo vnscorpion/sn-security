@@ -185,7 +185,7 @@ Luật cố định không viết hết được các biến thể kiểu: miner
 **1. Cài đặt AI (`/settings` trên hub).** Tự nhập **endpoint, model, API key**, không gắn cứng nhà cung cấp nào:
 - **OpenAI-compatible**: Hermes (Nous Portal, OpenRouter, vLLM, Ollama `/v1`, LiteLLM…), OpenAI… Nhập địa chỉ gốc (ví dụ `https://openrouter.ai/api/v1`) hoặc đầy đủ tới `/chat/completions`. Hermes chạy trên máy bạn thì dùng `http://127.0.0.1:11434/v1`, key có thể để trống.
 - **Anthropic (Claude)**: để trống endpoint thì dùng `api.anthropic.com`.
-- Có nút **Thử kết nối**, đặt mặc định, sửa (để trống key = giữ key cũ), xoá. API key lưu nguyên văn trong file SQLite của hub (chỉ user chạy hub đọc được) vì hub phải dùng nó; trang chỉ hiện 4 ký tự cuối.
+- Có nút **Thử kết nối**, đặt mặc định, sửa (để trống key = giữ key cũ), xoá. Dưới mỗi nhà cung cấp hub hiện **URL sẽ gọi**; khi lỗi, thông báo nêu mã HTTP, loại nội dung, URL đã gọi và đoạn đầu phản hồi. “Phản hồi không phải JSON … trang web (HTML)” gần như luôn là endpoint sai (thiếu `/v1`, hoặc trỏ vào giao diện web của dịch vụ thay vì API); hub không theo chuyển hướng (để không gửi key sang máy khác) nên báo địa chỉ đích để bạn nhập lại. API key lưu nguyên văn trong file SQLite của hub (chỉ user chạy hub đọc được) vì hub phải dùng nó; trang chỉ hiện 4 ký tự cuối.
 
 **2. Luồng làm việc.** Trên trang VPS có khung **"AI xử lý sự cố"**:
 1. Bấm **Phân tích bằng AI** (hoặc để hub tự gọi khi có sự cố: cảnh báo `cpu_high`, `malware_found`, `ban_cap`, hoặc nhãn triage `miner`/`php-bot`/`mixed`; tối đa một lần mỗi 30 phút mỗi VPS). Hub ra lệnh cho agent thu thập **bằng chứng** (chỉ đọc), VPS gửi về trong ~5–15 phút.

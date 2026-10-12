@@ -500,7 +500,17 @@ pub async fn settings_page(
                             tr {
                                 td { b { (p.name) } @if p.is_default { " " span class="badge b-ok" { "đang dùng" } } }
                                 td { (if p.kind == KIND_ANTHROPIC { "Anthropic" } else { "OpenAI-compatible" }) }
-                                td { code style="word-break:break-all" { (if p.endpoint.is_empty() { "(mặc định)" } else { p.endpoint.as_str() }) } }
+                                td {
+                                    code style="word-break:break-all" { (if p.endpoint.is_empty() { "(mặc định)" } else { p.endpoint.as_str() }) }
+                                    br;
+                                    span class="mut" style="font-size:12px" {
+                                        "Sẽ gọi: "
+                                        @match ai_client::request_url(&p.kind, &p.endpoint) {
+                                            Ok(u) => { code style="word-break:break-all" { (u) } }
+                                            Err(e) => { span style="color:var(--bad)" { (e.to_string()) } }
+                                        }
+                                    }
+                                }
                                 td { code { (p.model) } }
                                 td class="mut" { (ai_client::mask_key(&p.api_key)) }
                                 td {
