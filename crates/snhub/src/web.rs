@@ -17,7 +17,7 @@ use snsec_common::schema::{DesiredBan, DesiredBody, Mode, ReportBody};
 use crate::AppState;
 use crate::auth;
 
-fn now() -> i64 {
+pub(crate) fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -85,7 +85,7 @@ pre{background:#0d1218;padding:14px;border-radius:9px;overflow:auto;white-space:
  border-radius:8px;padding:12px 14px;color:var(--mut);font-size:13px;margin-bottom:16px}
 "#;
 
-fn shell(title: &str, body: Markup) -> Markup {
+pub(crate) fn shell(title: &str, body: Markup) -> Markup {
     html! {
         (DOCTYPE)
         html lang="vi" {
@@ -103,6 +103,7 @@ fn shell(title: &str, body: Markup) -> Markup {
                         a href="/" { "Tổng quan" }
                         a href="/add-vps" { "Thêm VPS" }
                         a href="/log" { "Nhật ký" }
+                        a href="/settings" { "Cài đặt AI" }
                     }
                     span class="sp" {}
                     form class="ipcheck" method="get" action="/check-ip" {
@@ -116,14 +117,14 @@ fn shell(title: &str, body: Markup) -> Markup {
     }
 }
 
-fn guard(st: &AppState, headers: &HeaderMap) -> Option<Response> {
+pub(crate) fn guard(st: &AppState, headers: &HeaderMap) -> Option<Response> {
     match auth::session_from_headers(headers) {
         Some(tok) if st.sessions.valid(&tok) => None,
         _ => Some(Redirect::to("/login").into_response()),
     }
 }
 
-fn rel_time(ts: i64) -> String {
+pub(crate) fn rel_time(ts: i64) -> String {
     if ts == 0 {
         return "chưa có".into();
     }
@@ -485,7 +486,7 @@ fn page_bounds(total: usize, page: usize, size: usize) -> (usize, usize, usize, 
 }
 
 /// Percent-encode a query-string value (everything but unreserved characters).
-fn urlenc(s: &str) -> String {
+pub(crate) fn urlenc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
@@ -828,6 +829,9 @@ pub struct AgentQuery {
     /// Page of the malware findings (independent of the blocklist page).
     #[serde(default)]
     fpage: usize,
+    /// A one-line result to show in the AI card after an action.
+    #[serde(default)]
+    msg: String,
 }
 
 /// Download the latest scan results: `csv` (every finding) or `txt` (paths of
@@ -925,6 +929,8 @@ pub async fn agent_detail(
     let partial = ban_list_partial(report.as_ref());
     let hidden = hidden_bans(report.as_ref());
 
+    let ai_data = crate::web_ai::card_data(&st, &agent.id);
+
     // Blocklist: filter by address, then show one page.
     let needle = aq.q.trim().to_lowercase();
     let filtered: Vec<&BanView> = bans
@@ -1007,6 +1013,8 @@ pub async fn agent_detail(
             }
             p class="help" { "“Hoàn tác” chỉ chạy nếu VPS bật tuỳ chọn cho phép (" code { "[remote] allow_undo" } ")." }
         }
+
+        (crate::web_ai::ai_card(&agent.id, report.as_ref(), &ai_data, aq.msg.trim()))
 
         div class="card" id="bans" {
             h2 { "IP đang bị chặn (" (bans.len() + hidden) ")" }
@@ -1412,9 +1420,14 @@ pub async fn job_post(
         _ => return (StatusCode::BAD_REQUEST, "unknown job").into_response(),
     };
     let db = st.db.lock().expect("db");
-    let _ = db.queue_job(&id, now(), "admin", job, &detail);
+    let queued = db.queue_job(&id, now(), "admin", job, &detail);
     drop(db);
-    Redirect::to(&format!("/agent/{id}")).into_response()
+    match queued {
+        Ok(()) => Redirect::to(&format!("/agent/{id}")).into_response(),
+        // Say why nothing happened (e.g. the previous order has not run yet).
+        Err(e) => Redirect::to(&format!("/agent/{id}?msg={}#ai", urlenc(&format!("{e:#}"))))
+            .into_response(),
+    }
 }
 
 // ---- add vps ---------------------------------------------------------------
@@ -1954,6 +1967,8 @@ mod tests {
             active_bans_total: total,
             hunt: None,
             clamav: None,
+            evidence: None,
+            remediation: None,
         }
     }
 

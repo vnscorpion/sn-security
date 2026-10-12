@@ -12,6 +12,7 @@ use snsec_common::crypto;
 use snsec_common::schema::{Envelope, ReportBody, Signed};
 
 use crate::AppState;
+use crate::analysis;
 use crate::desired::sign_desired;
 
 fn now() -> i64 {
@@ -56,6 +57,52 @@ pub async fn post_report(State(st): State<Arc<AppState>>, body: String) -> impl 
     if let Err(e) = db.record_report(&env.agent_id, env.seq, now(), &env.body, &body_json) {
         tracing::error!("record_report: {e:#}");
         return (StatusCode::INTERNAL_SERVER_ERROR, "store failed").into_response();
+    }
+
+    // AI-assisted incident response (best effort: never fails the report).
+    let at = now();
+    let agent_id = env.agent_id.clone();
+    let mut analyse_now = false;
+    let ai = db.ai_state(&agent_id).unwrap_or_default();
+    if let Some(ev) = &env.body.evidence {
+        let _ = db.save_evidence(&agent_id, ev);
+        // The evidence an analysis was waiting for (not one collected before it asked).
+        analyse_now = ai.pending && ev.at + 5 >= ai.pending_since;
+    }
+    if let Some(rem) = &env.body.remediation {
+        let _ = db.attach_remediation(&agent_id, rem);
+    }
+    if !analyse_now {
+        let has_provider = db.default_provider().ok().flatten().is_some();
+        // A proposal still waiting for an answer (or for the VPS) means the last
+        // analysis has not been dealt with: asking the model again about the same
+        // incident would only repeat itself and cost money.
+        let open_proposal = db
+            .latest_proposal(&agent_id)
+            .ok()
+            .flatten()
+            .is_some_and(|p| {
+                matches!(p.status.as_str(), "proposed" | "executing") && at - p.created < 24 * 3600
+            });
+        if !open_proposal && analysis::should_auto_trigger(&ai, at, &env.body, has_provider) {
+            // An incident on a VPS where the operator allowed it: collect evidence;
+            // the analysis starts when it arrives.
+            let queued = db.queue_job(
+                &agent_id,
+                at,
+                "ai-auto",
+                snsec_common::schema::Job::Evidence,
+                "thu thập bằng chứng (tự động, có sự cố)",
+            );
+            if queued.is_ok() {
+                let _ = db.set_pending(&agent_id, true, at);
+            }
+        }
+    }
+    drop(db);
+    if analyse_now {
+        let st2 = Arc::clone(&st);
+        tokio::task::spawn_blocking(move || analysis::run(&st2, &agent_id));
     }
     (StatusCode::OK, "ok").into_response()
 }

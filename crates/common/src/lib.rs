@@ -7,6 +7,7 @@
 //! newer agent and an older hub (or vice versa) can still talk, replay is
 //! rejected, and a stale desired-state never silently weakens a VPS.
 
+pub mod ai;
 pub mod crypto;
 pub mod heuristic;
 pub mod labels;

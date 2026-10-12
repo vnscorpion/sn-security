@@ -108,6 +108,13 @@ pub struct ReportBody {
     /// predate it.
     #[serde(default)]
     pub clamav: Option<ClamavInfo>,
+    /// A fresh [`Evidence`] snapshot, present in the report that follows an
+    /// `evidence` job.
+    #[serde(default)]
+    pub evidence: Option<Evidence>,
+    /// Outcome of the last `remediate` job.
+    #[serde(default)]
+    pub remediation: Option<RemediationReport>,
 }
 
 /// What the hub needs to know about ClamAV on a VPS, to show its state and to
@@ -411,6 +418,16 @@ pub enum Job {
     /// variant cannot parse a desired-state containing it, so the hub must send
     /// it only to agents that report the `clamav` capability.
     InstallClamav,
+    /// Collect an [`Evidence`] snapshot and send it with the next report.
+    /// Read-only. Only for agents that report the `evidence` capability.
+    Evidence,
+    /// Carry out a short list of [`Action`]s about an incident. Only honoured
+    /// when the VPS opted in with `[remote] allow_remediate`, and only for agents
+    /// that report the `remediate` capability.
+    Remediate {
+        id: String,
+        actions: Vec<Action>,
+    },
     /// A job kind from a newer hub that this agent does not know: ignored, but
     /// the rest of the desired-state still applies.
     #[serde(other)]
@@ -434,6 +451,192 @@ pub struct PolicyBody {
     pub patterns_yaml: Option<String>,
     /// Allow a remote switch back to observe (defaults off; agent config gates).
     pub allow_mode_observe: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Incident evidence, and what an operator or an AI may order done about it
+// ---------------------------------------------------------------------------
+
+/// A read-only snapshot of what is wrong on a VPS, collected on request and
+/// sent to the hub. Every field comes from the (possibly compromised) machine,
+/// so a consumer must treat the text in it as data, never as instructions.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Evidence {
+    /// Unix time it was collected.
+    #[serde(default)]
+    pub at: i64,
+    /// The triage label (`miner`, `php-bot`, `ddos-l7`, ... or `unknown`).
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub load1: f64,
+    /// The busiest or most suspicious processes.
+    #[serde(default)]
+    pub processes: Vec<EvProc>,
+    /// Places a foothold can survive a reboot or a new login: shell start-up
+    /// files, cron, `authorized_keys`, `ld.so.preload`.
+    #[serde(default)]
+    pub persistence: Vec<EvPersist>,
+    /// Executables and unusual files in temp directories and users' hidden dirs.
+    #[serde(default)]
+    pub temp_files: Vec<EvFile>,
+    /// Recent successful SSH logins.
+    #[serde(default)]
+    pub ssh_logins: Vec<EvLogin>,
+    /// Services listening on a non-loopback address.
+    #[serde(default)]
+    pub listeners: Vec<EvListener>,
+    /// Accounts that can log in with a shell.
+    #[serde(default)]
+    pub shell_users: Vec<EvUser>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EvProc {
+    pub pid: i32,
+    /// With the pid, identifies one process even after pid reuse.
+    pub starttime: u64,
+    #[serde(default)]
+    pub user: String,
+    #[serde(default)]
+    pub comm: String,
+    #[serde(default)]
+    pub exe: String,
+    #[serde(default)]
+    pub exe_deleted: bool,
+    /// Command line, cut short.
+    #[serde(default)]
+    pub cmdline: String,
+    #[serde(default)]
+    pub cpu_pct: f64,
+    /// Established outbound connections as `ip:port`.
+    #[serde(default)]
+    pub out_conns: Vec<String>,
+    #[serde(default)]
+    pub score: u32,
+    /// A kernel-thread-looking name (`[kworker/0:1]`) on a real user-space program.
+    #[serde(default)]
+    pub masquerade: bool,
+    /// The command line or an outbound connection matches a known miner marker
+    /// (stratum, xmrig, a mining-pool port...).
+    #[serde(default)]
+    pub miner_hint: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EvPersist {
+    /// `shell_rc`, `cron`, `authorized_keys`, `ld_preload`, `rc_local`.
+    pub kind: String,
+    pub path: String,
+    #[serde(default)]
+    pub user: String,
+    /// 1-based line in the file.
+    #[serde(default)]
+    pub line_no: u32,
+    /// The line, cut short.
+    #[serde(default)]
+    pub line: String,
+    /// SHA-256 (hex) of the line with surrounding whitespace removed: lets a
+    /// later action prove it is about this exact line.
+    #[serde(default)]
+    pub sha256: String,
+    #[serde(default)]
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EvFile {
+    pub path: String,
+    #[serde(default)]
+    pub size: u64,
+    #[serde(default)]
+    pub owner: String,
+    #[serde(default)]
+    pub mode: u32,
+    #[serde(default)]
+    pub mtime: i64,
+    /// Starts with the ELF magic: a compiled program, not a script or data.
+    #[serde(default)]
+    pub elf: bool,
+    #[serde(default)]
+    pub executable: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EvLogin {
+    pub user: String,
+    pub ip: String,
+    #[serde(default)]
+    pub method: String,
+    #[serde(default)]
+    pub when: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EvListener {
+    pub port: u16,
+    #[serde(default)]
+    pub addr: String,
+    #[serde(default)]
+    pub comm: String,
+    #[serde(default)]
+    pub pid: i32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EvUser {
+    pub name: String,
+    #[serde(default)]
+    pub uid: u32,
+    #[serde(default)]
+    pub home: String,
+    #[serde(default)]
+    pub shell: String,
+    /// Can administer the machine (group sudo, wheel, admin or adm, or the only
+    /// regular account). Such an account is never locked automatically.
+    #[serde(default)]
+    pub admin: bool,
+}
+
+/// One thing the hub may order a VPS to do about an incident. A closed list:
+/// there is deliberately no "run this command". The agent re-checks each action
+/// against what it saw itself before it acts, and records how to undo it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Action {
+    /// SIGKILL one process, identified by pid and start time.
+    KillProcess { pid: i32, starttime: u64 },
+    /// Set a user's login shell to a non-login one (undoable).
+    LockUserShell { user: String },
+    /// Move a file into the quarantine vault (restorable with `sn restore`).
+    QuarantineFile { path: String },
+    /// Remove one line from a user's shell start-up file (backed up first).
+    RemoveShellLine {
+        path: String,
+        line_no: u32,
+        sha256: String,
+    },
+    /// `systemctl disable --now` a unit from a short allow-list (undoable).
+    DisableService { unit: String },
+}
+
+/// What happened to each action of a remediation job.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ActionResult {
+    /// Position in the job's action list.
+    pub index: u32,
+    pub ok: bool,
+    #[serde(default)]
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RemediationReport {
+    /// The job id the hub gave.
+    pub id: String,
+    pub at: i64,
+    #[serde(default)]
+    pub results: Vec<ActionResult>,
 }
 
 #[cfg(test)]

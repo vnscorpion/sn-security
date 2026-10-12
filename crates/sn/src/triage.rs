@@ -15,9 +15,9 @@ use crate::sys::{netstat, proc};
 use crate::util;
 
 /// Ports strongly associated with mining pools / common C2.
-const BAD_OUT_PORTS: &[u16] = &[3333, 4444, 5555, 7777, 9999, 14444, 45700, 3357];
+pub(crate) const BAD_OUT_PORTS: &[u16] = &[3333, 4444, 5555, 7777, 9999, 14444, 45700, 3357];
 
-const MINER_HINTS: &[&str] = &[
+pub(crate) const MINER_HINTS: &[&str] = &[
     "stratum",
     "xmrig",
     "--donate",

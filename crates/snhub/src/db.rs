@@ -53,7 +53,7 @@ CREATE TABLE IF NOT EXISTS decisions (
 "#;
 
 pub struct Db {
-    conn: Connection,
+    pub(crate) conn: Connection,
 }
 
 /// One row of the decisions log: `(agent_id, who, action, detail, ts)`.
@@ -76,6 +76,8 @@ impl Db {
         conn.pragma_update(None, "journal_mode", "WAL").ok();
         conn.pragma_update(None, "foreign_keys", "ON").ok();
         conn.execute_batch(SCHEMA).context("applying schema")?;
+        conn.execute_batch(crate::db_ai::SCHEMA_AI)
+            .context("applying AI schema")?;
         Ok(Db { conn })
     }
 
@@ -308,6 +310,21 @@ impl Db {
         let (epoch, version, mut body) =
             self.get_desired(agent_id)?
                 .unwrap_or((1, 0, DesiredBody::default()));
+        // There is one job slot per VPS. Replacing a job the VPS has not run yet
+        // would drop it silently (an operator's ban order, an incident-response
+        // order), so refuse and say so; the caller can try again shortly.
+        if !body.jobs.is_empty() {
+            let applied = self
+                .latest_report(agent_id)
+                .ok()
+                .flatten()
+                .map_or(0, |r| r.applied_desired.seq);
+            if !job_already_applied(&body, applied) {
+                anyhow::bail!(
+                    "VPS còn một lệnh chưa chạy (đang chờ báo cáo kế tiếp, tối đa ~15 phút); thử lại sau"
+                );
+            }
+        }
         let new_version = version + 1;
         body.jobs = vec![job];
         body.jobs_seq = new_version;

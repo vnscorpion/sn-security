@@ -13,6 +13,7 @@ Một binary Rust tĩnh (`sn`, ~3 MB) cấp cứu VPS Linux đang bị mã độ
 - `triage` — ảnh chụp chỉ-đọc: top process theo CPU (đo delta 2 mẫu), exe thật/`(deleted)`, cwd, kết nối ra, persistence (cron/`ld.so.preload`/rc.local), disk/inode; gắn nhãn `miner`/`php-bot`/`ddos-l7`/`bruteforce`/`disk-full`/`mixed`/`unknown`.
 - `contain` — nhốt process nghi ngờ vào cgroup 5% CPU (**cả cgroup v2 lẫn v1**), tuỳ chọn `--freeze`; **không bao giờ kill**; loại trừ dịch vụ hệ thống theo exe thật (miner đội tên `nginx` ở `/tmp` không thoát).
 - `hunt` — quét webshell PHP bằng heuristic (source→sink, decode→eval, dropper, `preg_replace /e`, entropy, file PHP trong uploads/đuôi ảnh); nhận diện encoder thương mại (ionCube...) để tránh báo nhầm.
+- **AI xử lý sự cố**: hub nhờ mô hình AI bạn cấu hình (endpoint/model/key tuỳ ý; Hermes, Claude, OpenRouter, Ollama…) chẩn đoán từ bằng chứng agent thu thập và đề xuất hành động (cách ly file, khoá shell, gỡ dòng độc, tắt dịch vụ, dừng tiến trình), bạn duyệt hoặc cho tự xử — xem [AI xử lý sự cố](#ai-xử-lý-sự-cố-hub--agent).
 - **ClamAV tuỳ chọn** làm engine thứ hai cho `hunt`; hub có nút **Cài ClamAV** (agent tự chọn công thức theo hệ điều hành, mặc định tắt vì chạy trình quản lý gói bằng root) — xem [ClamAV](#clamav-engine-thứ-hai-tuỳ-chọn).
 - `clean`/`quarantine`/`restore` — cách ly file giữ nguyên owner/mode/mtime, phục hồi được.
 - `undo` — đảo ngược mọi contain/ban đã làm (log có cấu trúc `undo.jsonl`, không chạy shell).
@@ -176,6 +177,48 @@ Mỗi chu kỳ (~5 phút) agent đếm các dòng log mới theo **từng IP** (
 > - Luật `rate` đếm **mọi** request, kể cả ảnh/CSS/JS. Một trang WordPress có thể kéo 30–100 file, nên 120 request/5 phút dễ bị khách bình thường vượt qua, nhất là nhiều người dùng chung một IP (văn phòng, mạng di động). Hãy xem `would_ban` ở chế độ observe ít nhất vài ngày trước khi bật chặn.
 > - `/config.json` và `/phpmyadmin` trong luật `probe` cũng là đường dẫn hợp lệ của một số ứng dụng và của admin.
 > - Chưa có danh sách bot tự miễn chặn: Googlebot, Bingbot... cần thêm tay vào `[fw] whitelist` (ví dụ `66.249.64.0/19` cho Googlebot).
+
+## AI xử lý sự cố (hub + agent)
+
+Luật cố định không viết hết được các biến thể kiểu: miner giả tiến trình `[kworker/0:1Z]`, mã độc cài trong `.bashrc`, công cụ đào trong `/dev/shm`, đăng nhập SSH lạ, cổng 111 mở công khai. Hub vì thế có thể nhờ một mô hình AI do bạn cấu hình làm "bộ não": agent thu thập bằng chứng, AI chẩn đoán và đề xuất hành động, bạn duyệt (hoặc cho phép tự xử), agent thực hiện.
+
+**1. Cài đặt AI (`/settings` trên hub).** Tự nhập **endpoint, model, API key**, không gắn cứng nhà cung cấp nào:
+- **OpenAI-compatible**: Hermes (Nous Portal, OpenRouter, vLLM, Ollama `/v1`, LiteLLM…), OpenAI… Nhập địa chỉ gốc (ví dụ `https://openrouter.ai/api/v1`) hoặc đầy đủ tới `/chat/completions`. Hermes chạy trên máy bạn thì dùng `http://127.0.0.1:11434/v1`, key có thể để trống.
+- **Anthropic (Claude)**: để trống endpoint thì dùng `api.anthropic.com`.
+- Có nút **Thử kết nối**, đặt mặc định, sửa (để trống key = giữ key cũ), xoá. API key lưu nguyên văn trong file SQLite của hub (chỉ user chạy hub đọc được) vì hub phải dùng nó; trang chỉ hiện 4 ký tự cuối.
+
+**2. Luồng làm việc.** Trên trang VPS có khung **"AI xử lý sự cố"**:
+1. Bấm **Phân tích bằng AI** (hoặc để hub tự gọi khi có sự cố: cảnh báo `cpu_high`, `malware_found`, `ban_cap`, hoặc nhãn triage `miner`/`php-bot`/`mixed`; tối đa một lần mỗi 30 phút mỗi VPS). Hub ra lệnh cho agent thu thập **bằng chứng** (chỉ đọc), VPS gửi về trong ~5–15 phút.
+2. Hub gửi bằng chứng cho AI. AI trả về chẩn đoán và danh sách hành động; hub loại những đề xuất không hợp lệ.
+3. Bạn thấy chẩn đoán, từng hành động kèm **mức rủi ro** và lý do, rồi bấm **Thực hiện** từng việc hoặc **Thực hiện tất cả**. Hub gửi một lệnh ký số cho agent; kết quả từng hành động hiện lại trong khung.
+
+**Bằng chứng agent thu thập** (`sn evidence`): tiến trình đáng ngờ (kể cả tên giả tiến trình nhân `[kworker]` nhưng có chương trình thật), kết nối ra ngoài, các **dòng đáng ngờ** trong file khởi động shell của các tài khoản (`.bashrc`, `.profile`, `.zshrc`… không gửi cả file), cron và `ld.so.preload`, `authorized_keys` (không gửi khoá), chương trình biên dịch/thực thi lạ trong `/dev/shm`, `/tmp`, `/var/tmp` và thư mục ẩn trong home, các lần đăng nhập SSH thành công gần đây, cổng đang lắng nghe ngoài loopback, tài khoản có shell. **Không** gửi nội dung website hay database. **Lưu ý:** dòng lệnh tiến trình và các dòng khởi động/cron có thể chứa mật khẩu hoặc token gõ trên dòng lệnh; agent che các dạng phổ biến (`password=…`, `--token`, `-pMẬT_KHẨU`, `user:pass@host`, `Bearer …`) nhưng **không đảm bảo che hết**, và bằng chứng cũng lưu trong database của hub. Muốn tránh gửi ra ngoài thì dùng model chạy trên máy bạn. Xem đúng những gì AI nhận được ở `/agent/<id>/evidence.json`.
+
+**Hành động AI được phép đề xuất** (danh sách đóng, không có "chạy lệnh tuỳ ý"):
+
+| Hành động | Rủi ro | Hoàn tác |
+| --- | --- | --- |
+| Cách ly file (`/dev/shm`, `/tmp`, `/var/tmp`, thư mục ẩn trong `/home`) | thấp | `sn restore <id>` |
+| Khoá shell một tài khoản thường (UID ≥ 1000, **không** phải tài khoản sudo/wheel) | vừa | `sn undo --remediation` |
+| Gỡ một dòng khỏi file khởi động shell của tài khoản (có bản sao lưu) | vừa | `sn undo --remediation` |
+| Tắt một dịch vụ trong danh sách, chỉ khi đang lắng nghe cổng tương ứng (rpcbind:111, cups:631, telnet, rsh, rexec) | vừa | `sn undo --remediation` |
+| Dừng một tiến trình (SIGKILL), chỉ khi có dấu hiệu mạnh: tên giả tiến trình nhân, dấu hiệu miner, hoặc chạy từ `/tmp`, `/dev/shm`, thư mục ẩn trong `/home` | cao | **không** |
+
+**Chống bị AI (và kẻ tấn công) lừa:**
+- Nội dung bằng chứng do máy có thể đã bị xâm nhập tạo ra (tên file, dòng lệnh, dòng trong `.bashrc`) nên có thể chứa câu chữ dụ AI. Vì vậy AI **chỉ được nhắm vào thứ có trong bằng chứng** (đúng pid + thời điểm khởi động, đúng đường dẫn + số dòng + SHA-256 của dòng, tài khoản có liên quan trong bằng chứng, dịch vụ trong danh sách) và hub loại mọi đề xuất khác.
+- Dịch vụ lõi (nginx, php-fpm, database, sshd…) và tài khoản hệ thống không bao giờ bị đụng tới.
+- **Agent kiểm tra lại độc lập** bằng bằng chứng nó tự thu thập (còn mới dưới 2 giờ) và trạng thái thật của máy, rồi mới làm. File được sửa qua đường dẫn mở bằng `O_NOFOLLOW`.
+- Mọi hành động (trừ dừng tiến trình) được ghi để hoàn tác.
+
+**3. Mức tự xử lý (từng VPS).** Mặc định **"Duyệt từng bước"**. Bạn có thể chọn: *Tắt* (AI không tự chạy); *Tự xử lý việc hoàn tác được* (cách ly file, khoá shell, gỡ dòng độc, tắt dịch vụ chạy luôn, dừng tiến trình vẫn chờ bạn); *Tự xử lý tất cả* (kể cả dừng tiến trình). Ở hai mức tự xử, khi có sự cố hub tự thu thập bằng chứng, gọi AI và gửi lệnh mà không chờ bạn bấm. Mọi việc đều hiện ở khung AI và Nhật ký. **Nên bật sau khi bạn đã thấy AI đề xuất đúng vài lần ở chế độ duyệt**, vì AI vẫn có thể sai.
+
+**4. Bật trên VPS.** Thu thập bằng chứng (chỉ đọc) bật sẵn (`[remote] allow_evidence = true`). **Thực hiện hành động mặc định tắt** vì nó chạy bằng root theo lệnh từ hub. Bật cho từng VPS:
+```sh
+curl -fsSL https://HUB/install.sh | sudo sh -s -- --hub https://HUB --upgrade --allow-remote-fix
+```
+(hoặc đặt `allow_remediate = true` trong `[remote]` của `/etc/sn/agent.toml`). Agent chỉ báo hỗ trợ khi VPS cho phép, nên hub chỉ hiện nút ở nơi chạy được.
+
+**Giới hạn đã biết:** các luật kiểm tra (đặc biệt "đáng ngờ" của dòng `.bashrc`, tiến trình giả danh) là heuristic nên có thể bỏ sót hoặc báo thừa; chưa chặn IP bằng ipset/firewall toàn cổng (nft của agent chỉ chặn cổng web) và chưa tự chặn bot ở Nginx của DirectAdmin; AI có thể chẩn đoán sai, nên đọc kỹ trước khi duyệt. **Chưa thử trên VPS thật.**
 
 ## Bot phân tán và CPU cao
 

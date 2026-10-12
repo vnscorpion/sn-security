@@ -15,6 +15,7 @@ TOKEN=""
 ARCH=""
 UPGRADE=0
 ALLOW_CLAMAV_INSTALL=0
+ALLOW_REMOTE_FIX=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -24,6 +25,7 @@ while [ $# -gt 0 ]; do
     --arch) ARCH="$2"; shift 2;;
     --upgrade) UPGRADE=1; shift;;
     --allow-clamav-install) ALLOW_CLAMAV_INSTALL=1; shift;;
+    --allow-remote-fix) ALLOW_REMOTE_FIX=1; shift;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done
@@ -83,15 +85,25 @@ if [ "$UPGRADE" -eq 1 ]; then
     systemctl daemon-reload || true
     echo ">> sn-hunt.service: memory cap raised to 2G (for ClamAV)"
   fi
-  if [ "$ALLOW_CLAMAV_INSTALL" -eq 1 ] && [ -f /etc/sn/agent.toml ]; then
-    if grep -q '^allow_install_clamav' /etc/sn/agent.toml; then
-      sed -i 's/^allow_install_clamav.*/allow_install_clamav = true/' /etc/sn/agent.toml
+  # Turn a [remote] switch on in the existing config (add it if missing).
+  set_remote_flag() {
+    key="$1"
+    [ -f /etc/sn/agent.toml ] || return 0
+    if grep -q "^$key" /etc/sn/agent.toml; then
+      sed -i "s/^$key.*/$key = true/" /etc/sn/agent.toml
     elif grep -q '^\[remote\]' /etc/sn/agent.toml; then
-      sed -i '/^\[remote\]/a allow_install_clamav = true' /etc/sn/agent.toml
+      sed -i "/^\[remote\]/a $key = true" /etc/sn/agent.toml
     else
-      printf '\n[remote]\nallow_install_clamav = true\n' >> /etc/sn/agent.toml
+      printf '\n[remote]\n%s = true\n' "$key" >> /etc/sn/agent.toml
     fi
+  }
+  if [ "$ALLOW_CLAMAV_INSTALL" -eq 1 ]; then
+    set_remote_flag allow_install_clamav
     echo ">> the hub may now install ClamAV on this VPS ([remote] allow_install_clamav = true)"
+  fi
+  if [ "$ALLOW_REMOTE_FIX" -eq 1 ]; then
+    set_remote_flag allow_remediate
+    echo ">> the hub may now carry out incident-response actions on this VPS ([remote] allow_remediate = true)"
   fi
   echo ">> upgraded. Rollback: cp /usr/local/bin/sn.bak /usr/local/bin/sn"
   exit 0
@@ -166,6 +178,8 @@ clamav = "auto"
 allow_mode_observe = false
 allow_undo = false
 allow_install_clamav = $( [ "$ALLOW_CLAMAV_INSTALL" -eq 1 ] && echo true || echo false )
+allow_evidence = true
+allow_remediate = $( [ "$ALLOW_REMOTE_FIX" -eq 1 ] && echo true || echo false )
 EOF
 chmod 0600 /etc/sn/agent.toml
 

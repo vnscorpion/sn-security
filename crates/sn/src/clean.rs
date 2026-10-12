@@ -69,43 +69,176 @@ pub fn clean(state: &State, yes: bool) -> Result<usize> {
     Ok(n)
 }
 
-/// Move one file into the vault. Returns the quarantine id (sha256 prefix).
-pub fn quarantine(state: &State, path: &Path) -> Result<String> {
-    let meta =
-        std::fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
-    if !meta.file_type().is_file() {
-        bail!("not a regular file: {}", path.display());
-    }
-    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    let sha = hex::encode(hasher.finalize());
-    let id = format!("{}-{}", &sha[..16], util::ts_compact(util::now_secs()));
+/// Largest file the vault will take.
+const MAX_QUARANTINE_BYTES: u64 = 256 * 1024 * 1024;
 
+/// `(uid, gid, mode, mtime)` of a file.
+type Attrs = (u32, u32, u32, i64);
+
+/// Write a copy of `data` into a new vault entry and describe it. The original is
+/// not touched here.
+fn store(
+    state: &State,
+    orig_path: &Path,
+    data: &[u8],
+    (uid, gid, mode, mtime): Attrs,
+) -> Result<(String, PathBuf)> {
+    let sha = hex::encode(Sha256::digest(data));
+    let id = format!("{}-{}", &sha[..16], util::ts_compact(util::now_secs()));
     let dest_dir = vault(state).join(&id);
     std::fs::create_dir_all(&dest_dir)?;
     let dest = dest_dir.join("payload.bin");
-
-    // Move (rename within same fs, else copy+remove).
-    if std::fs::rename(path, &dest).is_err() {
-        std::fs::write(&dest, &bytes)?;
-        std::fs::remove_file(path)?;
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&dest)?;
+        f.write_all(data)?;
     }
     // chmod 000 so the quarantined payload cannot run.
     let _ = std::fs::set_permissions(&dest, std::os::unix::fs::PermissionsExt::from_mode(0o000));
-
     let qm = QuarantineMeta {
         id: id.clone(),
-        orig_path: path.to_string_lossy().to_string(),
-        uid: meta.uid(),
-        gid: meta.gid(),
-        mode: meta.mode(),
-        mtime: meta.mtime(),
+        orig_path: orig_path.to_string_lossy().to_string(),
+        uid,
+        gid,
+        mode,
+        mtime,
         sha256: sha,
         quarantined_at: util::now_secs(),
     };
     std::fs::write(dest_dir.join("meta.json"), serde_json::to_vec_pretty(&qm)?)?;
+    Ok((id, dest_dir))
+}
+
+/// Move one file into the vault. Returns the quarantine id (sha256 prefix).
+///
+/// The file is opened without following a symlink and without blocking, and its
+/// size is bounded, so a link or a FIFO swapped in by the file's owner cannot make
+/// this read something else or hang. (For a file an attacker can influence while
+/// it runs, use [`quarantine_safe`], which also resolves the directories safely.)
+pub fn quarantine(state: &State, path: &Path) -> Result<String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    let meta = f.metadata()?;
+    if !meta.is_file() {
+        bail!("not a regular file: {}", path.display());
+    }
+    if meta.len() > MAX_QUARANTINE_BYTES {
+        bail!(
+            "file is larger than {} MiB: {}",
+            MAX_QUARANTINE_BYTES >> 20,
+            path.display()
+        );
+    }
+    let mut bytes = Vec::new();
+    f.take(MAX_QUARANTINE_BYTES)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read {}", path.display()))?;
+    let (id, dest_dir) = store(
+        state,
+        path,
+        &bytes,
+        (meta.uid(), meta.gid(), meta.mode(), meta.mtime()),
+    )?;
+    // Take it out of place: the copy in the vault is the one that matters now.
+    if let Err(e) = std::fs::remove_file(path) {
+        let _ = std::fs::remove_dir_all(dest_dir);
+        return Err(e).with_context(|| format!("remove {}", path.display()));
+    }
     Ok(id)
+}
+
+/// Quarantine a file that an attacker may be racing against (an AI-ordered clean
+/// of something in `/tmp` or a hidden home directory).
+///
+/// Every directory on the way is opened with `O_NOFOLLOW` relative to the one
+/// before it, the file with `O_NOFOLLOW | O_NONBLOCK` relative to its parent, and
+/// the removal is `unlinkat` on that same parent descriptor. Renaming a directory
+/// or swapping a symlink in afterwards cannot redirect any of it, because nothing
+/// is looked up by path again. If `expect_owner` is set the file must belong to
+/// that uid.
+pub fn quarantine_safe(state: &State, path: &Path, expect_owner: Option<u32>) -> Result<String> {
+    use nix::fcntl::{OFlag, openat};
+    use nix::sys::stat::{Mode, SFlag, fstat};
+    use nix::unistd::{UnlinkatFlags, close, read, unlinkat};
+    use std::os::fd::RawFd;
+
+    let comps: Vec<&str> = path
+        .to_str()
+        .context("path is not valid UTF-8")?
+        .split('/')
+        .filter(|c| !c.is_empty() && *c != ".")
+        .collect();
+    let (leaf, dirs) = comps.split_last().context("empty path")?;
+    if !path.is_absolute() || comps.contains(&"..") {
+        bail!("path must be absolute and free of `..`");
+    }
+
+    let dir_flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    let mut cur: RawFd = openat(None, "/", dir_flags, Mode::empty()).context("open /")?;
+    for d in dirs {
+        let next = openat(Some(cur), *d, dir_flags, Mode::empty());
+        let _ = close(cur);
+        cur = next.with_context(|| format!("open directory {d} (a symlink on the way?)"))?;
+    }
+    let result = (|| -> Result<String> {
+        let fd = openat(
+            Some(cur),
+            *leaf,
+            OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .with_context(|| format!("open {leaf}"))?;
+        let body = (|| -> Result<(Vec<u8>, Attrs)> {
+            let st = fstat(fd)?;
+            if SFlag::from_bits_truncate(st.st_mode) & SFlag::S_IFMT != SFlag::S_IFREG {
+                bail!("not a regular file");
+            }
+            if let Some(uid) = expect_owner
+                && st.st_uid != uid
+            {
+                bail!("file belongs to uid {}, not {uid}", st.st_uid);
+            }
+            let size = u64::try_from(st.st_size).unwrap_or(0);
+            if size > MAX_QUARANTINE_BYTES {
+                bail!("file is larger than {} MiB", MAX_QUARANTINE_BYTES >> 20);
+            }
+            let mut data = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                let n = read(fd, &mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                data.extend_from_slice(&buf[..n]);
+                if data.len() as u64 > MAX_QUARANTINE_BYTES {
+                    bail!("file grew beyond the limit while reading");
+                }
+            }
+            Ok((data, (st.st_uid, st.st_gid, st.st_mode, st.st_mtime)))
+        })();
+        let _ = close(fd);
+        let (data, attrs) = body?;
+        let (id, dest_dir) = store(state, path, &data, attrs)?;
+        if let Err(e) = unlinkat(Some(cur), *leaf, UnlinkatFlags::NoRemoveDir) {
+            // Do not leave a second copy behind when the original stays.
+            let _ = std::fs::remove_dir_all(dest_dir);
+            bail!("could not remove the original: {e}");
+        }
+        Ok(id)
+    })();
+    let _ = close(cur);
+    result
 }
 
 /// Restore a quarantined file to its original path, owner, mode and mtime.

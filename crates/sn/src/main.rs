@@ -11,8 +11,11 @@ mod clean;
 mod config;
 mod contain;
 mod discover;
+mod evidence;
+mod evidence_parse;
 mod hub;
 mod hunt;
+mod remediate;
 mod state;
 mod sys;
 mod triage;
@@ -78,6 +81,16 @@ enum Cmd {
     },
     /// Install ClamAV for this OS (root). Used by the hub's "Install ClamAV" button.
     InstallClamav,
+    /// Take a read-only incident snapshot (processes, start-up files, temp
+    /// executables, SSH logins, open ports) and keep it for the hub.
+    Evidence,
+    /// Carry out an incident-response order the hub gave (root). Reads the job
+    /// file the agent wrote when it received the order.
+    Remediate {
+        /// Job id (the name of the job file in the state directory).
+        #[arg(long)]
+        job: String,
+    },
     /// Quarantine malicious findings from the last hunt (requires --yes).
     Clean {
         #[arg(long)]
@@ -89,8 +102,13 @@ enum Cmd {
     Restore { id: String },
     /// List quarantined files.
     ListQuarantine,
-    /// Reverse everything recorded in the undo log (release jail, remove bans).
-    Undo,
+    /// Reverse the recorded containment (release the jail, remove bans). With
+    /// `--remediation`, reverse what `sn remediate` did instead (restore shells and
+    /// start-up files, re-enable services).
+    Undo {
+        #[arg(long)]
+        remediation: bool,
+    },
     /// One watch cycle: read logs, count, ban/observe, report to hub.
     Watch {
         /// Replay a captured log file (no firewall or hub side effects).
@@ -159,6 +177,15 @@ fn run() -> Result<()> {
             };
             hunt::run(&cfg, &state, &opts)?;
         }
+        Cmd::Evidence => {
+            let state = State::open()?;
+            let ev = evidence::collect(&state)?;
+            evidence::print(&ev);
+        }
+        Cmd::Remediate { job } => {
+            let state = State::open()?;
+            remediate::run_job(&cfg, &state, &job)?;
+        }
         Cmd::InstallClamav => {
             let state = State::open()?;
             clamav_run::install(&state)?;
@@ -180,9 +207,13 @@ fn run() -> Result<()> {
             let state = State::open()?;
             clean::list(&state)?;
         }
-        Cmd::Undo => {
+        Cmd::Undo { remediation } => {
             let state = State::open()?;
-            let n = undo::run_all(&state.dir)?;
+            let n = if remediation {
+                undo::run_remediation(&state.dir)?
+            } else {
+                undo::run_all(&state.dir)?
+            };
             println!("reversed {n} recorded action(s).");
         }
         Cmd::Watch { replay } => {

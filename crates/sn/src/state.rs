@@ -45,6 +45,12 @@ pub struct Meta {
     /// Consecutive cycles with CPU at or above `cpu_alert_pct`.
     #[serde(default)]
     pub cpu_streak: u32,
+    /// `at` of the evidence snapshot the hub already has.
+    #[serde(default)]
+    pub last_evidence_sent: i64,
+    /// Id of the remediation result the hub already has.
+    #[serde(default)]
+    pub last_remediation_sent: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

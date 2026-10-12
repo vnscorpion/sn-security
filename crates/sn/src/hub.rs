@@ -24,17 +24,24 @@ const MEM_ALERT_PCT: f64 = 90.0;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(15);
 
-fn capabilities() -> Vec<String> {
-    vec![
-        "triage".into(),
-        "contain".into(),
-        "hunt".into(),
-        "watch".into(),
-        "ban".into(),
-        "undo".into(),
+fn capabilities(cfg: &Config) -> Vec<String> {
+    let mut caps: Vec<String> = [
+        "triage", "contain", "hunt", "watch", "ban", "undo",
         // Understands the `install_clamav` job (older agents cannot parse it).
-        "clamav".into(),
+        "clamav",
     ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
+    // Listed only when this VPS allows them, so the hub offers the AI features
+    // exactly where they will work. An agent that predates them lists neither.
+    if cfg.remote.allow_evidence {
+        caps.push("evidence".into());
+    }
+    if cfg.remote.allow_remediate {
+        caps.push("remediate".into());
+    }
+    caps
 }
 
 fn host_info() -> HostInfo {
@@ -126,11 +133,13 @@ pub fn sync(
         triage,
         findings,
         applied_desired: meta.applied_desired,
-        capabilities: capabilities(),
+        capabilities: capabilities(cfg),
         active_bans: active_list,
         active_bans_total: active_total,
         hunt,
         clamav: Some(crate::clamav_run::info(cfg, state)),
+        evidence: fresh_evidence(state, &mut meta),
+        remediation: fresh_remediation(state, &mut meta),
     };
 
     let body_json = serde_json::to_vec(&body)?;
@@ -235,6 +244,77 @@ fn hunt_unit_args(days: u32) -> Vec<String> {
     .map(|s| (*s).to_string())
     .collect();
     args.push(days.to_string());
+    args
+}
+
+/// The evidence snapshot, once: only when it is newer than what was last sent.
+fn fresh_evidence(
+    state: &State,
+    meta: &mut crate::state::Meta,
+) -> Option<snsec_common::schema::Evidence> {
+    let ev = crate::evidence::latest(state)?;
+    if ev.at <= meta.last_evidence_sent {
+        return None;
+    }
+    meta.last_evidence_sent = ev.at;
+    Some(ev)
+}
+
+/// The result of the last remediation, once.
+fn fresh_remediation(
+    state: &State,
+    meta: &mut crate::state::Meta,
+) -> Option<snsec_common::schema::RemediationReport> {
+    let r = crate::remediate::latest_result(state)?;
+    if r.id == meta.last_remediation_sent {
+        return None;
+    }
+    meta.last_remediation_sent = r.id.clone();
+    Some(r)
+}
+
+/// `systemd-run` arguments for `sn evidence`: a short read-only job. It runs as
+/// its own unit because the watch unit has a private `/tmp` and a read-only home,
+/// so it could not see the places that matter.
+fn evidence_unit_args() -> Vec<String> {
+    [
+        "--quiet",
+        "--no-block",
+        "--collect",
+        "--unit=sn-evidence",
+        "--description=SN Secure evidence snapshot (requested from the hub)",
+        "--property=Nice=10",
+        "--property=IOSchedulingClass=idle",
+        "--property=RuntimeMaxSec=5min",
+        "--property=MemoryMax=512M",
+        "/usr/local/bin/sn",
+        "evidence",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect()
+}
+
+/// `systemd-run` arguments for `sn remediate --job <id>`. Unconfined root: it
+/// has to edit users' files, change a shell and stop a service, which the watch
+/// unit's sandbox forbids. One at a time (fixed unit name), and bounded in time.
+fn remediate_unit_args(id: &str) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "--quiet",
+        "--no-block",
+        "--collect",
+        "--unit=sn-remediate",
+        "--description=SN Secure incident response (requested from the hub)",
+        "--property=RuntimeMaxSec=10min",
+        "--property=MemoryMax=1G",
+        "/usr/local/bin/sn",
+        "remediate",
+        "--job",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
+    args.push(id.to_string());
     args
 }
 
@@ -557,6 +637,58 @@ fn run_job(cfg: &Config, state: &State, job: &snsec_common::schema::Job) {
                     "hub: could not start the ClamAV install ({s}); one may already be running (`systemctl status sn-install-clamav`)"
                 ),
                 Err(e) => eprintln!("hub: could not start the ClamAV install: {e}"),
+            }
+        }
+        Job::Evidence => {
+            if !cfg.remote.allow_evidence {
+                eprintln!("hub: ignoring evidence job (set [remote] allow_evidence=true)");
+                return;
+            }
+            match std::process::Command::new("systemd-run")
+                .args(evidence_unit_args())
+                .status()
+            {
+                Ok(s) if s.success() => eprintln!("hub: started evidence collection"),
+                Ok(s) => eprintln!("hub: could not start evidence collection ({s})"),
+                Err(e) => eprintln!("hub: could not start evidence collection: {e}"),
+            }
+        }
+        Job::Remediate { id, actions } => {
+            if !cfg.remote.allow_remediate {
+                eprintln!(
+                    "hub: ignoring remediate job (set [remote] allow_remediate=true to permit)"
+                );
+                return;
+            }
+            if !crate::remediate::is_valid_job_id(id) {
+                eprintln!("hub: ignoring remediate job with an invalid id");
+                return;
+            }
+            // The unit reads the order from a file only root can read.
+            let capped: Vec<_> = actions
+                .iter()
+                .take(snsec_common::ai::MAX_ACTIONS)
+                .cloned()
+                .collect();
+            let path = crate::remediate::job_path(state, id);
+            let written = serde_json::to_vec(&capped)
+                .map_err(anyhow::Error::from)
+                .and_then(|b| std::fs::write(&path, b).map_err(anyhow::Error::from));
+            if let Err(e) = written {
+                eprintln!("hub: could not write the remediation job: {e:#}");
+                return;
+            }
+            match std::process::Command::new("systemd-run")
+                .args(remediate_unit_args(id))
+                .status()
+            {
+                Ok(s) if s.success() => {
+                    eprintln!("hub: started remediation {id} ({} action(s))", capped.len());
+                }
+                Ok(s) => eprintln!(
+                    "hub: could not start remediation ({s}); one may already be running (`systemctl status sn-remediate`)"
+                ),
+                Err(e) => eprintln!("hub: could not start remediation: {e}"),
             }
         }
         Job::Unknown => {

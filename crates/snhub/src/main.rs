@@ -5,13 +5,17 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod ai_client;
+mod analysis;
 mod api;
 mod auth;
 mod config;
 mod db;
+mod db_ai;
 mod desired;
 mod keys;
 mod web;
+mod web_ai;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -223,6 +227,25 @@ async fn serve(cfg: HubConfig, state: Arc<AppState>) -> Result<()> {
         .route("/agent/{id}/job", post(web::job_post))
         .route("/agent/{id}/findings.csv", get(web::findings_csv_download))
         .route("/agent/{id}/findings.txt", get(web::findings_txt_download))
+        .route("/agent/{id}/evidence.json", get(web_ai::evidence_download))
+        .route("/agent/{id}/ai/analyze", post(web_ai::ai_analyze_post))
+        .route("/agent/{id}/ai/autonomy", post(web_ai::ai_autonomy_post))
+        .route("/agent/{id}/ai/{pid}/apply", post(web_ai::ai_apply_post))
+        .route("/agent/{id}/ai/{pid}/reject", post(web_ai::ai_reject_post))
+        .route("/settings", get(web_ai::settings_page))
+        .route("/settings/provider", post(web_ai::provider_save_post))
+        .route(
+            "/settings/provider/{pid}/default",
+            post(web_ai::provider_default_post),
+        )
+        .route(
+            "/settings/provider/{pid}/delete",
+            post(web_ai::provider_delete_post),
+        )
+        .route(
+            "/settings/provider/{pid}/test",
+            post(web_ai::provider_test_post),
+        )
         .route("/add-vps", get(web::add_vps_page).post(web::add_vps_post))
         .route("/log", get(web::log_page))
         .route("/check-ip", get(web::check_ip))

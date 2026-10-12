@@ -130,7 +130,7 @@ fn parse_label(s: &str) -> Label {
 /// Reasons a process must never be jailed (SEC-7 / DET-4): PID 1, our own
 /// process, core services identified by exe location + name, and web-server
 /// *workers* (a webshell inside php-fpm is handled by maintenance, not a jail).
-fn protected_reason(pid: i32, st: &proc::ProcStat, exe: &str) -> Option<&'static str> {
+pub(crate) fn protected_reason(pid: i32, st: &proc::ProcStat, exe: &str) -> Option<&'static str> {
     if pid <= 1 {
         return Some("init");
     }

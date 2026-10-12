@@ -49,3 +49,16 @@ pub fn ellipsize(s: &str, n: usize) -> String {
         out
     }
 }
+
+/// Directories searched for a program the agent runs as root. Fixed on purpose:
+/// never `PATH`, which a caller (or an attacker's environment) could steer.
+const BIN_DIRS: &[&str] = &["/usr/bin", "/usr/local/bin", "/bin", "/usr/sbin", "/sbin"];
+
+/// The absolute path of `name` in a system directory, if it is installed.
+#[must_use]
+pub fn find_bin(name: &str) -> Option<std::path::PathBuf> {
+    BIN_DIRS
+        .iter()
+        .map(|d| std::path::Path::new(d).join(name))
+        .find(|p| p.is_file())
+}

@@ -29,7 +29,6 @@ use crate::state::State;
 use crate::sys::proc;
 use crate::util;
 
-const BIN_DIRS: &[&str] = &["/usr/bin", "/usr/local/bin", "/bin", "/usr/sbin", "/sbin"];
 const DB_DIR: &str = "/var/lib/clamav";
 /// `clamscan` with the full database does not fit comfortably below this.
 const MIN_INSTALL_RAM_MB: u64 = 1800;
@@ -49,13 +48,7 @@ const MIN_SCAN_BUDGET_SECS: u64 = 120;
 /// After SIGTERM, how long a timed-out process gets before SIGKILL.
 const TERM_GRACE: Duration = Duration::from_secs(20);
 
-/// An absolute path to `name` in a system directory, if it is installed.
-pub fn find_bin(name: &str) -> Option<PathBuf> {
-    BIN_DIRS
-        .iter()
-        .map(|d| Path::new(d).join(name))
-        .find(|p| p.is_file())
-}
+pub use crate::util::find_bin;
 
 fn newest_mtime(stem: &str, exts: &[&str]) -> Option<SystemTime> {
     exts.iter()
