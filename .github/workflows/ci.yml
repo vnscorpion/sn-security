@@ -34,8 +34,24 @@ jobs:
         run: cargo fmt --all -- --check
       - name: clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # A failing test is named in an annotation (with its panic and left/right
+      # lines), so it can be read without downloading the job log.
       - name: test
-        run: cargo test --workspace --locked
+        run: |
+          set -o pipefail
+          if ! cargo test --workspace --locked --no-fail-fast 2>&1 | tee "$RUNNER_TEMP/test.log"; then
+            awk '
+              /^---- .* stdout ----$/ { if (msg != "") print msg; msg = $2; next_too = 0; next }
+              msg != "" && (next_too || /panicked at|^ *left:|^ *right:|assertion/) {
+                if (length(msg) < 900) msg = msg "%0A" $0
+                next_too = /panicked at/
+              }
+              END { if (msg != "") print msg }
+            ' "$RUNNER_TEMP/test.log" | head -n 10 | while IFS= read -r m; do
+              echo "::error title=test failed::$m"
+            done
+            exit 1
+          fi
 
   build-musl:
     name: static musl build (${{ matrix.arch }})

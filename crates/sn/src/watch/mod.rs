@@ -1373,9 +1373,14 @@ mod tests {
         let by_id = |id| st.hits.iter().find(|h| h.id == id).unwrap();
         assert_eq!(by_id(60_001).count, 2);
         assert_eq!(by_id(60_001).blocked, 0);
+        // Examples keep the path as sent (no query string): the second shows
+        // how the probe tried to get round the rule.
         assert_eq!(
             by_id(60_001).samples,
-            vec!["shop.example /.env".to_string()]
+            vec![
+                "shop.example /.env".to_string(),
+                "shop.example //./.env".to_string()
+            ]
         );
         assert_eq!((by_id(60_002).count, by_id(60_002).blocked), (1, 1));
         // Taken by that report: the next one starts from zero.
