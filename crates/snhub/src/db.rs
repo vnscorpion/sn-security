@@ -389,6 +389,45 @@ impl Db {
 
     /// Queue a single one-shot job for the agent. Replaces any pending job and
     /// stamps `jobs_seq` with the new version so the agent runs it exactly once.
+    /// Lift every ban on a VPS: the hub's own orders are dropped and the VPS is
+    /// told (by `unban_all_seq`) to empty its ban sets and forget its offence
+    /// counts. An agent too old to know the marker gets the addresses its last
+    /// report listed as unbans instead. With `observe`, the VPS also stops
+    /// banning by itself until switched back.
+    ///
+    /// # Errors
+    /// A database error.
+    pub fn unban_all(&self, agent_id: &str, now: i64, who: &str, observe: bool) -> Result<()> {
+        let report = self.latest_report(agent_id)?;
+        let knows = report
+            .as_ref()
+            .is_some_and(|r| r.capabilities.iter().any(|c| c == "unban_all"));
+        let listed: Vec<String> = if knows {
+            Vec::new()
+        } else {
+            report
+                .map(|r| r.active_bans.into_iter().map(|b| b.ip).collect())
+                .unwrap_or_default()
+        };
+        let detail = if observe {
+            "gỡ toàn bộ lệnh chặn, chuyển sang chỉ theo dõi"
+        } else {
+            "gỡ toàn bộ lệnh chặn"
+        };
+        self.update_desired(agent_id, now, who, "unban_all", detail, |d| {
+            let hub_bans: Vec<String> = d.bans.drain(..).map(|b| b.ip).collect();
+            d.unbans.clear();
+            if !knows {
+                d.unbans = hub_bans.into_iter().chain(listed).collect();
+                d.unbans.dedup();
+            }
+            d.unban_all_seq = (d.unban_all_seq + 1).max(u64::try_from(now).unwrap_or(0));
+            if observe {
+                d.mode = snsec_common::schema::Mode::Observe;
+            }
+        })
+    }
+
     pub fn queue_job(
         &self,
         agent_id: &str,

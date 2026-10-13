@@ -192,6 +192,7 @@ Có — từ giao diện snhub bạn **đặt lệnh cho VPS mà không cần SS
 | **Đổi observe ↔ enforce** | Agent đổi chế độ chu kỳ kế | Hub quyết định cả hai chiều |
 | **Quét ngay** (quét mã độc) | Agent chạy `sn hunt` trong một unit systemd riêng, ưu tiên thấp; kết quả lên hub ở báo cáo sau khi quét xong | Chạy một lần mỗi lần bấm; không chạy chồng hai lần quét |
 | **Undo** (gỡ contain + ban của sn) | Agent chạy `sn undo` chu kỳ kế | Hub quyết định |
+| **Gỡ chặn toàn bộ** | Agent xoá mọi IP đang chặn và bộ đếm vi phạm ở lần đồng bộ kế tiếp (nút trên trang VPS, nút cho mọi VPS ở Tổng quan, hoặc `snhub unban-all [--vps TÊN] [--observe]`) | Hub quyết định |
 
 Tier chính sách (đổi `patterns`, `trusted_proxies`, ép observe hàng loạt) cần **chữ ký root key offline** — hub bị chiếm cũng không hạ được bảo vệ. `contain`/`fetch` từ xa là **v1.1** (hiện làm qua SSH). Cần tức thì tại chỗ thì dùng `sn disable` (kill switch) hoặc chạy lệnh qua SSH.
 

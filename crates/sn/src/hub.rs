@@ -42,6 +42,8 @@ fn capabilities(cfg: &Config) -> Vec<String> {
     if cfg.remote.hub_orders {
         caps.push("evidence".into());
         caps.push("remediate".into());
+        // Lifts every ban on the hub's `unban_all_seq`.
+        caps.push("unban_all".into());
     }
     caps
 }
@@ -866,6 +868,28 @@ fn apply_desired(cfg: &Config, state: &State, d: &DesiredBody) -> Result<()> {
     // Hard local bounds (SEC-2): the hub can never exceed these.
     let _timer = d.timer_interval_secs.clamp(300, 900);
 
+    // "Lift every ban" from the admin (too many wrong bans): before the operator
+    // bans below, so a ban ordered after it still applies. Once per marker.
+    if d.unban_all_seq > 0 {
+        let take = state.update_meta(|m| {
+            let new = d.unban_all_seq > m.last_unban_all_seq;
+            if new {
+                m.last_unban_all_seq = d.unban_all_seq;
+            }
+            new
+        });
+        if matches!(take, Ok(true)) {
+            match crate::sys::fw::flush_bans() {
+                Ok(()) => eprintln!("hub: every ban lifted on the admin's order"),
+                Err(e) => eprintln!("hub: could not lift the bans ({e:#})"),
+            }
+            let _ = state.save_bans(&Default::default());
+            // Forget the offence counts too, or the next offence of an address
+            // that was banned wrongly would start at a longer ban.
+            let _ = state.save_strikes(&Default::default());
+        }
+    }
+
     // Operator bans / unbans (web-port only, like every other ban). Only a key
     // rebuilt from a parsed address goes on (see `canonical_ban_key`).
     let now = util::now_secs();
@@ -1274,6 +1298,48 @@ mod tests {
             strike: 1,
             layer: "l3".into(),
         }
+    }
+
+    #[test]
+    fn an_unban_all_order_lifts_every_ban_once_and_forgets_the_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::at(dir.path().to_path_buf());
+        let now = util::now_secs();
+        let fill = || {
+            let mut bans = HashMap::new();
+            bans.insert("45.133.1.10".to_string(), ban(now + 3600));
+            state.save_bans(&bans).unwrap();
+            let mut strikes = HashMap::new();
+            strikes.insert(
+                "45.133.1.10".to_string(),
+                crate::state::Strike {
+                    count: 3,
+                    last_ts: now,
+                },
+            );
+            state.save_strikes(&strikes).unwrap();
+        };
+        fill();
+        let cfg = default_config();
+        let d = DesiredBody {
+            unban_all_seq: 7,
+            ..DesiredBody::default()
+        };
+        apply_desired(&cfg, &state, &d).unwrap();
+        assert!(state.bans().is_empty());
+        assert!(state.strikes().is_empty());
+        assert_eq!(state.meta().last_unban_all_seq, 7);
+        // The same marker again (a later, unrelated desired change) does nothing.
+        fill();
+        apply_desired(&cfg, &state, &d).unwrap();
+        assert_eq!(state.bans().len(), 1);
+        // A newer one acts again.
+        let d2 = DesiredBody {
+            unban_all_seq: 8,
+            ..DesiredBody::default()
+        };
+        apply_desired(&cfg, &state, &d2).unwrap();
+        assert!(state.bans().is_empty());
     }
 
     #[test]

@@ -45,6 +45,9 @@ pub struct Meta {
     /// Highest `jobs_seq` the agent has already executed.
     #[serde(default)]
     pub last_jobs_seq: u64,
+    /// Highest `unban_all_seq` the agent has acted on (see `DesiredBody`).
+    #[serde(default)]
+    pub last_unban_all_seq: u64,
     /// Consecutive cycles that read no log lines although web connections were
     /// open. One quiet cycle is normal (idle keep-alives); a streak is a symptom.
     #[serde(default)]

@@ -572,3 +572,65 @@ async fn a_new_password_revokes_every_hermes_token() {
     assert!(r.location().contains("msg="), "{}", r.location());
     assert_eq!(h.mcp(&tok, &ping).await.status, StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn the_admin_can_lift_every_ban_on_one_vps_or_all() {
+    use snsec_common::schema::{DesiredBan, Mode};
+    let h = hub();
+    let cookie = h.sign_in().await;
+    let id = h.vps(&["evidence", "remediate", "unban_all"]);
+    {
+        let db = h.st.db.lock().unwrap();
+        db.update_desired(&id, now(), "admin", "ban", "x", |d| {
+            d.bans.push(DesiredBan {
+                ip: "45.133.1.10".into(),
+                ttl_secs: 3600,
+                reason: "admin".into(),
+                created_at: now(),
+            });
+            d.mode = Mode::Enforce;
+        })
+        .unwrap();
+    }
+    let r = h
+        .post(&format!("/agent/{id}/unban-all"), &cookie, "observe=on")
+        .await;
+    assert!(r.location().contains("msg="), "{}", r.location());
+    let (_, _, d) = h.st.db.lock().unwrap().get_desired(&id).unwrap().unwrap();
+    assert!(d.unban_all_seq > 0);
+    assert!(d.bans.is_empty() && d.unbans.is_empty());
+    assert_eq!(d.mode, Mode::Observe);
+    let first = d.unban_all_seq;
+
+    // Every VPS at once; the marker always moves forward.
+    let r = h.post("/unban-all", &cookie, "observe=").await;
+    assert!(r.location().starts_with("/?msg="), "{}", r.location());
+    let (_, _, d) = h.st.db.lock().unwrap().get_desired(&id).unwrap().unwrap();
+    assert!(d.unban_all_seq > first);
+    // The overview shows the message.
+    let page = h.get(&r.location(), &cookie).await;
+    assert!(page.body.contains("gỡ toàn bộ lệnh chặn"), "{}", page.body);
+}
+
+#[tokio::test]
+async fn an_agent_too_old_for_the_marker_gets_its_listed_bans_as_unbans() {
+    use snsec_common::schema::ActiveBanInfo;
+    let h = hub();
+    let id = h.vps(&["evidence", "remediate"]);
+    {
+        let db = h.st.db.lock().unwrap();
+        let mut rep = db.latest_report(&id).unwrap().unwrap();
+        rep.active_bans = vec![ActiveBanInfo {
+            ip: "91.92.93.94".into(),
+            reason: "rate".into(),
+            expires_at: now() + 600,
+            strike: 1,
+            layer: "l3".into(),
+        }];
+        let text = serde_json::to_string(&rep).unwrap();
+        db.record_report(&id, 2, now(), &rep, &text).unwrap();
+        db.unban_all(&id, now(), "console", false).unwrap();
+    }
+    let (_, _, d) = h.st.db.lock().unwrap().get_desired(&id).unwrap().unwrap();
+    assert_eq!(d.unbans, vec!["91.92.93.94".to_string()]);
+}

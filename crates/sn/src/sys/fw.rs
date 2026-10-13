@@ -197,6 +197,17 @@ pub fn apply_bans(adds: &[(String, u64)], dels: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Lift every ban: empty both ban sets (the whitelist and the table stay). A
+/// missing table means there is nothing to lift.
+pub fn flush_bans() -> Result<()> {
+    if run_nft_json(&["list", "table", "inet", "sn"]).is_err() {
+        return Ok(());
+    }
+    run_nft_script(FLUSH_BANS)
+}
+
+const FLUSH_BANS: &str = "flush set inet sn sn_ban4\nflush set inet sn sn_ban6\n";
+
 /// Replace the whitelist sets with `keys` (CIDRs or plain addresses).
 pub fn set_whitelist(keys: &[String]) -> Result<()> {
     run_nft_script(&whitelist_script(keys)?)

@@ -384,6 +384,11 @@ pub struct DesiredBody {
     /// across unrelated desired edits (bans, mode).
     #[serde(default)]
     pub jobs_seq: u64,
+    /// "Lift every ban": when this exceeds the last value the agent acted on, it
+    /// empties its ban sets and forgets the offence counters (bans the hub orders
+    /// afterwards still apply). Not a job: it must not wait for the job slot.
+    #[serde(default)]
+    pub unban_all_seq: u64,
     /// Cycle cadence hint; the systemd timer stays fixed, the agent only
     /// decides whether to skip a cycle. Clamped to [300, 900] on the agent.
     #[serde(default)]

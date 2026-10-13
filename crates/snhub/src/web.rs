@@ -673,7 +673,17 @@ fn severity_vi(s: &str) -> &'static str {
 
 // ---- overview --------------------------------------------------------------
 
-pub async fn overview(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+#[derive(Deserialize, Default)]
+pub struct OverviewQuery {
+    #[serde(default)]
+    msg: String,
+}
+
+pub async fn overview(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(oq): Query<OverviewQuery>,
+) -> Response {
     if let Some(r) = guard(&st, &headers) {
         return r;
     }
@@ -738,6 +748,8 @@ pub async fn overview(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Re
             div class="stat" { div class="n" style=(if alerts>0 {"color:var(--warn)"} else {""}) { (alerts) } div class="l" { "Cảnh báo" } }
         }
 
+        @if !oq.msg.trim().is_empty() { div class="note" style="border-left-color:var(--ok)" { (oq.msg.trim()) } }
+
         div class="note" {
             b { "Chỉ theo dõi" } " = chỉ ghi nhận, chưa chặn ai (an toàn, nên dùng vài ngày đầu). "
             b { "Chặn tự động" } " = tự chặn IP xấu. Đổi chế độ trong trang từng VPS."
@@ -772,6 +784,26 @@ pub async fn overview(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Re
                                 td class="mut" { (rel_time(a.last_seen)) }
                             }
                         }
+                    }
+                }
+            }
+        }
+
+        @if total > 0 {
+            div class="card" {
+                h2 { "Gỡ chặn hàng loạt" }
+                p class="help" {
+                    "Gỡ mọi IP đang bị chặn trên " b { "tất cả " (total) " VPS" } " (cả lệnh chặn của hub lẫn của agent), "
+                    "và xoá bộ đếm vi phạm để lần sau không bị chặn dài hơn. Dùng khi chặn nhầm nhiều. "
+                    "IP nào vẫn tấn công sẽ bị chặn lại, trừ khi chọn chuyển sang “Chỉ theo dõi”."
+                }
+                form method="post" action="/unban-all" onsubmit="return confirm('Gỡ toàn bộ lệnh chặn trên mọi VPS?')" {
+                    div class="ctrls" {
+                        label style="display:flex;gap:6px;align-items:center" {
+                            input type="checkbox" name="observe" value="on";
+                            "Đồng thời chuyển mọi VPS sang “Chỉ theo dõi” (ngừng tự chặn)"
+                        }
+                        button class="bad" type="submit" { "Gỡ chặn toàn bộ" }
                     }
                 }
             }
@@ -999,6 +1031,18 @@ pub async fn agent_detail(
 
         div class="card" id="bans" {
             h2 { "IP đang bị chặn (" (bans.len() + hidden) ")" }
+            @if bans.len() + hidden > 0 {
+                form method="post" action={"/agent/" (agent.id) "/unban-all"} style="margin:0 0 12px"
+                    onsubmit="return confirm('Gỡ toàn bộ lệnh chặn trên VPS này?')" {
+                    div class="ctrls" {
+                        button class="bad" type="submit" { "Gỡ chặn toàn bộ" }
+                        label style="display:flex;gap:6px;align-items:center" {
+                            input type="checkbox" name="observe" value="on";
+                            "và chuyển sang “Chỉ theo dõi”"
+                        }
+                    }
+                }
+            }
 
             @if let Some((listed, total)) = partial {
                 div class="note" style="border-left-color:var(--warn)" {
@@ -1310,6 +1354,74 @@ pub async fn ban_post(
     });
     drop(db);
     Redirect::to(&format!("/agent/{id}")).into_response()
+}
+
+#[derive(Deserialize, Default)]
+pub struct UnbanAllForm {
+    /// `on` when "also switch to observe" is ticked.
+    #[serde(default)]
+    observe: String,
+}
+
+/// "Lift every ban" on one VPS.
+pub async fn unban_all_post(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(f): Form<UnbanAllForm>,
+) -> Response {
+    if let Some(r) = guard(&st, &headers) {
+        return r;
+    }
+    let observe = !f.observe.is_empty();
+    let done = st
+        .db
+        .lock()
+        .map_err(|_| ())
+        .and_then(|d| d.unban_all(&id, now(), "admin", observe).map_err(|_| ()));
+    control_msg(
+        &id,
+        if done.is_err() {
+            "Không gửi được lệnh gỡ chặn."
+        } else if observe {
+            "Đã gửi lệnh gỡ toàn bộ lệnh chặn và chuyển sang “Chỉ theo dõi”. VPS áp dụng ở lần đồng bộ kế tiếp (tối đa ~5–15 phút)."
+        } else {
+            "Đã gửi lệnh gỡ toàn bộ lệnh chặn. VPS áp dụng ở lần đồng bộ kế tiếp (tối đa ~5–15 phút); IP nào vẫn tấn công sẽ bị chặn lại."
+        },
+    )
+}
+
+/// "Lift every ban" on every VPS.
+pub async fn unban_all_fleet_post(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(f): Form<UnbanAllForm>,
+) -> Response {
+    if let Some(r) = guard(&st, &headers) {
+        return r;
+    }
+    let observe = !f.observe.is_empty();
+    let n = st
+        .db
+        .lock()
+        .map(|d| {
+            let at = now();
+            d.list_agents()
+                .unwrap_or_default()
+                .iter()
+                .filter(|a| d.unban_all(&a.id, at, "admin", observe).is_ok())
+                .count()
+        })
+        .unwrap_or(0);
+    let msg = format!(
+        "Đã gửi lệnh gỡ toàn bộ lệnh chặn cho {n} VPS{}. Mỗi VPS áp dụng ở lần đồng bộ kế tiếp (tối đa ~5–15 phút).",
+        if observe {
+            " và chuyển sang “Chỉ theo dõi”"
+        } else {
+            ""
+        }
+    );
+    Redirect::to(&format!("/?msg={}", urlenc(&msg))).into_response()
 }
 
 pub async fn unban_post(
