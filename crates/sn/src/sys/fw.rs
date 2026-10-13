@@ -146,15 +146,18 @@ pub fn available() -> bool {
         .unwrap_or(false)
 }
 
-/// Create (idempotently) the `inet sn` table, sets and input chain. Existing
-/// ban/white set contents are preserved — only the chain's rules are rebuilt.
-pub fn ensure_table(web_ports: &[u16]) -> Result<()> {
+/// The script that creates (idempotently) the `inet sn` table, sets and input
+/// chain. A ban drops new TCP and UDP flows to the web ports: browsers speak
+/// HTTP/3 over UDP 443, so a TCP-only drop let a banned address keep loading
+/// pages (and keep showing up over the threshold in the log). Two rules per
+/// family rather than `th dport`, which older nft releases lack.
+fn table_script(web_ports: &[u16]) -> String {
     let ports = web_ports
         .iter()
         .map(u16::to_string)
         .collect::<Vec<_>>()
         .join(", ");
-    let script = format!(
+    format!(
         r#"add table inet sn
 add set inet sn sn_ban4 {{ type ipv4_addr; flags timeout; }}
 add set inet sn sn_ban6 {{ type ipv6_addr; flags interval, timeout; }}
@@ -167,10 +170,26 @@ add rule inet sn input iif "lo" accept
 add rule inet sn input ip saddr @sn_white4 accept
 add rule inet sn input ip6 saddr @sn_white6 accept
 add rule inet sn input ip saddr @sn_ban4 tcp dport {{ {ports} }} drop
+add rule inet sn input ip saddr @sn_ban4 udp dport {{ {ports} }} drop
 add rule inet sn input ip6 saddr @sn_ban6 tcp dport {{ {ports} }} drop
+add rule inet sn input ip6 saddr @sn_ban6 udp dport {{ {ports} }} drop
 "#
-    );
-    run_nft_script(&script)
+    )
+}
+
+/// Create (idempotently) the `inet sn` table, sets and input chain. Existing
+/// ban/white set contents are preserved — only the chain's rules are rebuilt.
+pub fn ensure_table(web_ports: &[u16]) -> Result<()> {
+    run_nft_script(&table_script(web_ports))
+}
+
+/// [`ensure_table`], then replace the whitelist sets with `white_keys`: done
+/// together wherever bans are about to be applied, so what may never be
+/// banned (the whitelist, trusted proxies, Cloudflare) is accepted by the
+/// firewall before any ban rule, whoever ordered the ban.
+pub fn prepare(web_ports: &[u16], white_keys: &[String]) -> Result<()> {
+    ensure_table(web_ports)?;
+    set_whitelist(white_keys)
 }
 
 /// Apply a batch of bans (add with per-element timeout) and unbans in one
@@ -333,6 +352,28 @@ mod tests {
     #[test]
     fn one_bad_key_stops_the_whole_batch() {
         assert!(ban_lines(&bans(&["203.0.113.7", "x; flush ruleset"]), &[]).is_err());
+    }
+
+    #[test]
+    fn a_ban_drops_new_tcp_and_udp_flows_to_the_web_ports_only() {
+        let s = table_script(&[80, 443]);
+        for fam in ["ip saddr @sn_ban4", "ip6 saddr @sn_ban6"] {
+            for proto in ["tcp", "udp"] {
+                let rule = format!("add rule inet sn input {fam} {proto} dport {{ 80, 443 }} drop");
+                assert!(s.contains(&rule), "missing: {rule}");
+            }
+        }
+        // The whitelist and established flows are still accepted first.
+        let first_drop = s.find("drop").unwrap();
+        for accept in [
+            "ct state established,related accept",
+            "@sn_white4 accept",
+            "@sn_white6 accept",
+        ] {
+            assert!(s.find(accept).unwrap() < first_drop, "{accept}");
+        }
+        // Nothing else is dropped: SSH, panels, mail stay reachable.
+        assert_eq!(s.matches("drop").count(), 4);
     }
 
     #[test]

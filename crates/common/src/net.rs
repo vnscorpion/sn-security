@@ -22,25 +22,57 @@ impl Cidr {
             if prefix > max {
                 return None;
             }
-            Some(Cidr { addr, prefix })
+            Some(Cidr { addr, prefix }.canonical())
         } else {
             let addr: IpAddr = s.parse().ok()?;
             let prefix = if addr.is_ipv4() { 32 } else { 128 };
-            Some(Cidr { addr, prefix })
+            Some(Cidr { addr, prefix }.canonical())
         }
     }
 
     /// Does this range contain `ip`? IPv4 and IPv6 are compared within their
-    /// own family; an IPv4-mapped IPv6 address is normalized to IPv4 first.
+    /// own family; an IPv4-mapped IPv6 address is normalized to IPv4 first (and
+    /// an IPv4-mapped range of at least /96 is the IPv4 range it maps).
     #[must_use]
     pub fn contains(&self, ip: IpAddr) -> bool {
-        let ip = normalize(ip);
-        let base = normalize(self.addr);
-        match (base, ip) {
-            (IpAddr::V4(b), IpAddr::V4(x)) => prefix_eq(&b.octets(), &x.octets(), self.prefix),
-            (IpAddr::V6(b), IpAddr::V6(x)) => prefix_eq(&b.octets(), &x.octets(), self.prefix),
+        let c = self.canonical();
+        match (c.addr, normalize(ip)) {
+            (IpAddr::V4(b), IpAddr::V4(x)) => prefix_eq(&b.octets(), &x.octets(), c.prefix),
+            (IpAddr::V6(b), IpAddr::V6(x)) => prefix_eq(&b.octets(), &x.octets(), c.prefix),
             _ => false,
         }
+    }
+
+    /// The same range written plainly: an IPv4-mapped range of at least /96 as
+    /// IPv4, the prefix within the family's length, the host bits cleared.
+    #[must_use]
+    pub fn canonical(&self) -> Cidr {
+        let (addr, prefix) = match self.addr {
+            IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                Some(v4) if self.prefix >= 96 => (IpAddr::V4(v4), self.prefix - 96),
+                _ => (IpAddr::V6(v6), self.prefix.min(128)),
+            },
+            v4 => (v4, self.prefix.min(32)),
+        };
+        let addr = match addr {
+            IpAddr::V4(v4) => {
+                let mask = u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0);
+                IpAddr::V4((u32::from(v4) & mask).into())
+            }
+            IpAddr::V6(v6) => {
+                let mask = u128::MAX.checked_shl(128 - u32::from(prefix)).unwrap_or(0);
+                IpAddr::V6((u128::from(v6) & mask).into())
+            }
+        };
+        Cidr { addr, prefix }
+    }
+
+    /// Do the two ranges share any address? Two prefixes either nest or are
+    /// apart, so one of them holds the other's base address exactly when they
+    /// overlap.
+    #[must_use]
+    pub fn overlaps(&self, other: &Cidr) -> bool {
+        self.contains(other.addr) || other.contains(self.addr)
     }
 }
 
@@ -120,6 +152,51 @@ mod tests {
         let c = Cidr::parse("203.0.113.7").unwrap();
         assert!(c.contains("203.0.113.7".parse().unwrap()));
         assert!(!c.contains("203.0.113.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn mapped_and_oversized_ranges_neither_panic_nor_lie() {
+        let c = |s| Cidr::parse(s).unwrap();
+        // An IPv4-mapped single address or range is the IPv4 one.
+        assert!(c("::ffff:198.51.100.4").contains("198.51.100.4".parse().unwrap()));
+        assert!(c("::ffff:10.0.0.0/104").contains("10.9.9.9".parse().unwrap()));
+        assert!(!c("::ffff:10.0.0.0/104").contains("11.0.0.1".parse().unwrap()));
+        // Wider than the mapped block: an IPv6 range, never a panic.
+        assert!(!c("::ffff:0.0.0.0/64").contains("10.0.0.1".parse().unwrap()));
+        // A prefix past the family's length, built by hand.
+        let odd = Cidr {
+            addr: "10.0.0.1".parse().unwrap(),
+            prefix: 64,
+        };
+        assert!(odd.contains("10.0.0.1".parse().unwrap()));
+        assert!(!odd.contains("10.0.0.2".parse().unwrap()));
+        // Host bits are cleared when written out.
+        let k = c("10.1.2.3/8").canonical();
+        assert_eq!((k.addr.to_string(), k.prefix), ("10.0.0.0".to_string(), 8));
+        let k = c("2001:db8:1:2::5/64").canonical();
+        assert_eq!(k.addr.to_string(), "2001:db8:1:2::");
+        let k = c("::ffff:198.51.100.4").canonical();
+        assert_eq!(
+            (k.addr.to_string(), k.prefix),
+            ("198.51.100.4".to_string(), 32)
+        );
+        assert_eq!(c("0.0.0.0/0").canonical().prefix, 0);
+    }
+
+    #[test]
+    fn ranges_overlap_when_one_holds_the_other() {
+        let c = |s| Cidr::parse(s).unwrap();
+        // A /128 (an SSH session) inside a /64 ban key, either way round.
+        assert!(c("2001:db8:1:2::/64").overlaps(&c("2001:db8:1:2::5")));
+        assert!(c("2001:db8:1:2::5").overlaps(&c("2001:db8:1:2::/64")));
+        // A wide range around it, host bits set or not.
+        assert!(c("2001:db8::/32").overlaps(&c("2001:db8:1:2::/64")));
+        assert!(c("10.200.0.5/8").overlaps(&c("10.1.2.0/24")));
+        assert!(c("10.1.2.0/24").overlaps(&c("10.200.0.5/8")));
+        // Neighbours, and the other family.
+        assert!(!c("2001:db8:1:3::/64").overlaps(&c("2001:db8:1:2::5")));
+        assert!(!c("10.1.2.0/24").overlaps(&c("10.1.3.0/24")));
+        assert!(!c("10.0.0.0/8").overlaps(&c("2001:db8::/32")));
     }
 
     #[test]

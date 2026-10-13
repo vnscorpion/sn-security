@@ -261,6 +261,24 @@ fn alert_kind_vi(k: &str) -> &str {
         "report_cap" => {
             "Quá nhiều IP khớp quy tắc trong một lần quét; báo cáo chỉ liệt kê các IP truy cập nhiều nhất"
         }
+        "rate_storm" => {
+            "Quá nhiều IP vượt ngưỡng truy cập cùng lúc: chỉ chặn IP vượt xa ngưỡng, còn lại chỉ báo (nghi ngưỡng quá thấp hoặc bị tấn công diện rộng)"
+        }
+        "proxy_in_logs" => {
+            "Một IP mang truy cập của rất nhiều trình duyệt trên nhiều website (nghi proxy/CDN chưa khai báo): không chặn vì vượt ngưỡng truy cập"
+        }
+        "listener_unknown" => {
+            "Không nhận ra web server đang nghe cổng 80/443: agent tự chọn log, nên đặt sources_mode = \"manual\""
+        }
+        "hub_ban_refused" => {
+            "VPS từ chối lệnh chặn từ hub vì IP được bảo vệ (whitelist, Cloudflare, IP của chính VPS, mạng nội bộ)"
+        }
+        "config_misplaced" => {
+            "agent.toml có khoá của [watch] nằm sai chỗ (dưới [[watch.sources]]) nên không có tác dụng"
+        }
+        "backlog_skipped" => {
+            "Đọc bù log tồn đọng (agent dừng một lúc): lần quét này không xét luật truy cập nhiều và quét 404"
+        }
         _ => k,
     }
 }
@@ -1200,6 +1218,15 @@ pub async fn agent_detail(
                     }
                 }
                 p class="help" { "“Đăng nhập thử” = số lần POST vào wp-login.php/xmlrpc.php (dấu hiệu dò mật khẩu)." }
+                p class="help" {
+                    "Ngưỡng “truy cập nhiều” tự học: "
+                    @if r.cycle.baseline_ready {
+                        span class="badge b-ok" { "Đã học" }
+                    } @else {
+                        span class="badge b-warn" { "Đang học" }
+                        " VPS chưa học xong mức truy cập bình thường của mình; nên để “Chỉ theo dõi” tới khi mục này báo “Đã học”."
+                    }
+                }
             }
 
             @if !r.cycle.top_cpu.is_empty() {
@@ -1396,9 +1423,14 @@ pub async fn ban_post(
     }
     // Only the canonical text of one address (or of the IPv6 /64 the VPS lists
     // its clients by) goes into the order the VPS runs.
-    let Some(ip) = crate::db::ban_target(&f.ip) else {
+    let Some(ip) = crate::db::unban_target(&f.ip) else {
         return control_msg(&id, &bad_ip_msg(&f.ip, false));
     };
+    // Never a Cloudflare edge or a private / CGNAT address: the VPS refuses it
+    // too, but the admin should hear why here.
+    if let Some(why) = crate::db::never_ban_reason(&ip) {
+        return control_msg(&id, &never_ban_msg(&ip, why));
+    }
     let ts = now();
     let key = key_of(&ip);
     let db = st.db.lock().expect("db");
@@ -1546,7 +1578,7 @@ pub async fn unban_post(
     if f.ip.trim().is_empty() {
         return Redirect::to(&format!("/agent/{id}")).into_response();
     }
-    let Some(ip) = crate::db::ban_target(&f.ip) else {
+    let Some(ip) = crate::db::unban_target(&f.ip) else {
         return control_msg(&id, &bad_ip_msg(&f.ip, true));
     };
     let key = key_of(&ip);
@@ -1764,6 +1796,21 @@ fn bad_ip_msg(input: &str, unban: bool) -> String {
     )
 }
 
+/// Why the hub refuses to ban an address that is otherwise well formed.
+fn never_ban_msg(ip: &str, why: &str) -> String {
+    let what = match why {
+        "cloudflare" => {
+            "là IP của Cloudflare (proxy, không phải khách): chặn nó làm mọi khách đi qua điểm đó bị lỗi 522, còn kẻ tấn công phía sau vẫn không bị chặn"
+        }
+        "cgnat" => "thuộc dải CGNAT (100.64.0.0/10) của nhà mạng, dùng chung cho rất nhiều người",
+        "ula" | "private" => {
+            "thuộc mạng nội bộ (vd. IP công khai bị NAT của chính VPS, mạng LAN, VPN), không phải khách trên internet"
+        }
+        _ => "là địa chỉ link-local, không phải khách trên internet",
+    };
+    format!("Không chặn “{ip}” từ hub: địa chỉ này {what}. VPS cũng tự từ chối lệnh chặn như vậy.")
+}
+
 // ---- ip check --------------------------------------------------------------
 
 /// Canonical key an IP is tracked under: plain IPv4, or the /64 for IPv6.
@@ -1819,7 +1866,9 @@ struct IpOnAgent {
     /// Agent version; an agent older than the blocklist report cannot say
     /// whether an address is blocked.
     version: String,
-    would_ban: Option<String>,
+    /// What the VPS reported for it, and whether only as a report (a pattern
+    /// that never bans, or a rate hit while its baseline is still learning).
+    would_ban: Option<(String, bool)>,
     hub_unban: bool,
 }
 
@@ -1908,7 +1957,7 @@ pub async fn check_ip(
                 .would_ban
                 .iter()
                 .find(|b| key_of(&b.ip) == key)
-                .map(|b| b.reason.clone());
+                .map(|b| (b.reason.clone(), b.layer == "report"));
         }
         hit.ban = ban_views(rep.as_ref(), desired.as_ref().map(|(_, _, d)| d), now())
             .into_iter()
@@ -1983,8 +2032,14 @@ pub async fn check_ip(
                                             (if b.by_admin { "Admin đặt" } else { reason_vi(&b.reason) }) " · " (expires_in(b.expires_at))
                                         }
                                     }
-                                    @if let Some(reason) = &h.would_ban {
-                                        span class="badge b-warn" { "Sẽ bị chặn (chưa bật)" } " " span class="mut" { (reason_vi(reason)) }
+                                    @if let Some((reason, report_only)) = &h.would_ban {
+                                        @if *report_only {
+                                            // A pattern that never bans, or a rate hit while the
+                                            // baseline is still learning.
+                                            span class="badge b-mut" { "Chỉ ghi nhận, không chặn" } " " span class="mut" { (reason_vi(reason)) }
+                                        } @else {
+                                            span class="badge b-warn" { "Sẽ bị chặn (chưa bật)" } " " span class="mut" { (reason_vi(reason)) }
+                                        }
                                     }
                                     @if h.hub_unban && h.ban.is_none() {
                                         span class="badge b-ok" { "Admin đã gỡ chặn" }
@@ -2208,7 +2263,17 @@ mod tests {
 
     #[test]
     fn the_new_alert_kinds_have_vietnamese_labels() {
-        for k in ["cpu_high", "bot_ua", "bot_shape"] {
+        for k in [
+            "cpu_high",
+            "bot_ua",
+            "bot_shape",
+            "rate_storm",
+            "proxy_in_logs",
+            "listener_unknown",
+            "hub_ban_refused",
+            "config_misplaced",
+            "backlog_skipped",
+        ] {
             assert_ne!(alert_kind_vi(k), k, "{k} has no label");
         }
     }

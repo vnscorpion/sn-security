@@ -23,7 +23,11 @@ fn now() -> i64 {
 }
 
 /// POST /v1/report — body is a [`Signed`] wrapping an [`Envelope<ReportBody>`].
-pub async fn post_report(State(st): State<Arc<AppState>>, body: String) -> impl IntoResponse {
+pub async fn post_report(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> impl IntoResponse {
     let signed: Signed = match serde_json::from_str(&body) {
         Ok(s) => s,
         Err(_) => return (StatusCode::BAD_REQUEST, "bad json").into_response(),
@@ -71,6 +75,12 @@ pub async fn post_report(State(st): State<Arc<AppState>>, body: String) -> impl 
     if let Err(e) = db.record_report(&env.agent_id, env.seq, now(), &env.body, &body_json) {
         tracing::error!("record_report: {e:#}");
         return (StatusCode::INTERNAL_SERVER_ERROR, "store failed").into_response();
+    }
+    // Where this signed, new report came from: the VPS's own public address,
+    // which on a cloud that NATs it is on none of its interfaces. Sent back in
+    // the desired state so the agent never bans it (best effort).
+    if let Err(e) = db.note_self_ip(&env.agent_id, &crate::auth::client_ip(&headers), now()) {
+        tracing::warn!("note_self_ip: {e:#}");
     }
 
     // AI-assisted incident response (best effort: never fails the report).

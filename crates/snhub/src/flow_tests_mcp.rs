@@ -482,11 +482,14 @@ async fn an_outside_agent_cannot_free_an_attacker_or_switch_protection_off() {
         d.bans,
         d.unbans
     );
-    // Private networks are not for an outside agent to block.
-    let r = h
-        .call(&act, "ban_ip", json!({ "vps": "all", "ip": "10.0.0.1" }))
-        .await;
-    assert_eq!(r["isError"], true);
+    // Private networks are not for an outside agent to block, nor is a
+    // Cloudflare edge (every visitor through it would be cut off, on every VPS).
+    for ip in ["10.0.0.1", "104.16.0.1", "2606:4700::6810:1"] {
+        let r = h
+            .call(&act, "ban_ip", json!({ "vps": "all", "ip": ip }))
+            .await;
+        assert_eq!(r["isError"], true, "{ip}");
+    }
 }
 
 #[tokio::test]

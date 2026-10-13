@@ -315,10 +315,35 @@ fn run() -> Result<()> {
             }
             let conns = sys::netstat::all();
             println!("tcp connections: {}", conns.len());
-            let wl = whitelist::build(&cfg, &conns);
+            let state = State::open().ok();
+            let wl = whitelist::build(&cfg, &conns, state.as_ref());
             println!("whitelist entries: {}", wl.keys().len());
+            if let Some(s) = &state {
+                let own = s.meta().self_ips;
+                if !own.is_empty() {
+                    println!(
+                        "own public address (as the hub sees it): {}",
+                        own.join(", ")
+                    );
+                }
+            }
             println!("mode: {}", cfg.watch.mode.as_str());
             println!("trusted proxies: {}", cfg.watch.trusted_proxies.join(", "));
+            println!(
+                "cloudflare never banned: {}",
+                if cfg.watch.protect_cloudflare {
+                    "yes"
+                } else {
+                    "no"
+                }
+            );
+            let misplaced = cfg.misplaced_keys();
+            if !misplaced.is_empty() {
+                println!(
+                    "WARNING: key(s) under a [[watch.sources]] entry do nothing there: {}",
+                    misplaced.join(", ")
+                );
+            }
             let (resolved, sources) = watch::describe_sources(&cfg);
             match resolved.listener {
                 Some(l) => println!("log sources (auto-detected; web server: {}):", l.name()),

@@ -262,7 +262,9 @@ root_pubkeys = []
 [watch]
 mode         = "observe"
 k            = 5.0
-min_requests = 120
+# Floor of the request-rate rule: dynamic requests (pages, not images/CSS/JS)
+# one address may make on one site in a ~5-minute cycle.
+min_requests = 300
 trusted_proxies = ["cloudflare"]
 cpu_alert_pct = 85.0
 # auto = detect the web server's logs each cycle (recommended); manual = only the

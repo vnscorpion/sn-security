@@ -13,6 +13,7 @@ pub mod heuristic;
 pub mod labels;
 pub mod logfmt;
 pub mod net;
+pub mod ranges;
 pub mod schema;
 pub mod waf;
 

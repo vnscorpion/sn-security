@@ -6,33 +6,37 @@
 pub mod baseline;
 pub mod bots;
 pub mod cpu;
+pub mod decide;
 pub mod patterns;
 pub mod tail;
 
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use snsec_common::logfmt::{self, LogFormat};
+use snsec_common::logfmt::{self, LogFormat, LogLine};
 use snsec_common::net::{self, Cidr};
-use snsec_common::schema::{BanEvent, CycleStats, IpCount};
+use snsec_common::ranges;
+use snsec_common::schema::{Alert, CycleStats, IpCount};
 
 use crate::config::{Config, LogSource, SourcesMode};
 use crate::discover;
-use crate::state::{ActiveBan, State, Strike};
+use crate::state::State;
 use crate::sys::{fw, netstat};
 use crate::util;
-use crate::whitelist::Whitelist;
+use crate::whitelist;
 
 use baseline::Baseline;
-use patterns::IpAgg;
+use decide::{
+    ABS_CEILING, Candidate, Decisions, MAX_SPAN_JUDGED, STORM_FACTOR, alert, backlog_alert,
+    cycle_span, decide_bans, misplaced_alert, proxy_alert, proxy_keys, prune_strikes, scale,
+    storm_alert, unlisted_alert,
+};
+use patterns::{IpAgg, Judge};
 
 /// Per-cycle, in-memory result before we decide bans.
 struct CycleData {
     per_ip: HashMap<String, IpAgg>,
-    /// Representative parsed IP per ban-key, for whitelist/CIDR checks.
-    ip_of_key: HashMap<String, IpAddr>,
     lines_read: u64,
     parse_errors: u64,
     requests: u64,
@@ -57,10 +61,9 @@ struct CycleData {
 }
 
 impl CycleData {
-    /// The aggregate a request from `client` counts in, `None` once
+    /// The aggregate a request with this ban key counts in, `None` once
     /// [`MAX_TRACKED_IPS`] keys are tracked and this is a new one.
-    fn track(&mut self, bankey: String, client: IpAddr) -> Option<&mut IpAgg> {
-        self.ip_of_key.entry(bankey.clone()).or_insert(client);
+    fn track(&mut self, bankey: String) -> Option<&mut IpAgg> {
         if self.per_ip.len() >= MAX_TRACKED_IPS && !self.per_ip.contains_key(&bankey) {
             return None; // cap reached; count stays in `requests`
         }
@@ -73,6 +76,12 @@ const MAX_BYTES_PER_FILE: u64 = 64 * 1024 * 1024;
 /// Total log bytes a single cycle will parse before stopping (offsets still
 /// advance so the next cycle resumes). Bounds worst-case cycle time under flood.
 const CYCLE_BYTE_BUDGET: u64 = 256 * 1024 * 1024;
+
+/// The search crawler a ban key belongs to, by its published ranges (an IPv6
+/// key by its /64, which is how Google publishes its ranges).
+fn crawler_of(key: &str) -> Option<ranges::Crawler> {
+    Cidr::parse(key).and_then(|c| ranges::verified_crawler(c.addr))
+}
 
 /// Options for one watch invocation.
 pub struct Options {
@@ -90,28 +99,62 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<()> {
     let started = util::now_secs();
     let start_ms = util::now_millis();
     let trusted = cfg.trusted_cidrs();
+    // The trusted proxies and (unless switched off) every Cloudflare range.
+    let never_ban = cfg.never_ban_cidrs();
     let conns = netstat::all();
-    let wl = crate::whitelist::build(cfg, &conns);
+    let wl = whitelist::build(cfg, &conns, Some(state));
+
+    // How much log this cycle covers: since the last one started.
+    let prev_cycle = match state.meta().last_cycle_ts {
+        0 => state.cpu_sample().at, // the first cycle of an upgraded agent
+        t => t,
+    };
+    let span = cycle_span(prev_cycle, started);
+    state.update_meta(|m| m.last_cycle_ts = started)?;
 
     // Work out which logs to follow (detected each cycle), then read them.
     let resolved = resolve_sources(cfg, &conns);
     let data = collect(state, &trusted, &resolved.sources)?;
+    // A backlog: the agent was off a while, or a read hit its byte cap.
+    let backlog = data.catch_up || span > MAX_SPAN_JUDGED;
+    let protected = |k: &str| whitelist::key_protected(k, &wl, &never_ban);
 
-    // Busiest-IP count for the baseline (whitelisted IPs excluded).
-    let busiest = data
-        .per_ip
-        .iter()
-        .filter(|(k, _)| !key_protected(k, &data.ip_of_key, &wl, &trusted))
-        .map(|(_, a)| a.requests)
-        .max()
-        .unwrap_or(0);
+    // The busiest address's dynamic requests on one site, for the baseline:
+    // not a protected address, nor a search crawler (its volume is its own).
+    let busiest = {
+        let mut by_volume: Vec<(u64, &String)> = data
+            .per_ip
+            .iter()
+            .map(|(k, a)| (a.site_dynamic(), k))
+            .filter(|(n, _)| *n > 0)
+            .collect();
+        by_volume.sort_unstable_by(|a, b| b.cmp(a));
+        by_volume
+            .into_iter()
+            .find(|(_, k)| !protected(k) && crawler_of(k).is_none())
+            .map_or(0, |(n, _)| n)
+    };
 
     let slot = baseline::slot_of(started);
     let mut base: Baseline = load_baseline(state);
-    base.observe(slot, busiest);
-    let threshold = base.threshold(slot, cfg.watch.k, cfg.watch.min_requests);
+    // Only a cycle of ordinary traffic teaches it anything: not an idle one,
+    // not a backlog after a gap.
+    if data.lines_read > 0 && busiest > 0 && !backlog {
+        base.observe(slot, busiest);
+        save_baseline(state, &base);
+    }
+    let threshold = scale(
+        base.threshold(slot, cfg.watch.k, cfg.watch.min_requests),
+        span,
+    );
     let baseline_ready = base.ready(slot);
-    save_baseline(state, &base);
+    let judge = Judge {
+        threshold,
+        baseline_ready,
+        ceiling: scale(ABS_CEILING, span),
+        volume: !backlog,
+        crawler: false,
+    };
 
     // Decide bans.
     let mut strikes = state.strikes();
@@ -120,21 +163,42 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<()> {
     let effective_mode = state.meta().mode_override.unwrap_or(cfg.watch.mode);
     let enforce = effective_mode == snsec_common::schema::Mode::Enforce;
 
-    let mut candidates: Vec<(&String, &IpAgg)> = data
+    let mut candidates: Vec<Candidate> = data
         .per_ip
         .iter()
-        .filter(|(k, _)| !key_protected(k, &data.ip_of_key, &wl, &trusted))
+        .filter_map(|(key, agg)| {
+            let hit = patterns::judge(agg, &judge)?;
+            if protected(key) {
+                return None;
+            }
+            // A crawler is only ever judged more leniently, so only an address
+            // that matched something needs looking up.
+            let hit = if crawler_of(key).is_some() {
+                patterns::judge(
+                    agg,
+                    &Judge {
+                        crawler: true,
+                        ..judge
+                    },
+                )?
+            } else {
+                hit
+            };
+            Some(Candidate { key, agg, hit })
+        })
         .collect();
     // Stable order: busiest first, so the per-cycle cap keeps the worst.
-    candidates.sort_by_key(|(_, a)| std::cmp::Reverse(a.requests));
+    candidates.sort_by(|a, b| b.agg.requests.cmp(&a.agg.requests).then(a.key.cmp(b.key)));
+    let proxies = proxy_keys(&candidates);
     let Decisions {
         applied,
         would,
         to_add,
         unlisted,
+        storm,
     } = decide_bans(
         &candidates,
-        threshold,
+        threshold.saturating_mul(STORM_FACTOR),
         cfg.fw.max_bans_per_cycle as usize,
         enforce,
         started,
@@ -144,13 +208,15 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<()> {
 
     let over_cap = applied.len() >= cfg.fw.max_bans_per_cycle as usize;
 
-    // Apply firewall changes (enforce only).
+    // Apply firewall changes (enforce only). What may never be banned is
+    // accepted by the firewall before any ban rule.
     if enforce {
         if fw::available() {
-            if let Err(e) = fw::ensure_table(&cfg.fw.web_ports) {
-                eprintln!("watch: ensure_table: {e:#}");
+            let mut white = wl.keys();
+            white.extend(whitelist::cidr_keys(&never_ban));
+            if let Err(e) = fw::prepare(&cfg.fw.web_ports, &white) {
+                eprintln!("watch: preparing the firewall: {e:#}");
             }
-            let _ = fw::set_whitelist(&wl.keys());
             if let Err(e) = fw::apply_bans(&to_add, &[]) {
                 eprintln!("watch: apply_bans: {e:#}");
             }
@@ -209,7 +275,7 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<()> {
     // Only a cycle that looks like ordinary traffic is judged and learned from:
     // not one with no lines, not a catch-up read after the agent was off (hours
     // of traffic in one cycle look like a surge of everything).
-    let representative = data.lines_read > 0 && !data.catch_up && !cpu_now.gap;
+    let representative = data.lines_read > 0 && !backlog && !cpu_now.gap;
     let mut base_bots = state.bot_baseline();
     let (flagged_ua, flagged_shape) = if cfg.watch.bot_detection && representative {
         let verdict = bots::assess(
@@ -258,201 +324,47 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<()> {
 
     alerts.extend(refused_alert(data.refused, data.first_refused.as_deref()));
     alerts.extend(unlisted_alert(unlisted));
+    alerts.extend(storm_alert(storm, threshold));
+    alerts.extend(proxy_alert(&proxies));
+    alerts.extend(backlog_alert(backlog && data.lines_read > 0, span));
+    alerts.extend(misplaced_alert(&cfg.misplaced_keys()));
+    let web_listening = conns
+        .iter()
+        .any(|c| c.state == netstat::ST_LISTEN && matches!(c.local_port, 80 | 443));
+    alerts.extend(listener_alert(&resolved, data.files_matched, web_listening));
 
     // Report + hub sync.
     crate::hub::sync(cfg, state, cycle, applied, would, alerts)?;
     Ok(())
 }
 
-/// Report-only entries one report carries; the rest are only counted.
-const MAX_REPORT_ONLY: usize = 200;
-
-/// What one cycle decides, before anything is applied.
-struct Decisions {
-    /// Bans applied this cycle (enforce mode).
-    applied: Vec<BanEvent>,
-    /// Report-only hits, and in observe mode the bans enforce would apply.
-    would: Vec<BanEvent>,
-    /// `(key, ttl)` for the firewall.
-    to_add: Vec<(String, u64)>,
-    /// Addresses that matched a rule but are in neither list.
-    unlisted: u64,
-}
-
-/// Decide what to do with `candidates`, busiest first and none of them
-/// protected. At most `ban_cap` bans (enforce stops there and raises
-/// `ban_cap`) and [`MAX_REPORT_ONLY`] report-only entries are listed, so
-/// however many addresses a flood brings the report stays small. Strikes and
-/// `active` change only for the bans listed.
-fn decide_bans(
-    candidates: &[(&String, &IpAgg)],
-    threshold: u64,
-    ban_cap: usize,
-    enforce: bool,
-    now: i64,
-    strikes: &mut HashMap<String, Strike>,
-    active: &mut HashMap<String, ActiveBan>,
-) -> Decisions {
-    let mut d = Decisions {
-        applied: Vec::new(),
-        would: Vec::new(),
-        to_add: Vec::new(),
-        unlisted: 0,
-    };
-    let (mut banned, mut reported) = (0usize, 0usize);
-    for &(key, agg) in candidates {
-        let Some(hit) = decide(agg, threshold) else {
-            continue;
-        };
-        if !hit.ban {
-            // Report-only pattern. The busiest are enough to see what goes on;
-            // one per address would let a crowd of addresses swell the report
-            // past what the hub accepts.
-            if reported >= MAX_REPORT_ONLY {
-                d.unlisted += 1;
-                continue;
-            }
-            reported += 1;
-            d.would.push(BanEvent {
-                ip: key.clone(),
-                reason: hit.reason.to_string(),
-                ttl_secs: 0,
-                strike: 0,
-                layer: "report".into(),
-            });
-            continue;
-        }
-        if banned >= ban_cap {
-            // Too many bans: likely distributed attack or broken rule. Checked
-            // before the strike, so an address left alone is not counted.
-            if enforce {
-                break;
-            }
-            d.unlisted += 1;
-            continue;
-        }
-        banned += 1;
-
-        let (ttl, strike) = strike_ttl(strikes, key, &hit, now);
-        let ev = BanEvent {
-            ip: key.clone(),
-            reason: hit.reason.to_string(),
-            ttl_secs: ttl,
-            strike,
-            layer: "l3".into(),
-        };
-        if enforce {
-            d.to_add.push((key.clone(), ttl));
-            active.insert(
-                key.clone(),
-                ActiveBan {
-                    reason: hit.reason.to_string(),
-                    expires_ts: now + ttl as i64,
-                    strike,
-                    layer: "l3".into(),
-                },
-            );
-            d.applied.push(ev);
-        } else {
-            d.would.push(ev);
-        }
+/// Logs were picked without knowing which web server writes them: something
+/// listens on :80/:443 (`web_listening`) that is not a server the agent knows.
+fn listener_alert(resolved: &Resolved, files: u32, web_listening: bool) -> Option<Alert> {
+    if resolved.listener != Some(discover::Listener::Unknown) || files == 0 || !web_listening {
+        return None;
     }
-    d
-}
-
-fn decide(agg: &IpAgg, threshold: u64) -> Option<patterns::PatternHit> {
-    let hit = patterns::evaluate(agg);
-    if agg.requests >= threshold && !hit.as_ref().is_some_and(|h| h.ban && h.escalate) {
-        // Over the rate threshold, a pattern that only reports or never
-        // escalates must not shield the flood from the rate ban.
-        return Some(patterns::PatternHit {
-            reason: "rate",
-            ttl_secs: hit.map_or(600, |h| h.ttl_secs.max(600)),
-            ban: true,
-            escalate: true,
-        });
-    }
-    hit
-}
-
-/// The ban length for an offence and its strike number. An offence that may
-/// escalate counts on the key's ladder (a clean week resets it); one that may
-/// not gets exactly its own ban, and is neither counted nor lengthened by
-/// earlier strikes (strike 0).
-fn strike_ttl(
-    strikes: &mut HashMap<String, Strike>,
-    key: &str,
-    hit: &patterns::PatternHit,
-    now: i64,
-) -> (u64, u32) {
-    if !hit.escalate {
-        return (hit.ttl_secs, 0);
-    }
-    let s = strikes.entry(key.to_string()).or_insert(Strike {
-        count: 0,
-        last_ts: now,
-    });
-    if now - s.last_ts > STRIKE_DECAY_SECS {
-        s.count = 0;
-    }
-    s.count = s.count.saturating_add(1);
-    s.last_ts = now;
-    (hit.ttl_secs.max(ladder_ttl(s.count)), s.count)
-}
-
-fn ladder_ttl(strike: u32) -> u64 {
-    match strike {
-        0 | 1 => 600,    // 10 min
-        2 => 3600,       // 1 hour
-        3 => 86_400,     // 24 hours
-        _ => 7 * 86_400, // 7 days
-    }
-}
-
-/// A clean week resets the strike ladder.
-const STRIKE_DECAY_SECS: i64 = 7 * 86_400;
-/// Most addresses (or /64s) strikes.json remembers.
-const MAX_STRIKES: usize = 100_000;
-
-/// Forget strikes past the decay window, which count as none anyway, and keep
-/// at most [`MAX_STRIKES`], the most recent first, so strikes.json stays small
-/// however many addresses a flood brings.
-fn prune_strikes(strikes: &mut HashMap<String, Strike>, now: i64) {
-    strikes.retain(|_, s| now - s.last_ts <= STRIKE_DECAY_SECS);
-    let excess = strikes.len().saturating_sub(MAX_STRIKES);
-    if excess == 0 {
-        return;
-    }
-    let mut oldest: Vec<(i64, u32, String)> = strikes
-        .iter()
-        .map(|(k, s)| (s.last_ts, s.count, k.clone()))
-        .collect();
-    oldest.select_nth_unstable(excess - 1);
-    for (_, _, k) in oldest.into_iter().take(excess) {
-        strikes.remove(&k);
-    }
-}
-
-fn key_protected(
-    key: &str,
-    ip_of_key: &HashMap<String, IpAddr>,
-    wl: &Whitelist,
-    trusted: &[Cidr],
-) -> bool {
-    if let Some(ip) = ip_of_key.get(key) {
-        wl.protects(*ip) || net::in_any(trusted, *ip)
-    } else if let Ok(ip) = key.split('/').next().unwrap_or(key).parse::<IpAddr>() {
-        wl.protects(ip) || net::in_any(trusted, ip)
+    let dropped = if resolved.dropped.is_empty() {
+        String::new()
     } else {
-        false
-    }
+        format!(
+            "; of log sets that name the same sites only the most recently written is read, left out: {}",
+            resolved.dropped.join(", ")
+        )
+    };
+    Some(alert(
+        "listener_unknown",
+        "warn",
+        format!(
+            "the program on :80/:443 is not a web server the agent recognises (Varnish, HAProxy, Caddy, a container proxy...), so it reads the logs it can find{dropped}. Set sources_mode = \"manual\" and list the front server's logs under [[watch.sources]]"
+        ),
+    ))
 }
 
 fn collect(state: &State, trusted: &[Cidr], sources: &[LogSource]) -> Result<CycleData> {
     let mut offsets = state.offsets();
     let mut data = CycleData {
         per_ip: HashMap::new(),
-        ip_of_key: HashMap::new(),
         lines_read: 0,
         parse_errors: 0,
         requests: 0,
@@ -471,6 +383,9 @@ fn collect(state: &State, trusted: &[Cidr], sources: &[LogSource]) -> Result<Cyc
     // budget ended the cycle before the last of them.
     let mut seen = std::collections::HashSet::new();
     let mut cut_short = false;
+    // Each log file is a site of its own (panels write one per vhost), unless
+    // the format names the vhost.
+    let mut file_no: u64 = 0;
 
     'outer: for src in sources {
         let fmt = LogFormat::from_str_opt(&src.format).unwrap_or(LogFormat::Combined);
@@ -481,6 +396,7 @@ fn collect(state: &State, trusted: &[Cidr], sources: &[LogSource]) -> Result<Cyc
                 break 'outer; // offsets already saved advance next cycle
             }
             data.files_matched += 1;
+            file_no += 1;
             let key = path.to_string_lossy().to_string();
             seen.insert(key.clone());
             let prev = offsets.get(&key).copied();
@@ -528,8 +444,9 @@ fn collect(state: &State, trusted: &[Cidr], sources: &[LogSource]) -> Result<Cyc
                                 parsed.client,
                             );
                         }
-                        if let Some(agg) = data.track(bankey, parsed.client) {
-                            agg.observe(&parsed);
+                        let site = site_of(&parsed, file_no);
+                        if let Some(agg) = data.track(bankey) {
+                            agg.observe(&parsed, site);
                         }
                     }
                     None => {
@@ -540,7 +457,7 @@ fn collect(state: &State, trusted: &[Cidr], sources: &[LogSource]) -> Result<Cyc
                         if let Some(ip) = logfmt::leading_ip(line)
                             && !ip.is_loopback()
                             && !net::in_any(trusted, ip)
-                            && let Some(agg) = data.track(net::ban_key(ip), ip)
+                            && let Some(agg) = data.track(net::ban_key(ip))
                         {
                             agg.observe_unparsed();
                         }
@@ -561,6 +478,17 @@ fn collect(state: &State, trusted: &[Cidr], sources: &[LogSource]) -> Result<Cyc
     Ok(data)
 }
 
+/// The site a request counts on: its vhost where the log format names it,
+/// else the log file it was read from (`file_no`), which on a panel is one per
+/// vhost. The two kinds of id never meet.
+fn site_of(line: &LogLine, file_no: u64) -> u64 {
+    if line.host.is_empty() {
+        file_no
+    } else {
+        bots::hash64(line.host.to_ascii_lowercase().as_bytes()) | (1 << 63)
+    }
+}
+
 /// The log sources in effect for this cycle, and how they were chosen.
 pub struct Resolved {
     pub sources: Vec<LogSource>,
@@ -568,6 +496,9 @@ pub struct Resolved {
     pub tried: Vec<String>,
     /// The web server detected on :80/:443 (`None` in manual mode).
     pub listener: Option<discover::Listener>,
+    /// Log sets left out because another set names the same sites (an
+    /// unrecognised front server, where both nginx's and Apache's logs exist).
+    pub dropped: Vec<String>,
 }
 
 /// What the config file lists explicitly (`sources`, or the older `logs`).
@@ -578,10 +509,7 @@ fn configured_sources(cfg: &Config) -> Vec<LogSource> {
     cfg.watch
         .logs
         .iter()
-        .map(|g| LogSource {
-            glob: g.clone(),
-            format: cfg.watch.format.clone(),
-        })
+        .map(|g| LogSource::new(g.clone(), cfg.watch.format.clone()))
         .collect()
 }
 
@@ -596,6 +524,7 @@ fn resolve_sources(cfg: &Config, conns: &[netstat::Conn]) -> Resolved {
             tried: configured.iter().map(|s| s.glob.clone()).collect(),
             sources: configured,
             listener: None,
+            dropped: Vec::new(),
         },
         SourcesMode::Auto => {
             let listener = discover::detect_listener(conns);
@@ -608,12 +537,14 @@ fn resolve_sources(cfg: &Config, conns: &[netstat::Conn]) -> Resolved {
                     sources: configured,
                     tried,
                     listener: Some(listener),
+                    dropped: Vec::new(),
                 }
             } else {
                 Resolved {
                     sources: found.found,
                     tried,
                     listener: Some(listener),
+                    dropped: found.dropped,
                 }
             }
         }
@@ -752,19 +683,6 @@ fn refused_alert(refused: u32, first: Option<&str>) -> Option<snsec_common::sche
     })
 }
 
-/// Addresses that matched a rule but are not in the report: report-only past
-/// [`MAX_REPORT_ONLY`], or would-be bans past the per-cycle ban cap in observe
-/// mode (in enforce mode that is the `ban_cap` alert).
-fn unlisted_alert(unlisted: u64) -> Option<snsec_common::schema::Alert> {
-    (unlisted > 0).then(|| snsec_common::schema::Alert {
-        kind: "report_cap".into(),
-        message: format!(
-            "{unlisted} more address(es) matched a rule this cycle; the report lists only the busiest"
-        ),
-        severity: "warn".into(),
-    })
-}
-
 fn top_ips(data: &CycleData) -> Vec<IpCount> {
     let mut v: Vec<IpCount> = data
         .per_ip
@@ -869,8 +787,9 @@ fn measure_cpu(state: &State, now: i64, threshold: f64, prev_streak: u32) -> Cpu
 fn load_baseline(state: &State) -> Baseline {
     std::fs::read(state.dir.join("baseline.json"))
         .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
+        .and_then(|b| serde_json::from_slice::<Baseline>(&b).ok())
         .unwrap_or_default()
+        .checked()
 }
 
 fn save_baseline(state: &State, b: &Baseline) {
@@ -899,26 +818,45 @@ fn replay(cfg: &Config, path: &PathBuf) -> Result<()> {
         match logfmt::parse_line(fmt, line, &trusted) {
             Some(p) => {
                 parsed_ok += 1;
+                let site = site_of(&p, 0);
                 per_ip
                     .entry(net::ban_key(p.client))
                     .or_default()
-                    .observe(&p);
+                    .observe(&p, site);
             }
             None => parse_errors += 1,
         }
     }
-    let threshold = u64::from(cfg.watch.min_requests);
+    // Judged as one cycle of a server whose baseline is learned, at the floor.
+    let judge = Judge {
+        threshold: u64::from(cfg.watch.min_requests),
+        baseline_ready: true,
+        ceiling: ABS_CEILING,
+        volume: true,
+        crawler: false,
+    };
+    let never_ban = cfg.never_ban_cidrs();
     let mut bans = 0u64;
     println!("== replay {} ==", path.display());
     println!("parsed {parsed_ok} lines, {parse_errors} parse errors");
     for (key, agg) in &per_ip {
-        if let Some(hit) = decide(agg, threshold) {
+        if whitelist::key_protected(key, &whitelist::Whitelist::default(), &never_ban) {
+            continue;
+        }
+        let j = Judge {
+            crawler: crawler_of(key).is_some(),
+            ..judge
+        };
+        if let Some(hit) = patterns::judge(agg, &j)
+            && hit.ban
+        {
             bans += 1;
             println!(
-                "would_ban {key:<20} reason={:<16} ttl={:<6} req={} 404={} posts={}",
+                "would_ban {key:<20} reason={:<16} ttl={:<6} req={} dyn={} 404={} posts={}",
                 hit.reason,
                 hit.ttl_secs,
                 agg.requests,
+                agg.dynamic(),
                 agg.err404,
                 agg.login_posts + agg.xmlrpc_posts
             );
@@ -1074,43 +1012,16 @@ mod tests {
     }
 
     #[test]
-    fn strikes_past_the_decay_window_are_forgotten_and_the_map_is_capped() {
-        let now: i64 = 1_000_000_000;
-        let strike = |count, age: i64| Strike {
-            count,
-            last_ts: now - age,
-        };
-        let mut s: HashMap<String, Strike> = HashMap::new();
-        s.insert("old".into(), strike(4, STRIKE_DECAY_SECS + 1));
-        s.insert("week".into(), strike(4, STRIKE_DECAY_SECS));
-        s.insert("new".into(), strike(1, 0));
-        prune_strikes(&mut s, now);
-        let mut keys: Vec<&str> = s.keys().map(String::as_str).collect();
-        keys.sort_unstable();
-        assert_eq!(keys, ["new", "week"]);
-
-        // A flood of distinct addresses: the oldest strikes go first.
-        let n = MAX_STRIKES + 10;
-        let mut s: HashMap<String, Strike> = (0..n)
-            .map(|i| (format!("k{i}"), strike(1, (n - i) as i64)))
-            .collect();
-        prune_strikes(&mut s, now);
-        assert_eq!(s.len(), MAX_STRIKES);
-        assert!(!s.contains_key("k0") && !s.contains_key("k9"));
-        assert!(s.contains_key("k10") && s.contains_key(&format!("k{}", n - 1)));
-    }
-
-    #[test]
     fn offsets_are_kept_only_for_files_still_matched() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let logs = dir.path().join("logs");
         std::fs::create_dir(&logs).unwrap();
         let state = State::at(dir.path().join("state"));
-        let src = [LogSource {
-            glob: format!("{}/*.log", logs.display()),
-            format: "combined".into(),
-        }];
+        let src = [LogSource::new(
+            format!("{}/*.log", logs.display()),
+            "combined".into(),
+        )];
         let a = logs.join("a.log");
         let b = logs.join("b.log");
         for p in [&a, &b] {
@@ -1152,161 +1063,86 @@ mod tests {
         assert!(ok("/var/log/httpd/domains/errorlog.com.log"));
     }
 
-    const BROWSER: &str = "Mozilla/5.0 (Windows NT 10.0) Chrome/148.0.0.0 Safari/537.36";
+    #[test]
+    fn an_unrecognised_front_server_is_named() {
+        let resolved = |listener, dropped: Vec<String>| Resolved {
+            sources: Vec::new(),
+            tried: Vec::new(),
+            listener,
+            dropped,
+        };
+        let unknown = resolved(
+            Some(discover::Listener::Unknown),
+            vec!["/var/log/httpd/domains/*.log".into()],
+        );
+        let a = listener_alert(&unknown, 4, true).unwrap();
+        assert_eq!(a.kind, "listener_unknown");
+        assert!(
+            a.message.contains("/var/log/httpd/domains/*.log"),
+            "{}",
+            a.message
+        );
+        assert!(listener_alert(&unknown, 0, true).is_none(), "nothing read");
+        // Nothing on :80/:443 at all (the web server is down): not this alert.
+        assert!(listener_alert(&unknown, 4, false).is_none());
+        let known = resolved(Some(discover::Listener::Nginx), Vec::new());
+        assert!(listener_alert(&known, 4, true).is_none());
+        assert!(
+            listener_alert(&resolved(None, Vec::new()), 4, true).is_none(),
+            "manual"
+        );
+    }
 
-    /// One address's cycle: `(path, status, user agent, times)`.
-    fn agg(requests: &[(&str, u16, &str, usize)]) -> IpAgg {
-        let mut a = IpAgg::default();
-        for &(path, status, ua, times) in requests {
-            let l = format!(
-                r#"198.51.100.7 - - [10/Oct/2026:01:02:03 +0000] "GET {path} HTTP/1.1" {status} 1 "-" "{ua}""#
-            );
-            let parsed = logfmt::parse_line(LogFormat::Combined, &l, &[]).unwrap();
-            for _ in 0..times {
-                a.observe(&parsed);
+    #[test]
+    fn every_vhost_log_is_a_site_of_its_own() {
+        use std::io::Write;
+        const BROWSER: &str = "Mozilla/5.0 (Windows NT 10.0) Chrome/148.0.0.0 Safari/537.36";
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        std::fs::create_dir(&logs).unwrap();
+        let state = State::at(dir.path().join("state"));
+        let src = [LogSource::new(
+            format!("{}/*.log", logs.display()),
+            "combined".into(),
+        )];
+        let sites = [logs.join("shop.example.log"), logs.join("blog.example.log")];
+        for p in &sites {
+            std::fs::write(p, "").unwrap();
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        collect(&state, &[], &src).unwrap();
+        for p in &sites {
+            let mut f = std::fs::OpenOptions::new().append(true).open(p).unwrap();
+            for i in 0..200 {
+                writeln!(
+                    f,
+                    r#"203.0.113.9 - - [10/Oct/2026:01:02:03 +0000] "GET /?p={i} HTTP/1.1" 200 1 "-" "{BROWSER}""#
+                )
+                .unwrap();
             }
         }
-        a
-    }
-
-    /// What a page with a few `<img>` tags makes its visitor's browser send.
-    fn lured() -> IpAgg {
-        let mut r = vec![
-            ("/.env", 404, BROWSER, 1),
-            ("/.git/config", 404, BROWSER, 1),
-            ("/phpmyadmin/", 404, BROWSER, 1),
-        ];
-        let misses: Vec<String> = (0..10).map(|i| format!("/old{i}.php")).collect();
-        r.extend(misses.iter().map(|p| (p.as_str(), 404, BROWSER, 1)));
-        agg(&r)
-    }
-
-    fn decide_one(a: &IpAgg, enforce: bool, strikes: &mut HashMap<String, Strike>) -> Decisions {
-        let key = "198.51.100.7".to_string();
-        decide_bans(
-            &[(&key, a)],
-            1000,
-            200,
-            enforce,
-            1_000_000_000,
-            strikes,
-            &mut HashMap::new(),
+        let d = collect(&state, &[], &src).unwrap();
+        let a = &d.per_ip["203.0.113.9"];
+        assert_eq!((a.dynamic(), a.site_dynamic()), (400, 200));
+        // A format that names the vhost counts by vhost instead.
+        let l = logfmt::parse_line(
+            LogFormat::Combined,
+            r#"203.0.113.9 - - [x] "GET / HTTP/1.1" 200 1 "-" "x""#,
+            &[],
         )
-    }
-
-    #[test]
-    fn a_browser_lured_into_probing_is_neither_struck_nor_escalated() {
-        let now = 1_000_000_000;
-        // An address already on its third strike (a shared NAT, an earlier
-        // real offence): the lure still gets only its short ban.
-        let mut strikes: HashMap<String, Strike> = HashMap::new();
-        strikes.insert(
-            "198.51.100.7".into(),
-            Strike {
-                count: 3,
-                last_ts: now - 60,
-            },
-        );
-        for enforce in [true, false] {
-            let d = decide_one(&lured(), enforce, &mut strikes);
-            let ev = d.applied.iter().chain(&d.would).next().unwrap();
-            assert_eq!((ev.reason.as_str(), ev.strike), ("probe", 0));
-            assert!(ev.ttl_secs <= 600, "{}", ev.ttl_secs);
-            assert_eq!(strikes["198.51.100.7"].count, 3);
-            assert_eq!(strikes["198.51.100.7"].last_ts, now - 60);
-        }
-        let mut none = HashMap::new();
-        decide_one(&lured(), true, &mut none);
-        assert!(none.is_empty(), "no strike entry for a lure");
-
-        // The same probes from a tool count, and climb the ladder.
-        let tool = agg(&[("/.env", 404, "", 1), ("/.git/config", 404, "", 1)]);
-        let d = decide_one(&tool, true, &mut strikes);
-        assert_eq!(d.applied[0].strike, 4);
-        assert_eq!(d.applied[0].ttl_secs, 7 * 86_400);
-        assert_eq!(strikes["198.51.100.7"].count, 4);
-    }
-
-    #[test]
-    fn a_flood_is_rate_banned_whatever_else_it_matches() {
-        let threshold = 100;
-        // A sweep or a pingback below the threshold decides on its own...
-        let sweep = decide(&lured(), threshold).unwrap();
-        assert_eq!((sweep.reason, sweep.escalate), ("probe", false));
-        // ...but cannot shield a flood from the escalating rate ban.
-        let mut flood = lured();
-        for _ in 0..200 {
-            flood.observe_unparsed();
-        }
-        let hit = decide(&flood, threshold).unwrap();
-        assert_eq!((hit.reason, hit.ban, hit.escalate), ("rate", true, true));
-        let pingbacks = agg(&[("/xmlrpc.php", 200, "WordPress/6.5", 150)]);
-        assert!(!decide(&pingbacks, 1000).unwrap().ban);
-        let hit = decide(&pingbacks, threshold).unwrap();
-        assert_eq!((hit.reason, hit.ban, hit.ttl_secs), ("rate", true, 600));
-        // A pattern that escalates keeps its own reason and length.
-        let tool = agg(&[("/.env", 404, "sqlmap/1.7", 150)]);
-        let hit = decide(&tool, threshold).unwrap();
-        assert_eq!((hit.reason, hit.ttl_secs), ("probe", 86_400));
-    }
-
-    #[test]
-    fn report_only_entries_and_observed_bans_are_capped() {
-        // 250 addresses that each fetched /.env once (a /48 is 65k /64s), the
-        // busiest first as `run` sorts them.
-        let keys: Vec<String> = (0..250).map(|i| format!("2001:db8:0:{i:x}::/64")).collect();
-        let aggs: Vec<IpAgg> = (0..250)
-            .map(|i| agg(&[("/.env", 404, BROWSER, 1), ("/", 200, BROWSER, 10 - i / 25)]))
-            .collect();
-        let candidates: Vec<(&String, &IpAgg)> = keys.iter().zip(&aggs).collect();
-        for enforce in [true, false] {
-            let mut strikes = HashMap::new();
-            let d = decide_bans(
-                &candidates,
-                1000,
-                5,
-                enforce,
-                0,
-                &mut strikes,
-                &mut HashMap::new(),
-            );
-            assert!(d.applied.is_empty());
-            assert_eq!(d.would.len(), MAX_REPORT_ONLY);
-            assert!(
-                d.would
-                    .iter()
-                    .all(|e| e.layer == "report" && e.ttl_secs == 0)
-            );
-            assert_eq!(d.would[0].ip, keys[0]);
-            assert_eq!(d.unlisted, 50);
-            assert!(strikes.is_empty());
-        }
-
-        // Bans: enforce applies the first `ban_cap` and stops; observe lists as
-        // many and counts the rest. Either way only those are struck.
-        let tools: Vec<IpAgg> = (0..8).map(|_| agg(&[("/", 200, "nikto", 1)])).collect();
-        let candidates: Vec<(&String, &IpAgg)> = keys.iter().zip(&tools).collect();
-        for enforce in [true, false] {
-            let (mut strikes, mut active) = (HashMap::new(), HashMap::new());
-            let d = decide_bans(&candidates, 1000, 5, enforce, 0, &mut strikes, &mut active);
-            assert_eq!(strikes.len(), 5, "enforce {enforce}");
-            if enforce {
-                assert_eq!((d.applied.len(), d.to_add.len(), active.len()), (5, 5, 5));
-                assert!(d.would.is_empty());
-                assert_eq!(d.unlisted, 0); // the `ban_cap` alert says it
-            } else {
-                assert!(d.applied.is_empty() && d.to_add.is_empty() && active.is_empty());
-                assert_eq!(d.would.len(), 5);
-                assert_eq!(d.unlisted, 3);
-            }
-        }
-        assert!(unlisted_alert(0).is_none());
-        let a = unlisted_alert(3).unwrap();
-        assert_eq!(
-            (a.kind.as_str(), a.severity.as_str()),
-            ("report_cap", "warn")
-        );
-        assert!(a.message.contains('3'));
+        .unwrap();
+        assert_eq!(site_of(&l, 7), 7);
+        let named = LogLine {
+            host: "Shop.Example".into(),
+            ..l.clone()
+        };
+        let other = LogLine {
+            host: "shop.example".into(),
+            ..l
+        };
+        assert_eq!(site_of(&named, 7), site_of(&other, 9));
+        assert_ne!(site_of(&named, 7), 7);
     }
 
     #[test]
@@ -1317,10 +1153,10 @@ mod tests {
         let logs = dir.path().join("logs");
         std::fs::create_dir(&logs).unwrap();
         let state = State::at(dir.path().join("state"));
-        let src = [LogSource {
-            glob: format!("{}/*.log", logs.display()),
-            format: "combined".into(),
-        }];
+        let src = [LogSource::new(
+            format!("{}/*.log", logs.display()),
+            "combined".into(),
+        )];
         let good = logs.join("a.log");
         let open = logs.join("b.log");
         for (p, mode) in [(&good, 0o644), (&open, 0o666)] {
