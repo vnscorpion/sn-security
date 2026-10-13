@@ -20,8 +20,12 @@ format = "combined"              # combined | sn | nginx_json
 
 mode         = "observe"         # observe (report only) | enforce (ban). Start in observe.
 k            = 5.0               # threshold multiplier over the baseline
-min_requests = 120              # never ban below this many requests/cycle
-trusted_proxies = ["cloudflare"] # "cloudflare" expands to CF ranges; or list CIDRs
+# Floor of the `rate` rule: DYNAMIC requests (pages, APIs, forms; not images,
+# CSS, JS, fonts, media, 206/304 answers) one address may make on ONE site in a
+# ~5-minute cycle. Raised up to 4x for several browsers behind one address.
+min_requests = 300
+trusted_proxies = ["cloudflare"] # aliases "cloudflare", "quic.cloud" (embedded ranges); or list CIDRs
+protect_cloudflare = true        # never ban a Cloudflare address, whatever trusted_proxies says
 cpu_alert_pct = 85.0              # cpu_high alert when average CPU since the last cycle reaches this %
 bot_detection = true            # alert when ONE User-Agent / request shape floods in from many IPs
 bot_min_ips = 25                 # ...from at least this many distinct IPs in a cycle
@@ -29,7 +33,10 @@ bot_min_requests = 50            # ...making at least this many dynamic requests
 bot_surge = 5.0                  # ...and at least this many times its usual volume
 
 [fw]
-whitelist = []                   # admin/office CIDRs — only editable here, never remotely
+# Admin/office CIDRs — only editable here, never remotely. Also list the hosts you
+# audit your own sites from (WPScan, nuclei, uptime monitors), or a scan run from
+# the office gets the office's address banned on the web ports.
+whitelist = []
 max_bans_per_cycle = 200
 web_ports = [80, 443]            # HTTP-derived bans only touch these ports
 

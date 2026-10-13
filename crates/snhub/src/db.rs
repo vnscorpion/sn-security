@@ -69,6 +69,9 @@ const REPORT_REFILL_SECS: f64 = 10.0;
 /// Reports kept per agent. The UI reads only the latest one.
 const REPORTS_KEPT: i64 = 10;
 
+/// Once a VPS's own address is known, how often another may be added.
+const SELF_IP_EVERY_SECS: i64 = 6 * 3600;
+
 /// One row of the decisions log: `(agent_id, who, action, detail, ts)`.
 pub type Decision = (String, String, String, String, i64);
 
@@ -467,6 +470,48 @@ impl Db {
         })
     }
 
+    /// Remember the address a signed report from this agent came from, so the
+    /// agent learns its own public address and never bans it (on a cloud that
+    /// NATs the VPS, its loopback, cron and cache-preload requests arrive from
+    /// that address, which is on none of its interfaces). Only a public address
+    /// the desired state does not list yet changes it (newest first, at most
+    /// `MAX_SELF_IPS`), so an unchanged address costs no new version; once one
+    /// is known, another is taken at most every [`SELF_IP_EVERY_SECS`], so a VPS
+    /// that leaves through a pool of addresses does not change its desired state
+    /// on every report. Returns whether it changed.
+    ///
+    /// # Errors
+    /// A database error.
+    pub fn note_self_ip(&self, agent_id: &str, raw: &str, now: i64) -> Result<bool> {
+        use snsec_common::schema::MAX_SELF_IPS;
+        let Some(ip) = self_ip_candidate(raw) else {
+            return Ok(false);
+        };
+        let Some((_, _, body)) = self.get_desired(agent_id)? else {
+            return Ok(false);
+        };
+        if body.self_ips.contains(&ip) {
+            return Ok(false);
+        }
+        if !body.self_ips.is_empty() {
+            let last: Option<i64> = self.conn.query_row(
+                "SELECT MAX(ts) FROM decisions WHERE agent_id = ?1 AND action = 'self_ip'",
+                params![agent_id],
+                |r| r.get(0),
+            )?;
+            if last.is_some_and(|t| now - t < SELF_IP_EVERY_SECS) {
+                return Ok(false);
+            }
+        }
+        let detail = format!("IP công khai của VPS (hub thấy báo cáo đến từ đây): {ip}");
+        self.update_desired(agent_id, now, "system", "self_ip", &detail, |d| {
+            d.self_ips.retain(|x| *x != ip);
+            d.self_ips.insert(0, ip.clone());
+            d.self_ips.truncate(MAX_SELF_IPS);
+        })?;
+        Ok(true)
+    }
+
     pub fn queue_job(
         &self,
         agent_id: &str,
@@ -601,11 +646,36 @@ fn canonical_v6_64(input: &str) -> Option<String> {
     banable(IpAddr::V6(net)).then_some(key)
 }
 
-/// What a ban or unban order may carry: the canonical text of one address, or
-/// of an IPv6 /64 (the agent turns a single IPv6 ban into its /64 anyway). The
-/// agent writes it into an nftables script as root, so free text never goes in.
-pub(crate) fn ban_target(input: &str) -> Option<String> {
+/// What an unban order may carry: the canonical text of one address, or of an
+/// IPv6 /64 (the agent turns a single IPv6 ban into its /64 anyway). The agent
+/// writes it into an nftables script as root, so free text never goes in.
+/// Lifting a ban is harmless whatever the address, so nothing else is refused.
+pub(crate) fn unban_target(input: &str) -> Option<String> {
     one_address(input).or_else(|| canonical_v6_64(input))
+}
+
+/// What a ban order may carry: an [`unban_target`] that is also not an address
+/// the hub must never ban (see [`never_ban_reason`]).
+pub(crate) fn ban_target(input: &str) -> Option<String> {
+    unban_target(input).filter(|t| never_ban_reason(t).is_none())
+}
+
+/// Why a canonical ban target must not be banned from the hub: a Cloudflare
+/// edge (every visitor routed through it would get errors, on every VPS the
+/// order names), or address space that is no client on the Internet (private,
+/// carrier-grade NAT, unique-local, link-local), such as a VPS's own NAT'd
+/// address. `None` for an ordinary address.
+pub(crate) fn never_ban_reason(target: &str) -> Option<&'static str> {
+    let addr: IpAddr = target.split('/').next()?.parse().ok()?;
+    snsec_common::ranges::never_ban_reason(addr)
+}
+
+/// The address this agent's report came from, if it is one worth telling the
+/// agent about: a single public address (not private, CGNAT, link-local or
+/// Cloudflare, which it would never ban anyway).
+fn self_ip_candidate(raw: &str) -> Option<String> {
+    let ip = snsec_common::net::normalize(raw.trim().parse::<IpAddr>().ok()?);
+    (banable(ip) && snsec_common::ranges::never_ban_reason(ip).is_none()).then(|| ip.to_string())
 }
 
 /// Hub bans and unbans a VPS keeps, at most. Every desired-state carries them and
@@ -627,7 +697,9 @@ fn bound_orders(body: &mut DesiredBody) {
 }
 
 /// Rewrite every ban and unban of `body` in its canonical form and drop the
-/// ones that name no single address or /64. Returns what was dropped.
+/// ones that name no single address or /64, and the bans of an address the hub
+/// must never ban (a ban an older hub stored for a Cloudflare edge or a private
+/// address). Returns what was dropped.
 fn keep_valid_orders(body: &mut DesiredBody) -> Vec<String> {
     let mut dropped = Vec::new();
     body.bans.retain_mut(|b| match ban_target(&b.ip) {
@@ -643,7 +715,7 @@ fn keep_valid_orders(body: &mut DesiredBody) -> Vec<String> {
     body.unbans = std::mem::take(&mut body.unbans)
         .into_iter()
         .filter_map(|u| {
-            let ok = ban_target(&u);
+            let ok = unban_target(&u);
             if ok.is_none() {
                 dropped.push(u);
             }
@@ -666,7 +738,7 @@ fn shown(dropped: &[String]) -> String {
 fn warn_dropped(agent_id: &str, dropped: &[String]) {
     if !dropped.is_empty() {
         tracing::warn!(
-            "desired state of {agent_id}: left out {} ban/unban entr(ies) that are not an IP address: {}",
+            "desired state of {agent_id}: left out {} ban/unban entr(ies) that are not an IP address, or bans of an address never banned from the hub: {}",
             dropped.len(),
             shown(dropped)
         );
@@ -704,7 +776,10 @@ fn scrub_desired(conn: &Connection) -> Result<()> {
             "INSERT INTO decisions (agent_id, who, action, detail, ts) VALUES (?1, 'system', 'drop', ?2, ?3)",
             params![
                 agent_id,
-                format!("lệnh chặn/gỡ chặn không phải địa chỉ IP: {}", shown(&dropped)),
+                format!(
+                    "lệnh chặn/gỡ chặn không phải địa chỉ IP, hoặc chặn IP không bao giờ chặn từ hub (Cloudflare, mạng nội bộ, CGNAT): {}",
+                    shown(&dropped)
+                ),
                 at
             ],
         )?;
@@ -773,14 +848,13 @@ mod tests {
             (" 203.0.113.7 ", "203.0.113.7"),
             ("2001:DB8:0:0:0:0:0:1", "2001:db8::1"),
             ("::ffff:203.0.113.7", "203.0.113.7"),
-            // A private address is the admin's call; it is only flagged elsewhere.
-            ("10.0.0.5", "10.0.0.5"),
             // The form the VPS lists its IPv6 clients and bans in.
             ("2001:db8:1:2::/64", "2001:db8:1:2::/64"),
             // Rebuilt from the parsed network, never passed through as typed.
             (" 2001:DB8:1:2:aa::5/64 ", "2001:db8:1:2::/64"),
         ] {
             assert_eq!(ban_target(input).as_deref(), Some(want), "{input}");
+            assert_eq!(unban_target(input).as_deref(), Some(want), "{input}");
         }
         for bad in [
             "",
@@ -811,7 +885,94 @@ mod tests {
             "ff02::1",
         ] {
             assert_eq!(ban_target(bad), None, "{bad}");
+            assert_eq!(unban_target(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn the_hub_never_bans_a_cloudflare_edge_or_a_private_address_but_may_lift_one() {
+        for (input, why) in [
+            // A Cloudflare edge: every visitor routed through it would get 522s.
+            ("172.70.1.2", "cloudflare"),
+            ("2606:4700:10::/64", "cloudflare"),
+            // A VPS's own NAT'd address, an office LAN, a carrier NAT, a ULA.
+            ("10.0.0.5", "private"),
+            ("192.168.1.20", "private"),
+            ("100.64.3.4", "cgnat"),
+            ("fd12:3456:789a:1::/64", "ula"),
+            ("169.254.169.254", "link-local"),
+        ] {
+            assert_eq!(ban_target(input), None, "{input}");
+            let canon = unban_target(input).unwrap();
+            assert_eq!(never_ban_reason(&canon), Some(why), "{input}");
+        }
+        // An ordinary public address is still banned.
+        assert_eq!(ban_target("45.133.1.10").as_deref(), Some("45.133.1.10"));
+        assert_eq!(never_ban_reason("45.133.1.10"), None);
+    }
+
+    #[test]
+    fn a_stored_ban_of_a_protected_address_is_dropped_but_its_unban_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let id = db.enroll_agent("web", "pk", 1).unwrap();
+        seed_desired(
+            &db,
+            &id,
+            r#"{"mode":"enforce","bans":[
+                {"ip":"104.16.5.5","ttl_secs":60,"reason":"admin","created_at":1},
+                {"ip":"45.133.1.10","ttl_secs":60,"reason":"admin","created_at":1}],
+              "unbans":["10.0.0.5"]}"#,
+        );
+        let (_, _, d) = db.get_desired(&id).unwrap().unwrap();
+        let bans: Vec<&str> = d.bans.iter().map(|b| b.ip.as_str()).collect();
+        assert_eq!(bans, ["45.133.1.10"]);
+        assert_eq!(d.unbans, ["10.0.0.5"]);
+    }
+
+    #[test]
+    fn the_address_a_report_came_from_reaches_the_agent_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let id = db.enroll_agent("web", "pk", 1).unwrap();
+        let version = |db: &Db| db.get_desired(&id).unwrap().unwrap().1;
+        let v0 = version(&db);
+        assert!(db.note_self_ip(&id, "198.51.100.20", 10).unwrap());
+        let v1 = version(&db);
+        assert!(v1 > v0, "a new address is a new version the agent pulls");
+        // The same address again: nothing changes, no new version.
+        assert!(!db.note_self_ip(&id, "198.51.100.20", 20).unwrap());
+        assert_eq!(version(&db), v1);
+        // Not a public address, or not an address: never sent.
+        for raw in [
+            "?",
+            "",
+            "127.0.0.1",
+            "10.1.2.3",
+            "100.64.0.9",
+            "104.16.0.1",
+            "::1",
+        ] {
+            assert!(!db.note_self_ip(&id, raw, 30).unwrap(), "{raw}");
+        }
+        // A VPS leaving through a pool of addresses: one more at most every
+        // SELF_IP_EVERY_SECS, not a new desired state on every report.
+        assert!(!db.note_self_ip(&id, "203.0.113.1", 40).unwrap());
+        assert_eq!(version(&db), v1);
+        // Newest first, at most MAX_SELF_IPS.
+        let mut at = 10;
+        for i in 1..=6 {
+            at += SELF_IP_EVERY_SECS;
+            let ip = format!("203.0.113.{i}");
+            assert!(db.note_self_ip(&id, &ip, at).unwrap(), "{ip}");
+        }
+        let d = db.get_desired(&id).unwrap().unwrap().2;
+        assert_eq!(
+            d.self_ips,
+            ["203.0.113.6", "203.0.113.5", "203.0.113.4", "203.0.113.3"]
+        );
+        // An unknown VPS gets nothing stored.
+        assert!(!db.note_self_ip("nobody", "203.0.113.9", 50).unwrap());
     }
 
     fn seed_desired(db: &Db, id: &str, json: &str) {

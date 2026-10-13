@@ -397,7 +397,18 @@ pub struct DesiredBody {
     /// carry a second, root/admin signature. `None` leaves policy unchanged.
     #[serde(default)]
     pub policy: Option<SignedPolicy>,
+    /// The public address(es) the hub saw this agent's signed reports come from,
+    /// newest first, at most [`MAX_SELF_IPS`]. On a cloud that NATs the VPS
+    /// (AWS, GCP, Oracle, Azure) that address is on no interface of the VPS, yet
+    /// its own loopback, cron and cache-preload requests arrive from it; the
+    /// agent never bans it. An older agent ignores the field, an older hub
+    /// never sends it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub self_ips: Vec<String>,
 }
+
+/// Most entries of [`DesiredBody::self_ips`] a hub sends or an agent takes.
+pub const MAX_SELF_IPS: usize = 4;
 
 fn default_k() -> f64 {
     5.0
@@ -691,6 +702,32 @@ mod tests {
         // desired-state unparseable and the agent would stop obeying the hub.
         let j: Job = serde_json::from_str(r#"{"kind":"some_future_job","x":1}"#).unwrap();
         assert!(matches!(j, Job::Unknown));
+    }
+
+    #[test]
+    fn self_ips_travel_both_ways_between_old_and_new() {
+        // A desired-state from an older hub: no `self_ips`.
+        let d: DesiredBody = serde_json::from_str(r#"{"mode":"enforce"}"#).unwrap();
+        assert!(d.self_ips.is_empty());
+        // Not written when empty, so what an older agent reads is unchanged...
+        assert!(!serde_json::to_string(&d).unwrap().contains("self_ips"));
+        // ...and when present, a body without the field (what an older agent
+        // knows) still reads it, ignoring the new key.
+        let new = DesiredBody {
+            self_ips: vec!["203.0.113.7".into()],
+            ..DesiredBody::default()
+        };
+        let json = serde_json::to_string(&new).unwrap();
+        #[derive(Deserialize)]
+        struct Older {
+            mode: Mode,
+            #[serde(default)]
+            bans: Vec<DesiredBan>,
+        }
+        let old: Older = serde_json::from_str(&json).unwrap();
+        assert_eq!((old.mode, old.bans.len()), (Mode::Observe, 0));
+        let back: DesiredBody = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.self_ips, ["203.0.113.7"]);
     }
 
     #[test]

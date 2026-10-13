@@ -1,15 +1,19 @@
 //! Self-lockout protection: the set of addresses `sn` must never ban.
 //!
 //! This is the agent's single most important safety property (plan §7, review
-//! LNX-1/SEC-6). It covers: loopback, every local interface address, the hub,
-//! the admin ranges from config, *active* SSH/panel sessions (resolved from the
-//! real listening ports, including IPv6-mapped sessions on dual-stack sockets;
-//! on sshd's ports only sessions that have logged in), and any IP that logged in
-//! over SSH successfully in the recent past.
+//! LNX-1/SEC-6). It covers: loopback, every local interface address, the
+//! VPS's own public address as the hub sees it (on a cloud that NATs it, that
+//! one is on no interface), the hub, the admin ranges from config, SSH/panel
+//! sessions that are open or were in the last half hour (resolved from the real
+//! listening ports, including IPv6-mapped sessions on dual-stack sockets; on
+//! sshd's ports only sessions that have logged in), and any IP that logged in
+//! over SSH successfully in the recent past. An admin's and the VPS's own IPv6
+//! entries cover their whole /64: the other devices of that LAN (the admin's
+//! browser with a privacy address) share its ban key.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
-use std::net::{IpAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv6Addr, ToSocketAddrs};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -17,6 +21,7 @@ use snsec_common::net::{self, Cidr};
 
 use crate::config::Config;
 use crate::evidence_parse;
+use crate::state::State;
 use crate::sys::{netstat, proc};
 use crate::util;
 
@@ -38,38 +43,122 @@ pub struct Whitelist {
 }
 
 impl Whitelist {
-    /// Would banning `ip` lock out something we must protect?
+    /// Would banning `ip` lock out something we must protect? (Ban keys go
+    /// through [`key_protected`].)
+    #[cfg(test)]
     #[must_use]
     pub fn protects(&self, ip: IpAddr) -> bool {
         net::in_any(&self.cidrs, ip)
     }
 
+    /// Would banning the range `net` (an IPv6 /64 ban key) lock out something
+    /// we must protect? Any whitelisted range or address inside it, or around
+    /// it, does: checking only the first address the logs showed in a /64
+    /// would miss the admin's session two addresses further on.
+    #[must_use]
+    pub fn protects_net(&self, net: Cidr) -> bool {
+        self.cidrs.iter().any(|c| c.overlaps(&net))
+    }
+
     /// nft-ready keys (CIDR or plain address) for the `sn_white*` sets.
     #[must_use]
     pub fn keys(&self) -> Vec<String> {
-        self.cidrs
-            .iter()
-            .map(|c| {
-                let max = if c.addr.is_ipv4() { 32 } else { 128 };
-                if c.prefix == max {
-                    c.addr.to_string()
-                } else {
-                    format!("{}/{}", c.addr, c.prefix)
-                }
-            })
-            .collect()
+        cidr_keys(&self.cidrs)
     }
 
+    /// A whitelist of exactly these ranges (tests elsewhere in the agent).
+    #[cfg(test)]
+    #[must_use]
+    pub fn of(cidrs: Vec<Cidr>) -> Whitelist {
+        Whitelist { cidrs }
+    }
+
+    /// One address exactly (/32 or /128).
     fn push_ip(&mut self, ip: IpAddr) {
         let ip = net::normalize(ip);
         let prefix = if ip.is_ipv4() { 32 } else { 128 };
         self.cidrs.push(Cidr { addr: ip, prefix });
     }
+
+    /// An admin's or the VPS's own address: IPv4 exactly, IPv6 as its /64,
+    /// which is the unit the agent bans IPv6 by.
+    fn push_host(&mut self, ip: IpAddr) {
+        match net::normalize(ip) {
+            IpAddr::V6(v6) => self.cidrs.push(Cidr {
+                addr: IpAddr::V6(net64(v6)),
+                prefix: 64,
+            }),
+            v4 => self.push_ip(v4),
+        }
+    }
 }
 
-/// Build the whitelist from config, the live socket table and the auth logs.
+/// The network address of the /64 that holds `v6`.
+fn net64(v6: Ipv6Addr) -> Ipv6Addr {
+    let mut o = [0u8; 16];
+    o[..8].copy_from_slice(&v6.octets()[..8]);
+    Ipv6Addr::from(o)
+}
+
+/// nft-ready keys (CIDR or plain address, host bits cleared) for ranges.
 #[must_use]
-pub fn build(cfg: &Config, conns: &[netstat::Conn]) -> Whitelist {
+pub fn cidr_keys(cidrs: &[Cidr]) -> Vec<String> {
+    cidrs
+        .iter()
+        .map(|c| {
+            let c = c.canonical();
+            let max = if c.addr.is_ipv4() { 32 } else { 128 };
+            if c.prefix == max {
+                c.addr.to_string()
+            } else {
+                format!("{}/{}", c.addr, c.prefix)
+            }
+        })
+        .collect()
+}
+
+/// Must the ban key (`203.0.113.7`, or an IPv6 `2001:db8:1:2::/64`) never be
+/// banned? It is when it holds or lies in a whitelisted range, or a range of
+/// `never_ban` (the trusted proxies, Cloudflare). A key that is not an address
+/// is not protected (and never reaches the firewall either).
+#[must_use]
+pub fn key_protected(key: &str, wl: &Whitelist, never_ban: &[Cidr]) -> bool {
+    let Some(net) = Cidr::parse(key) else {
+        return false;
+    };
+    wl.protects_net(net) || never_ban.iter().any(|c| c.overlaps(&net))
+}
+
+/// How long an SSH or panel session's peer stays whitelisted after it was last
+/// seen open. A panel user's browser opens and closes connections all the time;
+/// between two of them the agent's cycle must not treat the admin as a visitor.
+const ADMIN_MEMORY_SECS: i64 = 30 * 60;
+/// Most remembered admin peers.
+const MAX_REMEMBERED_ADMINS: usize = 256;
+
+/// Fold the admin peers seen now into the remembered ones (`addr -> last seen`),
+/// drop those not seen for [`ADMIN_MEMORY_SECS`], keep at most
+/// [`MAX_REMEMBERED_ADMINS`] (the most recent), and return what is remembered.
+fn remember_admins(known: &mut HashMap<String, i64>, seen_now: &[IpAddr], now: i64) -> Vec<IpAddr> {
+    for ip in seen_now {
+        known.insert(net::normalize(*ip).to_string(), now);
+    }
+    known.retain(|_, at| now - *at <= ADMIN_MEMORY_SECS && *at <= now + 60);
+    if known.len() > MAX_REMEMBERED_ADMINS {
+        let mut by_age: Vec<(i64, String)> = known.iter().map(|(k, at)| (*at, k.clone())).collect();
+        by_age.sort_unstable_by(|a, b| b.cmp(a));
+        for (_, k) in by_age.into_iter().skip(MAX_REMEMBERED_ADMINS) {
+            known.remove(&k);
+        }
+    }
+    known.keys().filter_map(|k| k.parse().ok()).collect()
+}
+
+/// Build the whitelist from config, the live socket table and the auth logs,
+/// plus, with the agent's `state`, the admin sessions of the last half hour
+/// (remembered there) and the VPS's own public address as the hub saw it.
+#[must_use]
+pub fn build(cfg: &Config, conns: &[netstat::Conn], state: Option<&State>) -> Whitelist {
     let mut wl = Whitelist::default();
 
     // 1) loopback
@@ -88,7 +177,7 @@ pub fn build(cfg: &Config, conns: &[netstat::Conn]) -> Whitelist {
 
     // 3) every local interface address
     for ip in local_ips() {
-        wl.push_ip(ip);
+        wl.push_host(ip);
     }
 
     // 4) the hub
@@ -96,14 +185,32 @@ pub fn build(cfg: &Config, conns: &[netstat::Conn]) -> Whitelist {
         wl.push_ip(ip);
     }
 
-    // 5) active SSH/panel sessions
-    for ip in admin_session_peers(conns) {
-        wl.push_ip(ip);
+    // 5) SSH/panel sessions open now, and (with state) those of the last half
+    // hour
+    let peers = admin_session_peers(conns);
+    for ip in &peers {
+        wl.push_host(*ip);
+    }
+    if let Some(state) = state {
+        let mut known = state.recent_admins();
+        let before = known.clone();
+        for ip in remember_admins(&mut known, &peers, util::now_secs()) {
+            wl.push_host(ip);
+        }
+        if known != before
+            && let Err(e) = state.save_recent_admins(&known)
+        {
+            eprintln!("whitelist: could not remember admin sessions: {e:#}");
+        }
+        // 7) the VPS's own public address(es), as the hub saw its reports come
+        for ip in state.meta().self_ips.iter().filter_map(|s| s.parse().ok()) {
+            wl.push_host(ip);
+        }
     }
 
     // 6) recent successful SSH logins
     for ip in recent_ssh_logins() {
-        wl.push_ip(ip);
+        wl.push_host(ip);
     }
 
     wl
@@ -388,6 +495,57 @@ mod tests {
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn a_64_is_protected_when_any_whitelisted_address_is_inside_it() {
+        // The admin is in over SSH from ::5; a colleague's device (or the
+        // admin's own browser with a privacy address) in the same /64 showed up
+        // in the log first.
+        let mut wl = Whitelist::default();
+        wl.push_ip(ip("2402:800:6310:12a::5"));
+        assert!(!wl.protects(ip("2402:800:6310:12a:aaaa::1")));
+        assert!(key_protected("2402:800:6310:12a::/64", &wl, &[]));
+        assert!(!key_protected("2402:800:6310:12b::/64", &wl, &[]));
+        // An admin's IPv6 session whitelists its /64 on the firewall too.
+        let mut wl = Whitelist::default();
+        wl.push_host(ip("2402:800:6310:12a::5"));
+        assert!(wl.protects(ip("2402:800:6310:12a:aaaa::1")));
+        assert_eq!(wl.keys(), ["2402:800:6310:12a::/64"]);
+        // IPv4 stays one address.
+        wl.push_host(ip("::ffff:198.51.100.4"));
+        assert!(key_protected("198.51.100.4", &wl, &[]));
+        assert!(!key_protected("198.51.100.5", &wl, &[]));
+        // A wide configured range, and ranges that must never be banned.
+        let cf = [Cidr::parse("2606:4700::/32").unwrap()];
+        assert!(key_protected(
+            "2606:4700:10::/64",
+            &Whitelist::default(),
+            &cf
+        ));
+        assert!(!key_protected("x", &wl, &cf));
+    }
+
+    #[test]
+    fn admin_sessions_are_remembered_for_half_an_hour_and_the_memory_is_bounded() {
+        let now = 1_000_000;
+        let mut known = HashMap::new();
+        let got = remember_admins(&mut known, &[ip("203.0.113.7")], now);
+        assert_eq!(got, [ip("203.0.113.7")]);
+        // The panel tab is closed: still whitelisted a while later...
+        let got = remember_admins(&mut known, &[], now + ADMIN_MEMORY_SECS);
+        assert_eq!(got, [ip("203.0.113.7")]);
+        // ...but not forever.
+        assert!(remember_admins(&mut known, &[], now + ADMIN_MEMORY_SECS + 1).is_empty());
+        // A flood of distinct peers keeps only the most recent.
+        let mut known = HashMap::new();
+        for i in 0..(MAX_REMEMBERED_ADMINS as i64 + 50) {
+            let peer = ip(&format!("10.9.{}.{}", i / 250, i % 250));
+            remember_admins(&mut known, &[peer], now + i);
+        }
+        assert_eq!(known.len(), MAX_REMEMBERED_ADMINS);
+        assert!(known.contains_key(&format!("10.9.{}.{}", 305 / 250, 305 % 250)));
+        assert!(!known.contains_key("10.9.0.0"));
     }
 
     #[test]

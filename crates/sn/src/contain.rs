@@ -7,7 +7,6 @@ use std::collections::HashSet;
 
 use anyhow::{Context, Result};
 use snsec_common::labels::Label;
-use snsec_common::net;
 
 use crate::config::Config;
 use crate::state::State;
@@ -174,8 +173,9 @@ pub(crate) fn protected_reason(pid: i32, st: &proc::ProcStat, exe: &str) -> Opti
 
 fn ban_flood_sources(state: &State, cfg: &Config, dry_run: bool) -> Result<usize> {
     let conns = netstat::all();
-    let wl = whitelist::build(cfg, &conns);
-    let trusted = cfg.trusted_cidrs();
+    let wl = whitelist::build(cfg, &conns, Some(state));
+    // Trusted proxies and Cloudflare: never banned.
+    let never_ban = cfg.never_ban_cidrs();
     let per_remote = netstat::conns_per_remote(&conns);
 
     let mut adds: Vec<(String, u64)> = Vec::new();
@@ -184,11 +184,9 @@ fn ban_flood_sources(state: &State, cfg: &Config, dry_run: bool) -> Result<usize
         if count <= 80 {
             continue;
         }
-        // key is a plain v4 or v6 /64; parse the representative ip for checks.
-        let probe_ip = key.split('/').next().unwrap_or(&key);
-        if let Ok(ip) = probe_ip.parse()
-            && (wl.protects(ip) || net::in_any(&trusted, ip))
-        {
+        // key is a plain v4 or an IPv6 /64: protected if any protected address
+        // or range overlaps it.
+        if whitelist::key_protected(&key, &wl, &never_ban) {
             continue;
         }
         if seen.insert(key.clone()) {
@@ -204,7 +202,9 @@ fn ban_flood_sources(state: &State, cfg: &Config, dry_run: bool) -> Result<usize
         }
         return Ok(adds.len());
     }
-    fw::ensure_table(&cfg.fw.web_ports)?;
+    let mut white = wl.keys();
+    white.extend(whitelist::cidr_keys(&never_ban));
+    fw::prepare(&cfg.fw.web_ports, &white)?;
     fw::apply_bans(&adds, &[])?;
     for (k, _) in &adds {
         undo::record(&state.dir, &UndoOp::Unban { key: k.clone() })?;

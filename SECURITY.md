@@ -28,13 +28,13 @@ SN Secure chạy trên máy mà, theo giả định, **có thể đã bị chi�
 2. **Cổng Docker publish** đi qua DNAT nên hook `input` có thể không chặn; cần chain `prerouting`/`DOCKER-USER` (v2).
 3. **cgroup v2 dưới systemd delegation**: bật controller `cpu` cho jail có thể thất bại; khi đó `--freeze` vẫn dừng được miner nhưng throttle CPU mềm có thể không áp. cgroup v1 dùng backend riêng.
 4. **UI admin**: một mật khẩu + session trong RAM; **chưa có TOTP/vai trò** (v1.1). Phải đặt sau VPN/allowlist.
-5. **Baseline** là EWMA xấp xỉ theo 96 khung 15 phút, chưa phải histogram p99 (v1.1). Khởi động lạnh chỉ dùng mẫu cố định + `min_requests`.
+5. **Baseline** là EWMA xấp xỉ theo 96 khung 15 phút (cộng một EWMA chung cho khung còn lạnh), chưa phải histogram p99 (v1.1). Khi chưa học xong, luật `rate` chỉ báo, trừ ≥ 3000 request động/chu kỳ.
 6. **Chưa có self-update do hub điều khiển**: nâng cấp agent bằng SSH/ansible theo đợt.
-7. **CGNAT/di động VN, ASN bot** chưa có xử lý riêng (v2) — một lý do nữa để observe đủ lâu.
+7. **CGNAT/di động VN**: chỉ ước lượng số người sau một IP theo số User-Agent trình duyệt (tối đa ×4 ngưỡng, ban ngắn không leo thang); máy cùng loại sau một IP đếm là một. Crawler được nhận theo dải IP công bố của Google, Microsoft, Apple (nhúng theo bản phát hành), chưa có reverse DNS hay ASN — một lý do nữa để observe đủ lâu.
 
 ## Trước production
 
-- [ ] Observe ≥ 3–7 ngày trên VPS thật; `would_ban` không chứa IP hợp lệ (bot, CDN, nhà mạng, IPN thanh toán).
+- [ ] Observe ≥ 8 ngày trên VPS thật (ít nhất tới khi hub báo ngưỡng truy cập “Đã học”); `would_ban` không chứa IP hợp lệ (bot, CDN, nhà mạng, IPN thanh toán).
 - [ ] Fuzz parser log + parser desired (`cargo fuzz`), test `../`/symlink trong hunt/restore.
 - [ ] Giả lập hub bị chiếm: desired 1.000 ban, `fetch /etc/shadow`, chữ ký sai, version cũ.
 - [ ] Root secret đã cất offline; backup SQLite của hub + test restore.

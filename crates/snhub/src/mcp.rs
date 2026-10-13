@@ -1210,7 +1210,8 @@ fn reject_proposal(db: &Db, args: &Value, who: &str, at: i64) -> ToolResult {
 /// internet address (private, shared CGNAT, link-local, unique-local, the
 /// documentation and benchmarking ranges). Blocking those would cut a VPS off
 /// from its own network, load balancer or monitoring, and nothing attacks from
-/// them across the internet. An admin can still ban them from the hub UI.
+/// them across the internet. (The private, CGNAT, unique-local and link-local
+/// ones, and Cloudflare's, are refused for an admin on the hub too.)
 fn not_public(ip: IpAddr) -> bool {
     match snsec_common::net::normalize(ip) {
         IpAddr::V4(v) => {
@@ -1246,12 +1247,18 @@ fn not_public(ip: IpAddr) -> bool {
 fn ban_arg(args: &Value) -> Result<String, String> {
     let raw = arg_str(args, "ip").unwrap_or("");
     let shown = || raw.chars().take(60).collect::<String>();
-    let canon = crate::db::ban_target(raw).ok_or_else(|| {
+    let canon = crate::db::unban_target(raw).ok_or_else(|| {
         format!(
             "\"{}\" không phải một địa chỉ IP thường (hoặc một IPv6 /64) có thể chặn",
             shown()
         )
     })?;
+    if crate::db::never_ban_reason(&canon) == Some("cloudflare") {
+        return Err(format!(
+            "\"{}\" là IP của Cloudflare (proxy, không phải khách): không bao giờ chặn",
+            shown()
+        ));
+    }
     let addr = canon
         .split('/')
         .next()
@@ -1332,7 +1339,7 @@ fn unban(db: &Db, args: &Value, who: &str, at: i64) -> ToolResult {
     let ip_s = ban_arg(args).or_else(|_| {
         // Lifting is harmless for any canonical address; only the public check
         // is relaxed here.
-        crate::db::ban_target(arg_str(args, "ip").unwrap_or(""))
+        crate::db::unban_target(arg_str(args, "ip").unwrap_or(""))
             .ok_or_else(|| "ip không hợp lệ".to_string())
     })?;
     let key = key_of(&ip_s);

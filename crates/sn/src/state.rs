@@ -67,6 +67,16 @@ pub struct Meta {
     /// back.
     #[serde(default)]
     pub last_pull_ts: i64,
+    /// This VPS's own public address(es) as the hub saw its reports arrive
+    /// (`DesiredBody::self_ips`): never banned. On a cloud that NATs the VPS
+    /// they are on none of its interfaces.
+    #[serde(default)]
+    pub self_ips: Vec<String>,
+    /// When the last watch cycle started. The next one reads the log written
+    /// since, so a long gap (timer stopped, reboot) means a backlog that must
+    /// not be judged against a 5-minute threshold.
+    #[serde(default)]
+    pub last_cycle_ts: i64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -80,6 +90,12 @@ pub struct Offset {
 pub struct Strike {
     pub count: u32,
     pub last_ts: i64,
+    /// Every offence counted here was a `rate` one. Those are forgotten after a
+    /// clean day instead of a clean week: a busy shared address (an office, a
+    /// carrier NAT) is not an attacker that came back. Absent (false) in a file
+    /// an older agent wrote, which keeps the week.
+    #[serde(default)]
+    pub rate_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -292,6 +308,18 @@ impl State {
 
     pub fn save_strikes(&self, s: &HashMap<String, Strike>) -> Result<()> {
         atomic_write(&self.p("strikes.json"), &serde_json::to_vec(s)?)
+    }
+
+    // ---- admin sessions seen lately -----------------------------------------
+
+    /// Peers of SSH / panel sessions seen in recent cycles, with when each was
+    /// last seen (see `whitelist::remember_admins`).
+    pub fn recent_admins(&self) -> HashMap<String, i64> {
+        load_json(&self.p("admins.json"))
+    }
+
+    pub fn save_recent_admins(&self, a: &HashMap<String, i64>) -> Result<()> {
+        atomic_write(&self.p("admins.json"), &serde_json::to_vec(a)?)
     }
 
     // ---- active bans ------------------------------------------------------

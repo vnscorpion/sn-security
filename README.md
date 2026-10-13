@@ -22,8 +22,9 @@ Một binary Rust tĩnh (`sn`, ~3 MB) cấp cứu VPS Linux đang bị mã độ
 - **Tự tìm log của web server** mỗi chu kỳ (nginx / Apache / LiteSpeed; DirectAdmin, cPanel, aaPanel...), không cần cấu hình theo từng VPS và tự đổi theo khi bạn chuyển web server. Chỉ đọc log của server ngoài cùng, bỏ file lỗi/nén.
 - Đọc log tăng dần theo `(dev,inode,offset)`, nhận biết rotation; file log gặp lần đầu luôn bắt đầu từ cuối file; lấy IP thật sau Cloudflare/proxy.
 - Cảnh báo cụ thể khi không đọc được log: không tìm thấy file, không đọc được, sai định dạng, hay log đứng im nhiều chu kỳ liền.
-- Mẫu cố định: bruteforce, probe, scanner, bad_ua, xmlrpc_pingback; cộng ngưỡng truy cập tự học theo khung 15 phút (xem [Ngưỡng chặn IP](#ngưỡng-chặn-ip)).
-- Ban nftables **chỉ cổng web**, TTL + leo thang theo số lần vi phạm (10 phút → 1 giờ → 24 giờ → 7 ngày); IPv6 gộp /64.
+- Mẫu cố định: bruteforce, probe, scanner, bad_ua, xmlrpc_pingback; cộng ngưỡng truy cập tự học theo khung 15 phút, đếm **request động theo từng website** (không tính ảnh/CSS/JS) và nâng theo số trình duyệt dùng chung một IP (xem [Ngưỡng chặn IP](#ngưỡng-chặn-ip)).
+- Googlebot, Bingbot, Applebot được nhận theo **dải IP chính thức** (không tin User-Agent tự xưng); IP Cloudflare, IP của chính VPS (kể cả IP công khai sau NAT của cloud, do hub cho biết) không bao giờ bị chặn.
+- Ban nftables **chỉ cổng web** (TCP và UDP/HTTP3), TTL + leo thang theo số lần vi phạm (10 phút → 1 giờ → 24 giờ → 7 ngày); IPv6 gộp /64.
 - Đo **RAM/swap** mỗi chu kỳ, cảnh báo khi RAM ≥ 90%.
 - **CPU cao liên tục** (≥ `cpu_alert_pct`, mặc định 85%, 2 chu kỳ liền) kèm **tài khoản và chương trình đang dùng CPU**.
 - **Bot phân tán**: cùng một User-Agent hoặc kiểu request tăng vọt từ nhiều IP khác nhau (xem [Bot phân tán](#bot-phân-tán-và-cpu-cao)).
@@ -62,7 +63,7 @@ Từ lúc dựng tới lúc vận hành ổn định:
 
 1. **Dựng hub** một lần trên server trung tâm → [Cài hub](#cài-hub-server-trung-tâm--ubuntu-2404--debian-12). Đặt mật khẩu admin, giấu root secret offline, đưa hub ra sau VPN/TLS.
 2. **Thêm từng VPS** từ giao diện hub → [Thêm một VPS](#thêm-một-vps). Agent vào **observe** ngay, chưa ban gì.
-3. **Theo dõi 3–7 ngày (observe)**: xem `would_ban` của mỗi VPS trên hub. Thấy IP hợp lệ (bot, CDN, nhà mạng, cổng thanh toán) thì thêm vào `[fw] whitelist` hoặc `trusted_proxies` trong `/etc/sn/agent.toml` (sửa trên VPS).
+3. **Theo dõi (observe) ít nhất 8 ngày, hoặc ít nhất tới khi trang VPS trên hub báo ngưỡng truy cập “Đã học” (`baseline_ready`)** rồi xem thêm vài ngày: xem `would_ban` của mỗi VPS trên hub. Thấy IP hợp lệ (bot, CDN, nhà mạng, cổng thanh toán) thì thêm vào `[fw] whitelist` hoặc `trusted_proxies` trong `/etc/sn/agent.toml` (sửa trên VPS).
 4. **Bật enforce** cho VPS đã sạch `would_ban` — ngay trên hub, không cần SSH ([Điều khiển từ hub](#điều-khiển-từ-hub)). Nên bật theo đợt: vài VPS nội bộ trước, rồi mở rộng.
 5. **Vận hành hằng ngày từ hub**: ban/unban IP, đổi mode, bấm **Chạy hunt** để quét theo yêu cầu, **Undo** khi cần. Mọi thao tác vào nhật ký. `sn-hunt` cũng tự chạy mỗi 3h sáng.
 6. **Khi một VPS gặp sự cố full CPU**: dùng ngay [cấp cứu chạy tay](#cấp-cứu-một-vps-đang-bị-chạy-tay) qua SSH (triage → contain → hunt → clean), rồi `undo` nếu cần. Không phụ thuộc hub.
@@ -188,7 +189,7 @@ Có — từ giao diện snhub bạn **đặt lệnh cho VPS mà không cần SS
 
 | Thao tác trên hub | Hiệu lực | Kiểm soát an toàn |
 | --- | --- | --- |
-| **Ban / Unban IP** (nhập tay hoặc nút cạnh top IP) | Agent áp vào nftables chu kỳ kế, TTL ≤ 24h | Chỉ cổng web; whitelist/trusted_proxies vẫn được loại trừ |
+| **Ban / Unban IP** (nhập tay hoặc nút cạnh top IP) | Agent áp vào nftables chu kỳ kế, TTL ≤ 24h; gỡ chặn một IP cũng xoá bộ đếm vi phạm của IP đó | Chỉ cổng web. Hub từ chối chặn IP Cloudflare, mạng nội bộ, CGNAT, ULA; VPS từ chối thêm IP trong whitelist, phiên admin, IP của chính nó, `trusted_proxies` (báo `hub_ban_refused`) |
 | **Đổi observe ↔ enforce** | Agent đổi chế độ chu kỳ kế | Hub quyết định cả hai chiều |
 | **Quét ngay** (quét mã độc) | Agent chạy `sn hunt` trong một unit systemd riêng, ưu tiên thấp; kết quả lên hub ở báo cáo sau khi quét xong | Chạy một lần mỗi lần bấm; không chạy chồng hai lần quét |
 | **Undo** (gỡ contain + ban của sn) | Agent chạy `sn undo` chu kỳ kế | Hub quyết định |
@@ -199,29 +200,44 @@ Tier chính sách (đổi `patterns`, `trusted_proxies`, ép observe hàng loạ
 
 ## Ngưỡng chặn IP
 
-Mỗi chu kỳ (~5 phút) agent đếm các dòng log mới theo **từng IP** (IPv6 gộp theo /64) rồi áp các luật dưới đây theo thứ tự. Luật nào khớp trước thì dùng luật đó.
+Mỗi chu kỳ (~5 phút) agent đếm các dòng log mới theo **từng IP** (IPv6 gộp theo /64) và **theo từng website** (mỗi file log của panel là một website; định dạng log có tên vhost thì tính theo vhost), rồi áp các luật dưới đây theo thứ tự. Luật nào khớp trước thì dùng luật đó.
 
 | Luật | Điều kiện (trong một chu kỳ) | Chặn trong |
 | --- | --- | --- |
-| `bruteforce` | **> 10** POST vào `wp-login.php` + `xmlrpc.php` | 1 giờ |
-| `probe` | chạm **một** đường dẫn dò lỗ hổng: `/.env`, `/.git/`, `/phpmyadmin`, `/pma/`, `/wp-config.php.bak`, `/wp-config.php~`, `/.ds_store`, `/.aws/`, `/config.json`, `/.svn/`, `/vendor/phpunit` | 24 giờ |
-| `scanner` | **> 30** lỗi 404 **và** **> 20** đường dẫn khác nhau | 30 phút |
-| `bad_ua` | User-Agent công cụ tấn công (sqlmap, nikto, masscan, nmap, zgrab, dirbuster, wpscan, acunetix, nuclei, havij), hoặc có request UA rỗng khi tổng **> 50** request | 24 giờ |
-| `rate` | số request của IP **≥ ngưỡng động** (bên dưới) | 10 phút |
-| `xmlrpc_pingback` | **> 3** POST `xmlrpc.php` với UA `WordPress/` | chỉ báo, **không chặn** |
+| `bruteforce` | Trên **một website**: **> 10** lần đăng nhập `wp-login.php` không thành (WordPress trả 200 khi sai mật khẩu; plugin khoá trả 401/403/429/503) cộng POST `xmlrpc.php` không phải từ WordPress/Jetpack; hoặc **> 60** lần đăng nhập được chuyển hướng (đăng nhập đúng, mở bài viết có mật khẩu, đăng ký); hoặc **> 60** POST `xmlrpc.php` từ WordPress/Jetpack. Cộng mọi website: gấp 3 các mức trên. POST từ máy chủ Jetpack của Automattic (dải IP công bố) không tính | 1 giờ, leo thang |
+| `probe` | Chạm đường dẫn dò lỗ hổng (`/.env`, `/.git/`, `/.svn/`, `/.hg/`, `/.aws/`, `/wp-config.php.bak`, `/wp-config.php~`, `/.DS_Store`, `/vendor/phpunit/`; `/phpmyadmin`, `/phpMyAdmin-5.x`, `/pma` chỉ khi server trả 4xx) **bằng chính request không có User-Agent hoặc mang UA công cụ** | 24 giờ, leo thang |
+| `scanner` | Trên một website **> 30** lỗi 404 cho trang (không tính ảnh, CSS, JS, font, video; vẫn tính `.zip`, `.sql`, `.bak`, `.txt`, `.php`), cộng mọi website **> 90**, **và** **> 20** đường dẫn khác nhau | 30 phút; leo thang khi phần lớn các 404 đó không có UA hoặc mang UA công cụ |
+| `bad_ua` | UA công cụ tấn công (sqlmap, nikto, masscan, nmap, zgrab, dirbuster, wpscan, acunetix, nuclei, havij) trên **≥ 3** request, hoặc trên một request bị trả 4xx | 1 giờ, leo thang |
+| `bad_ua` | **> 50** request không có UA mà **ít nhất một nửa** bị trả 4xx (UA rỗng nhưng trả lời bình thường, như job đồng bộ gọi REST API, để luật `rate` lo) | 24 giờ, leo thang |
+| `probe` (từ trình duyệt) | **3 loại** đường dẫn dò khác nhau (`.env`, `.git`, phpMyAdmin...; nhiều file của một loại chỉ tính một), hoặc một đường dẫn dò kèm ≥ 10 lỗi 4xx trang trên ≥ 10 đường dẫn, với UA trình duyệt | 10 phút, **không** leo thang (một trang web có thể khiến trình duyệt của khách gửi đúng như vậy) |
+| `rate` | Số request **động** của IP trên website bận nhất ≥ **ngưỡng × số trình duyệt** (bên dưới) | 10 phút, leo thang (bên dưới) |
+| `xmlrpc_pingback` | **> 3** request `xmlrpc.php` với UA `WordPress/` | chỉ báo, **không chặn** |
+| `probe` (lẻ) | Một đường dẫn dò từ trình duyệt, IP có ≤ 20 request | chỉ báo, **không chặn** |
 
-**Ngưỡng động của `rate`** = `max(min_requests, k × mức bình thường)`:
-- `min_requests` mặc định **120** request/chu kỳ, `k` mặc định **5** (cả hai chỉnh được trong `[watch]` của `/etc/sn/agent.toml`).
-- "Mức bình thường" là trung bình trượt của số request của **IP truy cập nhiều nhất** trong cùng khung 15 phút của ngày (96 khung/ngày). Khung chỉ được tin khi có ≥ 24 lần quan sát, với timer 5 phút nghĩa là khoảng **8 ngày**. Trước đó ngưỡng chỉ là `min_requests` = 120.
+**Request động** = trang, API, form, `admin-ajax.php`, sitemap: **không** tính ảnh, CSS, JS, font, video/âm thanh, và câu trả lời 206 (tải từng đoạn video) hay 304 (dùng bản trong cache). Một lượt xem trang WooCommerce kéo 60–100 file nhưng chỉ vài request động.
 
-**Leo thang:** thời hạn chặn thực tế là mức lớn hơn giữa thời hạn của luật và bậc theo số lần vi phạm của IP đó: lần 1 → 10 phút, lần 2 → 1 giờ, lần 3 → 24 giờ, từ lần 4 → 7 ngày. Số lần vi phạm về 0 sau 7 ngày không vi phạm.
+**Ngưỡng của `rate`** = `max(min_requests, k × mức bình thường)`:
+- `min_requests` mặc định **300** request động / website / chu kỳ (khoảng 1 request/giây liên tục), `k` mặc định **5** (chỉnh trong `[watch]` của `/etc/sn/agent.toml`).
+- "Mức bình thường" là trung bình trượt của số request động trên một website của **IP truy cập nhiều nhất** (không tính IP được bảo vệ và crawler đã xác minh), theo khung 15 phút trong ngày (96 khung). Chỉ chu kỳ có traffic bình thường mới được học (bỏ chu kỳ không có dòng log và chu kỳ đọc bù log tồn đọng). Mỗi khung dùng mức của riêng nó khi có ≥ 24 lần quan sát (khoảng **8 ngày**); trước đó dùng trung bình của mọi khung (sau ~2 giờ traffic); trước nữa chỉ dùng `min_requests`.
+- **Nhiều người chung một IP** (4G/CGNAT, văn phòng, trường học): ngưỡng nhân với số trình duyệt khác nhau (theo User-Agent trình duyệt) sau IP đó, tối đa **×4**; từ 3 trình duyệt trở lên thì lệnh chặn chỉ **10 phút và không leo thang**.
+- Cũng khớp khi tổng request động của IP trên mọi website ≥ **3 ×** mức trên (rải đều nhiều site), hoặc tổng mọi dòng log của IP, kể cả ảnh/CSS/JS, ≥ **10 ×** ngưỡng (flood file tĩnh).
+- **Khi ngưỡng chưa học xong** (trang VPS trên hub báo “Đang học”, tức `baseline_ready` = sai: khung hiện tại chưa đủ quan sát và chưa có khoảng một ngày traffic), `rate` **chỉ báo, không chặn**, trừ khi IP đạt **≥ 3000 request động / chu kỳ** (~10 request/giây): mức đó luôn bị chặn.
+- **Crawler đã xác minh**: Googlebot, Bingbot, Applebot nhận theo **dải IP chính thức** do Google, Microsoft, Apple công bố (nhúng sẵn trong agent, lấy ngày 14/10/2026); User-Agent tự xưng là crawler **không** được tính. Crawler đã xác minh có ngưỡng `rate` **× 10**, vượt thì chỉ bị chặn 10 phút và không leo thang; `scanner` chỉ báo. `bruteforce`, `probe`, `bad_ua` vẫn áp dụng.
+- Một IP mang ≥ 20 trình duyệt khác nhau trên ≥ 3 website (giống proxy/CDN chưa khai trong `trusted_proxies`) mà vượt ngưỡng thì **chỉ báo** kèm cảnh báo `proxy_in_logs`, trừ khi ≥ 3000 request động.
+- Hơn **20** IP vượt ngưỡng `rate` trong cùng một chu kỳ (cảnh báo `rate_storm`): chỉ IP vượt từ **10 ×** ngưỡng trở lên bị chặn, còn lại chỉ báo.
+- Sau một quãng agent không chạy (dừng timer, khởi động lại, VPS treo) log tồn đọng được đọc bù. Quãng dài hơn 15 phút (hoặc lần đọc chạm giới hạn dung lượng) thì chu kỳ đó **không xét** `rate` và `scanner` (cảnh báo `backlog_skipped`); từ 5 đến 15 phút thì ngưỡng nhân theo độ dài quãng.
 
-**Không bao giờ bị chặn:** IP trong `[fw] whitelist`, loopback, các IP của chính VPS, hub, phiên SSH/panel đang mở, IP vừa đăng nhập SSH, dải Cloudflare (`trusted_proxies`). Tối đa **200** lượt chặn mỗi chu kỳ; vượt thì dừng và báo cảnh báo khẩn. Ở chế độ **observe** các luật vẫn chạy nhưng chỉ ghi `would_ban`.
+**Leo thang:** thời hạn chặn thực tế là mức lớn hơn giữa thời hạn của luật và bậc theo số lần vi phạm của IP đó: lần 1 → 10 phút, lần 2 → 1 giờ, lần 3 → 24 giờ, từ lần 4 → 7 ngày. Số lần vi phạm về 0 sau **7 ngày** không vi phạm, hoặc sau **1 ngày** nếu mọi lần vi phạm của IP đều là `rate`. `rate` từ một IP gần như chỉ có trình duyệt (≥ 3/4 request động mang UA trình duyệt) không bao giờ quá **1 giờ**; flood bằng công cụ vẫn leo đủ thang. IP đang bị chặn không bị tính thêm lần vi phạm vì cùng lý do (kết nối cũ của nó vẫn ghi log thêm một lúc). Ở chế độ **observe** agent chỉ ghi `would_ban` (kèm thời hạn sẽ áp) và **không** tính lần vi phạm. Khi hub chuyển VPS sang enforce, bộ đếm vi phạm được xoá; admin gỡ chặn một IP trên hub cũng xoá bộ đếm của IP đó.
 
-> **Giới hạn hiện tại — đọc trước khi bật enforce.**
-> - Luật `rate` đếm **mọi** request, kể cả ảnh/CSS/JS. Một trang WordPress có thể kéo 30–100 file, nên 120 request/5 phút dễ bị khách bình thường vượt qua, nhất là nhiều người dùng chung một IP (văn phòng, mạng di động). Hãy xem `would_ban` ở chế độ observe ít nhất vài ngày trước khi bật chặn.
-> - `/config.json` và `/phpmyadmin` trong luật `probe` cũng là đường dẫn hợp lệ của một số ứng dụng và của admin.
-> - Chưa có danh sách bot tự miễn chặn: Googlebot, Bingbot... cần thêm tay vào `[fw] whitelist` (ví dụ `66.249.64.0/19` cho Googlebot).
+**Không bao giờ bị chặn:** IP trong `[fw] whitelist`, loopback, các IP của chính VPS (cả IP công khai mà hub thấy báo cáo gửi đến, cần trên cloud có NAT như AWS, GCP, Oracle, Azure), hub, phiên SSH/panel đang mở hoặc mới đóng trong 30 phút, IP vừa đăng nhập SSH, proxy trong `trusted_proxies` (mặc định `cloudflare`, cả khi file cấu hình thiếu khoá này; thêm `quic.cloud` nếu dùng QUIC.cloud) và mọi dải Cloudflare dù `trusted_proxies` ghi gì (tắt bằng `protect_cloudflare = false`). Với IPv6, cả dải /64 chứa một địa chỉ được bảo vệ đều không bị chặn, và IPv6 của admin hay của chính VPS được whitelist cả /64. Lệnh chặn từ hub (giao diện, MCP, AI) đi qua cùng các bảo vệ này trên VPS. Tối đa **200** lượt chặn mỗi chu kỳ; vượt thì dừng và báo cảnh báo khẩn. Lệnh chặn chặn kết nối mới cả TCP lẫn UDP (HTTP/3) tới cổng web.
+
+> **Cần biết trước khi bật enforce.**
+> - Số trình duyệt đếm theo User-Agent: nhiều máy cùng loại (cùng đời iPhone, cùng bản Chrome) sau một IP chỉ tính là một. Công cụ đổi UA liên tục được tối đa ×4 ngưỡng và chỉ bị chặn ngắn mỗi lần.
+> - Bruteforce chia nhỏ (dưới 11 lần sai mỗi website, dưới 31 lần trên cả VPS mỗi chu kỳ) không bị luật này bắt.
+> - CDN khác Cloudflare/QUIC.cloud (Sucuri, BunnyCDN...) cần khai dải IP của nó trong `trusted_proxies`. Dải crawler và CDN nhúng theo bản phát hành; dải công bố sau đó chỉ có ở bản sau.
+> - Không nhận ra web server phía trước (Varnish, HAProxy, Caddy...) thì agent chỉ đọc một bộ log cho mỗi website (bộ ghi gần nhất) và báo `listener_unknown`; nên đặt `sources_mode = "manual"`.
+> - Tự quét website của mình bằng WPScan/nuclei từ văn phòng thì thêm IP văn phòng vào `[fw] whitelist`.
+> - Hãy xem `would_ban` ở chế độ observe trước khi bật chặn.
 
 ## AI xử lý sự cố (hub + agent)
 

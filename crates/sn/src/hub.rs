@@ -97,8 +97,11 @@ pub fn sync(
     // Take the hub's orders *before* building the report, so a ban the admin
     // just ordered is already in force (and visible in `active_bans`) in this
     // very report instead of one cycle later.
-    if hub_configured && let Err(e) = fetch_and_apply_desired(cfg, state) {
-        eprintln!("hub: desired fetch/apply failed: {e:#}");
+    if hub_configured {
+        match fetch_and_apply_desired(cfg, state) {
+            Ok(refused) => alerts.extend(refused_alert(&refused)),
+            Err(e) => eprintln!("hub: desired fetch/apply failed: {e:#}"),
+        }
     }
 
     // Reserved under the meta lock, so no other writer can hand out the same
@@ -185,6 +188,28 @@ pub fn sync(
         eprintln!("hub: report flush failed (queued for retry): {e:#}");
     }
     Ok(())
+}
+
+/// Hub bans this VPS refused because the address must never be banned here.
+fn refused_alert(refused: &[String]) -> Option<snsec_common::schema::Alert> {
+    if refused.is_empty() {
+        return None;
+    }
+    let shown: Vec<&str> = refused.iter().take(10).map(String::as_str).collect();
+    Some(snsec_common::schema::Alert {
+        kind: "hub_ban_refused".into(),
+        message: format!(
+            "{} ban order(s) from the hub not applied: the address is protected on this VPS (whitelist, admin session, the VPS's own address, a trusted proxy or Cloudflare): {}{}",
+            refused.len(),
+            shown.join(", "),
+            if refused.len() > shown.len() {
+                ", ..."
+            } else {
+                ""
+            }
+        ),
+        severity: "warn".into(),
+    })
 }
 
 /// At most this many findings travel in one report (the summary has the totals).
@@ -714,7 +739,8 @@ fn root_keys(cfg: &Config) -> Vec<VerifyingKey> {
 /// The watch timer and an incident follow-up (below) can both ask at once; two
 /// that both see a new order would both run its job. A lock file in the state
 /// directory makes the second wait and then see the first one's result.
-fn fetch_and_apply_desired(cfg: &Config, state: &State) -> Result<()> {
+/// Returns the hub bans refused as protected.
+fn fetch_and_apply_desired(cfg: &Config, state: &State) -> Result<Vec<String>> {
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -768,10 +794,10 @@ pub fn follow_incident(cfg: &Config, state: &State) {
     }
 }
 
-fn fetch_and_apply_desired_unlocked(cfg: &Config, state: &State) -> Result<()> {
+fn fetch_and_apply_desired_unlocked(cfg: &Config, state: &State) -> Result<Vec<String>> {
     let keys = hub_keys(cfg);
     if keys.is_empty() {
-        return Ok(()); // no hub keys configured; cannot trust desired
+        return Ok(Vec::new()); // no hub keys configured; cannot trust desired
     }
     let sk =
         crypto::parse_secret(&cfg.hub.agent_key).context("parsing agent_key (hub.agent_key)")?;
@@ -797,14 +823,14 @@ fn fetch_and_apply_desired_unlocked(cfg: &Config, state: &State) -> Result<()> {
     }
     let text = match resp {
         Ok(r) => r.into_string().context("reading desired body")?,
-        Err(ureq::Error::Status(304, _)) => return Ok(()), // not modified
+        Err(ureq::Error::Status(304, _)) => return Ok(Vec::new()), // not modified
         Err(ureq::Error::Status(404, _)) => anyhow::bail!(
             "GET desired: the hub does not accept this agent's signed request (is the VPS clock right? was this VPS removed from the hub?)"
         ),
         Err(e) => anyhow::bail!("GET desired: {e}"),
     };
     if text.trim().is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let signed: Signed = serde_json::from_str(&text).context("parsing desired envelope")?;
     let now = util::now_secs();
@@ -816,10 +842,10 @@ fn fetch_and_apply_desired_unlocked(cfg: &Config, state: &State) -> Result<()> {
     }
     // Replay / monotonicity defence.
     if !env.is_newer_than(meta.last_desired.epoch, meta.last_desired.seq) {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
-    apply_desired(cfg, state, &env.body)?;
+    let refused = apply_desired(cfg, state, &env.body)?;
 
     // Raised, never lowered, whatever else changed in meta.json meanwhile.
     let applied = DesiredRef {
@@ -834,7 +860,7 @@ fn fetch_and_apply_desired_unlocked(cfg: &Config, state: &State) -> Result<()> {
             m.applied_desired = applied;
         }
     })?;
-    Ok(())
+    Ok(refused)
 }
 
 /// The time to sign a pull at: now, but always after the last pull the hub
@@ -858,15 +884,59 @@ fn pull_headers(
     [(HDR_PULL_TS, now.to_string()), (HDR_PULL_SIG, sig)]
 }
 
-fn apply_desired(cfg: &Config, state: &State, d: &DesiredBody) -> Result<()> {
+/// The VPS's own addresses as the hub reports them, checked: single addresses
+/// only (no loopback, unspecified or multicast), at most `MAX_SELF_IPS`.
+fn checked_self_ips(list: &[String]) -> Vec<String> {
+    use snsec_common::schema::MAX_SELF_IPS;
+    let mut out: Vec<String> = Vec::new();
+    for s in list {
+        let Ok(ip) = s.trim().parse::<std::net::IpAddr>() else {
+            continue;
+        };
+        let ip = net::normalize(ip);
+        if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
+            continue;
+        }
+        let ip = ip.to_string();
+        if !out.contains(&ip) && out.len() < MAX_SELF_IPS {
+            out.push(ip);
+        }
+    }
+    out
+}
+
+/// May a hub ban of `key` go ahead here? Not for an address this VPS protects
+/// (whitelist, admin sessions, its own addresses, trusted proxies,
+/// Cloudflare), nor for one no hub should ever ban (private, carrier-grade NAT,
+/// unique-local, link-local: an older hub did not refuse those).
+fn hub_ban_allowed(key: &str, wl: &crate::whitelist::Whitelist, never_ban: &[net::Cidr]) -> bool {
+    let reserved = net::Cidr::parse(key)
+        .and_then(|c| snsec_common::ranges::never_ban_reason(c.addr))
+        .is_some();
+    !reserved && !crate::whitelist::key_protected(key, wl, never_ban)
+}
+
+/// Apply a desired state from the hub. Returns the bans it ordered that were
+/// refused because the address is protected here.
+fn apply_desired(cfg: &Config, state: &State, d: &DesiredBody) -> Result<Vec<String>> {
     // The one local switch: a VPS with `[remote] hub_orders = false` only reports.
     // Otherwise the hub decides (bans, mode, scans, undo, evidence, ClamAV, orders).
     if !cfg.remote.hub_orders {
         eprintln!("hub: orders ignored on this VPS ([remote] hub_orders = false)");
-        return Ok(());
+        return Ok(Vec::new());
     }
     // Hard local bounds (SEC-2): the hub can never exceed these.
     let _timer = d.timer_interval_secs.clamp(300, 900);
+
+    // This VPS's own public address as the hub saw its reports arrive: on a
+    // cloud that NATs it, its own cron, loopback and cache-preload requests
+    // come from there, and must never get it banned.
+    let self_ips = checked_self_ips(&d.self_ips);
+    state.update_meta(|m| {
+        if m.self_ips != self_ips {
+            m.self_ips = self_ips;
+        }
+    })?;
 
     // "Lift every ban" from the admin (too many wrong bans): before the operator
     // bans below, so a ban ordered after it still applies. Once per marker.
@@ -915,36 +985,67 @@ fn apply_desired(cfg: &Config, state: &State, d: &DesiredBody) -> Result<()> {
         })
         .collect();
 
-    if (!adds.is_empty() || !dels.is_empty()) && crate::sys::fw::available() {
-        // A firewall problem must not stop the rest of the order. This used to
-        // return the error, so the desired-state was never marked applied, the
-        // same order was retried and failed every cycle, and a job in it (install
-        // ClamAV, a scan, an incident order) never ran.
-        let applied = crate::sys::fw::ensure_table(&cfg.fw.web_ports)
-            .and_then(|()| crate::sys::fw::apply_bans(&adds, &dels));
-        match applied {
-            Err(e) => eprintln!(
-                "hub: could not apply the ban list ({e:#}); carrying on with the rest of the order"
-            ),
-            Ok(()) => {
-                // Record operator bans in state so reports stay consistent.
-                let mut active = state.bans();
-                for (key, ttl) in &adds {
-                    active.insert(
-                        key.clone(),
-                        crate::state::ActiveBan {
-                            reason: "hub".into(),
-                            expires_ts: now + *ttl as i64,
-                            strike: 0,
-                            layer: "l3".into(),
-                        },
-                    );
-                }
-                for key in &dels {
-                    active.remove(key);
-                }
-                let _ = state.save_bans(&active);
+    // The hub's bans pass the same protections as the agent's own: a ban from
+    // the UI, MCP or an AI must not lock out an admin, this VPS's own address or
+    // a Cloudflare edge (every visitor behind it would get errors).
+    let mut refused = Vec::new();
+    let firewall = (!adds.is_empty() || !dels.is_empty()) && crate::sys::fw::available();
+    if !adds.is_empty() || firewall {
+        let wl = crate::whitelist::build(cfg, &crate::sys::netstat::all(), Some(state));
+        let never_ban = cfg.never_ban_cidrs();
+        adds.retain(|(key, _)| {
+            let ok = hub_ban_allowed(key, &wl, &never_ban);
+            if !ok {
+                eprintln!("hub: not banning {key}: the address is protected on this VPS");
+                refused.push(key.clone());
             }
+            ok
+        });
+        if firewall && (!adds.is_empty() || !dels.is_empty()) {
+            // A firewall problem must not stop the rest of the order. This used
+            // to return the error, so the desired-state was never marked
+            // applied, the same order was retried and failed every cycle, and a
+            // job in it (install ClamAV, a scan, an incident order) never ran.
+            let mut white = wl.keys();
+            white.extend(crate::whitelist::cidr_keys(&never_ban));
+            let applied = crate::sys::fw::prepare(&cfg.fw.web_ports, &white)
+                .and_then(|()| crate::sys::fw::apply_bans(&adds, &dels));
+            match applied {
+                Err(e) => eprintln!(
+                    "hub: could not apply the ban list ({e:#}); carrying on with the rest of the order"
+                ),
+                Ok(()) => {
+                    // Record operator bans in state so reports stay consistent.
+                    let mut active = state.bans();
+                    for (key, ttl) in &adds {
+                        active.insert(
+                            key.clone(),
+                            crate::state::ActiveBan {
+                                reason: "hub".into(),
+                                expires_ts: now + *ttl as i64,
+                                strike: 0,
+                                layer: "l3".into(),
+                            },
+                        );
+                    }
+                    for key in &dels {
+                        active.remove(key);
+                    }
+                    let _ = state.save_bans(&active);
+                }
+            }
+        }
+    }
+    // An address the admin unbanned also loses its offence count: banned
+    // wrongly, its next busy cycle must not start a step up the ladder.
+    if !dels.is_empty() {
+        let mut strikes = state.strikes();
+        let before = strikes.len();
+        for key in &dels {
+            strikes.remove(key);
+        }
+        if strikes.len() != before {
+            let _ = state.save_strikes(&strikes);
         }
     }
 
@@ -977,6 +1078,12 @@ fn apply_desired(cfg: &Config, state: &State, d: &DesiredBody) -> Result<()> {
     })?;
     if mode_changed {
         eprintln!("hub: mode -> {} (from hub)", d.mode.as_str());
+        if d.mode == snsec_common::schema::Mode::Enforce {
+            // Start enforcing with a clean slate: offences counted before (an
+            // older agent counted them in observe mode too) must not make the
+            // first real bans week-long.
+            let _ = state.save_strikes(&Default::default());
+        }
     }
 
     // One-shot jobs: run only when jobs_seq advanced beyond what we last ran.
@@ -985,7 +1092,7 @@ fn apply_desired(cfg: &Config, state: &State, d: &DesiredBody) -> Result<()> {
             run_job(cfg, state, job);
         }
     }
-    Ok(())
+    Ok(refused)
 }
 
 /// Take the jobs of `jobs_seq` for this run, if nobody ran them yet. Recorded
@@ -1315,6 +1422,7 @@ mod tests {
                 crate::state::Strike {
                     count: 3,
                     last_ts: now,
+                    rate_only: false,
                 },
             );
             state.save_strikes(&strikes).unwrap();
@@ -1340,6 +1448,131 @@ mod tests {
         };
         apply_desired(&cfg, &state, &d2).unwrap();
         assert!(state.bans().is_empty());
+    }
+
+    fn strikes_of(keys: &[&str]) -> HashMap<String, crate::state::Strike> {
+        keys.iter()
+            .map(|k| {
+                (
+                    (*k).to_string(),
+                    crate::state::Strike {
+                        count: 4,
+                        last_ts: util::now_secs(),
+                        rate_only: false,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_unban_from_the_hub_forgets_that_addresses_offences() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::at(dir.path().to_path_buf());
+        state
+            .save_strikes(&strikes_of(&[
+                "203.0.113.7",
+                "2001:db8:1:2::/64",
+                "45.133.1.10",
+            ]))
+            .unwrap();
+        let d = DesiredBody {
+            unbans: vec!["203.0.113.7".into(), "2001:db8:1:2::9".into()],
+            ..DesiredBody::default()
+        };
+        apply_desired(&default_config(), &state, &d).unwrap();
+        let left: Vec<String> = state.strikes().into_keys().collect();
+        assert_eq!(left, ["45.133.1.10"]);
+    }
+
+    #[test]
+    fn switching_to_enforce_starts_from_a_clean_slate() {
+        use snsec_common::schema::Mode;
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::at(dir.path().to_path_buf());
+        let cfg = default_config();
+        state.save_strikes(&strikes_of(&["203.0.113.7"])).unwrap();
+        // To observe (the default already): nothing forgotten.
+        apply_desired(&cfg, &state, &DesiredBody::default()).unwrap();
+        assert_eq!(state.strikes().len(), 1);
+        let enforce = DesiredBody {
+            mode: Mode::Enforce,
+            ..DesiredBody::default()
+        };
+        apply_desired(&cfg, &state, &enforce).unwrap();
+        assert!(state.strikes().is_empty());
+        assert_eq!(state.meta().mode_override, Some(Mode::Enforce));
+        // Already enforcing: a later desired state keeps what was counted since.
+        state.save_strikes(&strikes_of(&["203.0.113.8"])).unwrap();
+        apply_desired(&cfg, &state, &enforce).unwrap();
+        assert_eq!(state.strikes().len(), 1);
+    }
+
+    #[test]
+    fn the_vps_keeps_the_address_the_hub_saw_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::at(dir.path().to_path_buf());
+        let d = DesiredBody {
+            self_ips: vec![
+                "198.51.100.20".into(),
+                " ::ffff:198.51.100.21 ".into(),
+                "127.0.0.1".into(),
+                "not an address".into(),
+                "198.51.100.20".into(),
+                "2001:db8::5".into(),
+                "198.51.100.22".into(),
+                "198.51.100.23".into(),
+            ],
+            ..DesiredBody::default()
+        };
+        apply_desired(&default_config(), &state, &d).unwrap();
+        assert_eq!(
+            state.meta().self_ips,
+            [
+                "198.51.100.20",
+                "198.51.100.21",
+                "2001:db8::5",
+                "198.51.100.22"
+            ]
+        );
+        // A VPS that only reports ignores the hub entirely.
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::at(dir.path().to_path_buf());
+        let mut cfg = default_config();
+        cfg.remote.hub_orders = false;
+        apply_desired(&cfg, &state, &d).unwrap();
+        assert!(state.meta().self_ips.is_empty());
+    }
+
+    #[test]
+    fn a_hub_ban_of_a_protected_address_is_refused() {
+        use crate::whitelist::Whitelist;
+        let cidr = |s| net::Cidr::parse(s).unwrap();
+        // The admin's SSH session, inside the /64 the hub wants banned.
+        let wl = Whitelist::of(vec![cidr("2402:800:6310:12a::5"), cidr("203.0.113.7")]);
+        let never_ban = vec![cidr("104.16.0.0/13")];
+        for key in [
+            "2402:800:6310:12a::/64",
+            "203.0.113.7",
+            // A Cloudflare edge.
+            "104.16.1.1",
+            // Never a client on the Internet, whatever an older hub accepted.
+            "10.0.0.5",
+            "100.64.1.1",
+            "fd00:1::/64",
+        ] {
+            assert!(!hub_ban_allowed(key, &wl, &never_ban), "{key}");
+        }
+        for key in ["45.133.1.10", "2402:800:6310:12b::/64"] {
+            assert!(hub_ban_allowed(key, &wl, &never_ban), "{key}");
+        }
+        let a = refused_alert(&["104.16.1.1".into()]).unwrap();
+        assert_eq!(
+            (a.kind.as_str(), a.severity.as_str()),
+            ("hub_ban_refused", "warn")
+        );
+        assert!(a.message.contains("104.16.1.1"));
+        assert!(refused_alert(&[]).is_none());
     }
 
     #[test]

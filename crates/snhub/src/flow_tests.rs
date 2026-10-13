@@ -783,6 +783,42 @@ async fn reports_are_bounded_in_size_rate_and_history() {
 }
 
 #[tokio::test]
+async fn the_address_a_report_comes_from_is_sent_back_to_the_agent() {
+    let h = hub_with(false);
+    let (id, sk) = agent_key(&h);
+    let report = |seq: u64, from: &str| {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/v1/report")
+            .header(header::CONTENT_TYPE, "application/json")
+            // What the reverse proxy in front of the hub adds.
+            .header("x-forwarded-for", from)
+            .body(Body::from(signed_report(&id, &sk, seq)))
+            .unwrap()
+    };
+    let self_ips = |h: &Hub| {
+        h.st.db
+            .lock()
+            .unwrap()
+            .get_desired(&id)
+            .unwrap()
+            .unwrap()
+            .2
+            .self_ips
+    };
+    let r = h.request(report(1, "198.51.100.77")).await;
+    assert_eq!((r.status, r.body.as_str()), (StatusCode::OK, "ok"));
+    assert_eq!(self_ips(&h), ["198.51.100.77"]);
+    // A copy of a report already taken changes nothing, whoever sends it.
+    let r = h.request(report(1, "203.0.113.66")).await;
+    assert_eq!(r.body, "duplicate");
+    assert_eq!(self_ips(&h), ["198.51.100.77"]);
+    // A private address (a VPN to the hub) is no use to the agent.
+    h.request(report(2, "10.8.0.2")).await;
+    assert_eq!(self_ips(&h), ["198.51.100.77"]);
+}
+
+#[tokio::test]
 async fn a_report_from_an_agent_watching_a_botnet_wave_still_gets_in() {
     let h = hub_with(false);
     let (id, sk) = agent_key(&h);
@@ -855,6 +891,34 @@ async fn a_ban_order_holds_one_address_or_nothing() {
             vec!["2001:db8:1:2::/64".to_string()]
         )
     );
+}
+
+#[tokio::test]
+async fn the_hub_refuses_to_ban_a_cloudflare_edge_or_a_private_address() {
+    let h = hub_with(false);
+    let cookie = h.sign_in().await;
+    let (id, _) = agent_key(&h);
+    for (ip, says) in [
+        ("172.70.12.34", "lỗi 522"),
+        ("10.0.0.5", "thuộc mạng nội bộ"),
+        ("100.64.1.2", "thuộc dải CGNAT"),
+    ] {
+        let r = h
+            .post(&format!("/agent/{id}/ban"), &cookie, &format!("ip={ip}"))
+            .await;
+        assert!(r.location().contains("at=ctl"), "{ip}: {}", r.location());
+        let page = h
+            .get(r.location().split('#').next().unwrap(), &cookie)
+            .await;
+        assert!(page.body.contains(says), "{ip}");
+    }
+    let d = h.st.db.lock().unwrap().get_desired(&id).unwrap().unwrap().2;
+    assert!(d.bans.is_empty());
+    // Lifting one is fine (a ban from before, or one the VPS made).
+    h.post(&format!("/agent/{id}/unban"), &cookie, "ip=10.0.0.5")
+        .await;
+    let d = h.st.db.lock().unwrap().get_desired(&id).unwrap().unwrap().2;
+    assert_eq!(d.unbans, ["10.0.0.5"]);
 }
 
 #[tokio::test]

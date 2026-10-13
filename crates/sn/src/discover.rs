@@ -188,22 +188,24 @@ pub struct Discovery {
     pub found: Vec<LogSource>,
     /// Every pattern that was tried, for the "nothing found" message.
     pub tried: Vec<String>,
+    /// Patterns left out because another one names the same sites and was
+    /// written more recently (only when the web server is unknown).
+    pub dropped: Vec<String>,
 }
 
 /// Look for the listener's log locations. `root` is put in front of every
 /// pattern: `""` in production, a temporary directory in tests.
 #[must_use]
 pub fn discover(listener: Listener, root: &str) -> Discovery {
-    let mut found = Vec::new();
+    // One set of sources per pattern that matched.
+    let mut sets: Vec<(String, Vec<LogSource>)> = Vec::new();
     let mut tried = Vec::new();
     for g in candidate_globs(listener) {
         let pattern = format!("{root}{g}");
         tried.push(pattern.clone());
         // Every server above writes the Apache/nginx "combined" layout.
-        let source = |glob: String| LogSource {
-            glob,
-            format: "combined".into(),
-        };
+        let source = |glob: String| LogSource::new(glob, "combined".into());
+        let mut set = Vec::new();
         if g.starts_with(TENANT_AREA) {
             // One source per checked file, never the pattern: a file created
             // there after this check is not followed until it passes it too.
@@ -213,14 +215,77 @@ pub fn discover(listener: Listener, root: &str) -> Discovery {
                 if let Some(path) = file.to_str()
                     && tenant_log_ok(area, &file)
                 {
-                    found.push(source(glob::Pattern::escape(path)));
+                    set.push(source(glob::Pattern::escape(path)));
                 }
             }
         } else if !crate::watch::expand_glob(&pattern).is_empty() {
-            found.push(source(pattern));
+            set.push(source(pattern.clone()));
+        }
+        if !set.is_empty() {
+            sets.push((pattern, set));
         }
     }
-    Discovery { found, tried }
+    // Not knowing which server is in front, both nginx's and Apache's logs may
+    // be there, each request in both (and counted twice).
+    let dropped = if listener == Listener::Unknown {
+        one_set_per_site(&mut sets)
+    } else {
+        Vec::new()
+    };
+    Discovery {
+        found: sets.into_iter().flat_map(|(_, s)| s).collect(),
+        tried,
+        dropped,
+    }
+}
+
+/// Where two sets of logs name the same sites (the same file names: a server
+/// in front and one behind it both logging each request), keep only the one
+/// written most recently. Returns the patterns left out.
+fn one_set_per_site(sets: &mut Vec<(String, Vec<LogSource>)>) -> Vec<String> {
+    struct Seen {
+        names: HashSet<std::ffi::OsString>,
+        newest: Option<std::time::SystemTime>,
+    }
+    let seen = |set: &[LogSource]| {
+        let mut s = Seen {
+            names: HashSet::new(),
+            newest: None,
+        };
+        for file in set
+            .iter()
+            .flat_map(|src| crate::watch::expand_glob(&src.glob))
+        {
+            let modified = std::fs::metadata(&file).and_then(|m| m.modified()).ok();
+            s.newest = s.newest.max(modified);
+            if let Some(name) = file.file_name() {
+                s.names.insert(name.to_os_string());
+            }
+        }
+        s
+    };
+    let mut kept: Vec<((String, Vec<LogSource>), Seen)> = Vec::new();
+    let mut dropped = Vec::new();
+    for set in sets.drain(..) {
+        let this = seen(&set.1);
+        let clash: Vec<usize> = kept
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, k))| !k.names.is_disjoint(&this.names))
+            .map(|(i, _)| i)
+            .collect();
+        let newest_kept = clash.iter().map(|&i| kept[i].1.newest).max().flatten();
+        if clash.is_empty() || this.newest > newest_kept {
+            for &i in clash.iter().rev() {
+                dropped.push(kept.remove(i).0.0);
+            }
+            kept.push((set, this));
+        } else {
+            dropped.push(set.0);
+        }
+    }
+    sets.extend(kept.into_iter().map(|(set, _)| set));
+    dropped
 }
 
 #[cfg(test)]
@@ -282,9 +347,48 @@ mod tests {
             globs(&apache),
             [format!("{root}/var/log/httpd/domains/*.log")]
         );
-        // When the server cannot be identified, read what exists.
+        // When the server cannot be identified (Varnish, HAProxy, Caddy in
+        // front), the two sets name the same sites: only the one written most
+        // recently is read, or every request would count twice.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let set_mtime = |rel: &str, t| {
+            fs::OpenOptions::new()
+                .append(true)
+                .open(dir.path().join(rel))
+                .unwrap()
+                .set_modified(t)
+                .unwrap();
+        };
+        set_mtime("var/log/httpd/domains/example.com.log", old);
         let unknown = discover(Listener::Unknown, root);
-        assert_eq!(unknown.found.len(), 2);
+        assert_eq!(
+            globs(&unknown),
+            [format!("{root}/var/log/nginx/domains/*.log")]
+        );
+        assert_eq!(
+            unknown.dropped,
+            [format!("{root}/var/log/httpd/domains/*.log")]
+        );
+        // Apache's set is the live one.
+        set_mtime(
+            "var/log/nginx/domains/example.com.log",
+            old - std::time::Duration::from_secs(60),
+        );
+        set_mtime(
+            "var/log/httpd/domains/example.com.log",
+            std::time::SystemTime::now(),
+        );
+        let unknown = discover(Listener::Unknown, root);
+        assert_eq!(
+            globs(&unknown),
+            [format!("{root}/var/log/httpd/domains/*.log")]
+        );
+        // Sets naming different sites are both read.
+        touch(dir.path(), "var/log/apache2/other.example_access.log");
+        let unknown = discover(Listener::Unknown, root);
+        assert_eq!(unknown.found.len(), 2, "{:?}", globs(&unknown));
+        // A known front server never drops anything.
+        assert!(discover(Listener::Nginx, root).dropped.is_empty());
     }
 
     #[test]
