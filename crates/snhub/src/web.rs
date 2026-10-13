@@ -261,22 +261,25 @@ fn alert_kind_vi(k: &str) -> &str {
             "Quá nhiều IP khớp quy tắc trong một lần quét; báo cáo chỉ liệt kê các IP truy cập nhiều nhất"
         }
         "rate_storm" => {
-            "Quá nhiều IP vượt ngưỡng truy cập cùng lúc: chỉ chặn IP vượt xa ngưỡng, còn lại chỉ báo (nghi ngưỡng quá thấp hoặc bị tấn công diện rộng)"
+            "Quá nhiều IP vượt ngưỡng truy cập cùng lúc: IP giống trình duyệt chỉ báo, flood bằng công cụ vẫn bị chặn (ngưỡng quá thấp, hoặc bot giả trình duyệt diện rộng: cần luật WAF)"
         }
         "proxy_in_logs" => {
-            "Một IP mang truy cập của rất nhiều trình duyệt trên nhiều website (nghi proxy/CDN chưa khai báo): không chặn vì vượt ngưỡng truy cập"
+            "Một IP mang truy cập của rất nhiều trình duyệt trên nhiều trang (nghi proxy/CDN chưa khai báo): vượt ngưỡng truy cập nhưng không chặn"
+        }
+        "attack_via_cloudflare" => {
+            "Có tấn công (dò mật khẩu, dò lỗ hổng, công cụ quét) đi qua IP Cloudflare: không chặn được trên VPS, hãy chặn bằng luật WAF ở Cloudflare"
         }
         "listener_unknown" => {
             "Không nhận ra web server đang nghe cổng 80/443: agent tự chọn log, nên đặt sources_mode = \"manual\""
         }
         "hub_ban_refused" => {
-            "VPS từ chối lệnh chặn từ hub vì IP được bảo vệ (whitelist, Cloudflare, IP của chính VPS, mạng nội bộ)"
+            "VPS từ chối lệnh chặn từ hub vì IP được bảo vệ ([fw] whitelist, IP của chính VPS hoặc hub, trusted_proxies, Cloudflare, mạng nội bộ)"
         }
         "config_misplaced" => {
             "agent.toml có khoá của [watch] nằm sai chỗ (dưới [[watch.sources]]) nên không có tác dụng"
         }
         "backlog_skipped" => {
-            "Đọc bù log tồn đọng (agent dừng một lúc): lần quét này không xét luật truy cập nhiều và quét 404"
+            "Đọc bù log tồn đọng sau khi agent dừng một lúc: lần quét này không xét luật truy cập nhiều và quét 404"
         }
         _ => k,
     }
@@ -2223,6 +2226,7 @@ mod tests {
             "hub_ban_refused",
             "config_misplaced",
             "backlog_skipped",
+            "attack_via_cloudflare",
         ] {
             assert_ne!(alert_kind_vi(k), k, "{k} has no label");
         }

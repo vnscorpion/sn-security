@@ -188,15 +188,23 @@ pub struct Discovery {
     pub found: Vec<LogSource>,
     /// Every pattern that was tried, for the "nothing found" message.
     pub tried: Vec<String>,
-    /// Patterns left out because another one names the same sites and was
-    /// written more recently (only when the web server is unknown).
+    /// Patterns left out because another one names the same sites (only when
+    /// the web server is unknown).
     pub dropped: Vec<String>,
+    /// The patterns kept, one per set (see `found`).
+    pub kept: Vec<String>,
 }
 
+/// How recently a set read last cycle must have been written to stay the one
+/// read, when another set names the same sites.
+const STICKY_SECS: u64 = 15 * 60;
+
 /// Look for the listener's log locations. `root` is put in front of every
-/// pattern: `""` in production, a temporary directory in tests.
+/// pattern: `""` in production, a temporary directory in tests. `prefer`: the
+/// patterns read last cycle, kept while they are still written when another
+/// set names the same sites.
 #[must_use]
-pub fn discover(listener: Listener, root: &str) -> Discovery {
+pub fn discover(listener: Listener, root: &str, prefer: &[String]) -> Discovery {
     // One set of sources per pattern that matched.
     let mut sets: Vec<(String, Vec<LogSource>)> = Vec::new();
     let mut tried = Vec::new();
@@ -228,11 +236,12 @@ pub fn discover(listener: Listener, root: &str) -> Discovery {
     // Not knowing which server is in front, both nginx's and Apache's logs may
     // be there, each request in both (and counted twice).
     let dropped = if listener == Listener::Unknown {
-        one_set_per_site(&mut sets)
+        one_set_per_site(&mut sets, prefer)
     } else {
         Vec::new()
     };
     Discovery {
+        kept: sets.iter().map(|(p, _)| p.clone()).collect(),
         found: sets.into_iter().flat_map(|(_, s)| s).collect(),
         tried,
         dropped,
@@ -240,9 +249,13 @@ pub fn discover(listener: Listener, root: &str) -> Discovery {
 }
 
 /// Where two sets of logs name the same sites (the same file names: a server
-/// in front and one behind it both logging each request), keep only the one
-/// written most recently. Returns the patterns left out.
-fn one_set_per_site(sets: &mut Vec<(String, Vec<LogSource>)>) -> Vec<String> {
+/// in front and one behind it both logging each request), keep only one: the
+/// one read last cycle (in `prefer`) while it is still written, else the one
+/// written most recently. A choice that flipped between two busy sets would
+/// start each newly chosen file at its end and read almost nothing. Returns
+/// the patterns left out.
+fn one_set_per_site(sets: &mut Vec<(String, Vec<LogSource>)>, prefer: &[String]) -> Vec<String> {
+    let now = std::time::SystemTime::now();
     struct Seen {
         names: HashSet<std::ffi::OsString>,
         newest: Option<std::time::SystemTime>,
@@ -264,6 +277,15 @@ fn one_set_per_site(sets: &mut Vec<(String, Vec<LogSource>)>) -> Vec<String> {
         }
         s
     };
+    // Read last cycle and written lately.
+    let sticky = |pattern: &str, s: &Seen| {
+        prefer.iter().any(|p| p == pattern)
+            && s.newest.is_some_and(|t| {
+                now.duration_since(t)
+                    .ok()
+                    .is_none_or(|age| age.as_secs() <= STICKY_SECS)
+            })
+    };
     let mut kept: Vec<((String, Vec<LogSource>), Seen)> = Vec::new();
     let mut dropped = Vec::new();
     for set in sets.drain(..) {
@@ -275,7 +297,12 @@ fn one_set_per_site(sets: &mut Vec<(String, Vec<LogSource>)>) -> Vec<String> {
             .map(|(i, _)| i)
             .collect();
         let newest_kept = clash.iter().map(|&i| kept[i].1.newest).max().flatten();
-        if clash.is_empty() || this.newest > newest_kept {
+        let this_sticky = sticky(&set.0, &this);
+        let kept_sticky = clash.iter().any(|&i| sticky(&kept[i].0.0, &kept[i].1));
+        let take = clash.is_empty()
+            || (this_sticky && !kept_sticky)
+            || (this_sticky == kept_sticky && this.newest > newest_kept);
+        if take {
             for &i in clash.iter().rev() {
                 dropped.push(kept.remove(i).0.0);
             }
@@ -337,12 +364,12 @@ mod tests {
         touch(dir.path(), "var/log/nginx/domains/example.com.log");
         touch(dir.path(), "var/log/httpd/domains/example.com.log");
 
-        let nginx = discover(Listener::Nginx, root);
+        let nginx = discover(Listener::Nginx, root, &[]);
         assert_eq!(
             globs(&nginx),
             [format!("{root}/var/log/nginx/domains/*.log")]
         );
-        let apache = discover(Listener::Apache, root);
+        let apache = discover(Listener::Apache, root, &[]);
         assert_eq!(
             globs(&apache),
             [format!("{root}/var/log/httpd/domains/*.log")]
@@ -360,7 +387,7 @@ mod tests {
                 .unwrap();
         };
         set_mtime("var/log/httpd/domains/example.com.log", old);
-        let unknown = discover(Listener::Unknown, root);
+        let unknown = discover(Listener::Unknown, root, &[]);
         assert_eq!(
             globs(&unknown),
             [format!("{root}/var/log/nginx/domains/*.log")]
@@ -378,17 +405,60 @@ mod tests {
             "var/log/httpd/domains/example.com.log",
             std::time::SystemTime::now(),
         );
-        let unknown = discover(Listener::Unknown, root);
+        let unknown = discover(Listener::Unknown, root, &[]);
         assert_eq!(
             globs(&unknown),
             [format!("{root}/var/log/httpd/domains/*.log")]
         );
         // Sets naming different sites are both read.
         touch(dir.path(), "var/log/apache2/other.example_access.log");
-        let unknown = discover(Listener::Unknown, root);
+        let unknown = discover(Listener::Unknown, root, &[]);
         assert_eq!(unknown.found.len(), 2, "{:?}", globs(&unknown));
         // A known front server never drops anything.
-        assert!(discover(Listener::Nginx, root).dropped.is_empty());
+        assert!(discover(Listener::Nginx, root, &[]).dropped.is_empty());
+    }
+
+    #[test]
+    fn the_set_read_last_cycle_stays_while_it_is_written() {
+        // Both nginx's and Apache's logs are written all the time behind an
+        // unrecognised front server; slow clients make either one the newer
+        // from one cycle to the next. A flipping choice would start each newly
+        // chosen file at its end and read almost nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        touch(dir.path(), "var/log/nginx/domains/example.com.log");
+        touch(dir.path(), "var/log/httpd/domains/example.com.log");
+        let nginx = format!("{root}/var/log/nginx/domains/*.log");
+        let httpd = format!("{root}/var/log/httpd/domains/*.log");
+        let set_age = |rel: &str, secs: u64| {
+            fs::OpenOptions::new()
+                .append(true)
+                .open(dir.path().join(rel))
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(secs))
+                .unwrap();
+        };
+        set_age("var/log/nginx/domains/example.com.log", 60);
+        set_age("var/log/httpd/domains/example.com.log", 5);
+        let d = discover(Listener::Unknown, root, std::slice::from_ref(&nginx));
+        assert_eq!(
+            (d.kept.clone(), d.dropped),
+            (vec![nginx.clone()], vec![httpd.clone()])
+        );
+        // With no earlier choice, the newest wins.
+        assert_eq!(
+            discover(Listener::Unknown, root, &[]).kept,
+            std::slice::from_ref(&httpd)
+        );
+        // The set read last cycle stopped being written: the live one takes over.
+        set_age("var/log/nginx/domains/example.com.log", STICKY_SECS + 60);
+        let d = discover(Listener::Unknown, root, std::slice::from_ref(&nginx));
+        assert_eq!(d.kept, std::slice::from_ref(&httpd));
+        // Whichever of the two was read last.
+        set_age("var/log/nginx/domains/example.com.log", 5);
+        set_age("var/log/httpd/domains/example.com.log", 60);
+        let d = discover(Listener::Unknown, root, std::slice::from_ref(&httpd));
+        assert_eq!((d.kept, d.dropped), (vec![httpd], vec![nginx]));
     }
 
     #[test]
@@ -399,7 +469,7 @@ mod tests {
         touch(dir.path(), "var/log/nginx/domains/example.com.error.log");
         touch(dir.path(), "var/log/nginx/domains/example.com.bytes");
         touch(dir.path(), "var/log/nginx/domains/example.com.log.gz");
-        let d = discover(Listener::Nginx, root);
+        let d = discover(Listener::Nginx, root, &[]);
         assert!(d.found.is_empty());
         // ...and the message can say where it looked.
         assert!(
@@ -429,7 +499,7 @@ mod tests {
         touch(dir.path(), "usr/local/lsws/logs/stderr.log");
         touch(dir.path(), "var/log/opanel-php/example.com/php_error.log");
 
-        let d = discover(Listener::LiteSpeed, root);
+        let d = discover(Listener::LiteSpeed, root, &[]);
         assert_eq!(
             globs(&d),
             [format!("{root}/var/log/openlitespeed/*access*.log")]
@@ -443,7 +513,7 @@ mod tests {
                 .all(|f| f.to_string_lossy().ends_with(".access.log"))
         );
         // Still found when the server could not be identified.
-        assert!(!discover(Listener::Unknown, root).found.is_empty());
+        assert!(!discover(Listener::Unknown, root, &[]).found.is_empty());
     }
 
     #[test]
@@ -453,7 +523,7 @@ mod tests {
         let root = dir.path().to_str().unwrap();
         touch(dir.path(), "var/log/nginx/example.com.access.log");
         touch(dir.path(), "var/log/nginx/example.com.error.log");
-        let d = discover(Listener::Nginx, root);
+        let d = discover(Listener::Nginx, root, &[]);
         assert_eq!(d.found.len(), 1);
         assert_eq!(crate::watch::expand_glob(&d.found[0].glob).len(), 1);
     }
@@ -493,7 +563,7 @@ mod tests {
         )
         .unwrap();
 
-        let d = discover(Listener::LiteSpeed, root);
+        let d = discover(Listener::LiteSpeed, root, &[]);
         assert_eq!(
             globs(&d),
             [format!(
@@ -506,7 +576,7 @@ mod tests {
                 .any(|t| t.ends_with("/home/*/logs/*access*log"))
         );
         // Apache looks there the same way (older layouts and other panels).
-        assert_eq!(globs(&discover(Listener::Apache, root)), globs(&d));
+        assert_eq!(globs(&discover(Listener::Apache, root, &[])), globs(&d));
 
         // The source names that one file, so a file created there later is not
         // read before it has been checked.
@@ -544,7 +614,7 @@ mod tests {
         .unwrap();
 
         for l in [Listener::Apache, Listener::Nginx, Listener::Unknown] {
-            let d = discover(l, root);
+            let d = discover(l, root, &[]);
             // Once, from where the server writes it; not again by the symlink.
             assert_eq!(
                 globs(&d),
@@ -561,11 +631,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_str().unwrap();
         touch(dir.path(), "var/log/httpd/domains/example.com.log");
-        assert_eq!(discover(Listener::Apache, root).found.len(), 1);
-        assert!(discover(Listener::Nginx, root).found.is_empty());
+        assert_eq!(discover(Listener::Apache, root, &[]).found.len(), 1);
+        assert!(discover(Listener::Nginx, root, &[]).found.is_empty());
         // The site moves to nginx: its logs appear and are picked up.
         touch(dir.path(), "var/log/nginx/domains/example.com.log");
-        assert_eq!(discover(Listener::Nginx, root).found.len(), 1);
+        assert_eq!(discover(Listener::Nginx, root, &[]).found.len(), 1);
     }
 
     #[test]

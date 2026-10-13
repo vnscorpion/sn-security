@@ -77,6 +77,20 @@ pub struct Meta {
     /// not be judged against a 5-minute threshold.
     #[serde(default)]
     pub last_cycle_ts: i64,
+    /// Cycles after a gap that may still be reading its backlog (see
+    /// `watch::decide::backlog_state`).
+    #[serde(default)]
+    pub gap_cycles_left: u32,
+    /// The mode the last watch cycle ran in (`None`: an agent from before this
+    /// field). Strikes are forgotten when it turns to enforce, whoever
+    /// switched it (the hub, or `mode` in agent.toml).
+    #[serde(default)]
+    pub last_mode: Option<Mode>,
+    /// Log patterns read last cycle when the web server in front was not
+    /// recognised and two sets named the same sites: kept while they are
+    /// still written, so the choice does not flip between cycles.
+    #[serde(default)]
+    pub log_sets: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -320,6 +334,18 @@ impl State {
 
     pub fn save_recent_admins(&self, a: &HashMap<String, i64>) -> Result<()> {
         atomic_write(&self.p("admins.json"), &serde_json::to_vec(a)?)
+    }
+
+    // ---- addresses the admin unbanned from the hub --------------------------
+
+    /// When each address was last unbanned from the hub: for a while after,
+    /// the volume rules only report it.
+    pub fn unbanned(&self) -> HashMap<String, i64> {
+        load_json(&self.p("unbanned.json"))
+    }
+
+    pub fn save_unbanned(&self, u: &HashMap<String, i64>) -> Result<()> {
+        atomic_write(&self.p("unbanned.json"), &serde_json::to_vec(u)?)
     }
 
     // ---- active bans ------------------------------------------------------

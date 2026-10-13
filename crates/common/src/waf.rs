@@ -58,11 +58,16 @@ fn is_plain(s: &str) -> bool {
 /// anything.
 const CRAWLER_TOKENS: &[&str] = &[
     "googlebot",
+    "adsbot-google",
+    "mediapartners-google",
+    "google-inspectiontool",
+    "googleother",
     "bingbot",
     "applebot",
     "yandex",
     "baiduspider",
     "duckduckbot",
+    "coccocbot",
     "facebookexternalhit",
     "semrushbot",
     "ahrefsbot",

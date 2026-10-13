@@ -25,7 +25,8 @@ k            = 5.0               # threshold multiplier over the baseline
 # ~5-minute cycle. Raised up to 4x for several browsers behind one address.
 min_requests = 300
 trusted_proxies = ["cloudflare"] # aliases "cloudflare", "quic.cloud" (embedded ranges); or list CIDRs
-protect_cloudflare = true        # never ban a Cloudflare address, whatever trusted_proxies says
+protect_cloudflare = true        # never ban a Cloudflare address that carries visitors (with "cloudflare"
+                                 # in trusted_proxies: never any); its attack hits are reported instead
 cpu_alert_pct = 85.0              # cpu_high alert when average CPU since the last cycle reaches this %
 bot_detection = true            # alert when ONE User-Agent / request shape floods in from many IPs
 bot_min_ips = 25                 # ...from at least this many distinct IPs in a cycle
@@ -39,6 +40,8 @@ bot_surge = 5.0                  # ...and at least this many times its usual vol
 whitelist = []
 max_bans_per_cycle = 200
 web_ports = [80, 443]            # HTTP-derived bans only touch these ports
+block_quic = true                # a ban also drops UDP 443 (HTTP/3); false if a VPN (OpenVPN,
+                                 # WireGuard) listens on UDP 443, or banned addresses lose it too
 
 [hunt]
 allowed_roots = ["/home", "/var/www"]

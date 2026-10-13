@@ -19,14 +19,27 @@ const CYCLE_SECS: i64 = 300;
 pub(super) const MAX_SPAN_JUDGED: i64 = 900;
 /// Spans are clamped to this before scaling.
 const MAX_SPAN: i64 = 3600;
-/// Dynamic requests in one cycle (ten a second) at or above which a `rate` hit
-/// bans even while the baseline is still learning.
+/// Dynamic requests on one site in one cycle (ten a second) at or above which
+/// a `rate` hit bans whatever else is known: while the baseline is still
+/// learning, from a proxy-looking address, and above any learned threshold
+/// (the threshold itself never goes past it).
 pub(super) const ABS_CEILING: u64 = 3000;
 /// More `rate` bans than this in one cycle is a storm: a threshold far too low
-/// for this traffic, or a wave too wide for address bans. Then only addresses
-/// at [`STORM_FACTOR`] times the threshold are banned; the rest are reported.
+/// for this traffic. Then the browser-looking and shared addresses under
+/// [`STORM_FACTOR`] times the threshold are only reported; floods from tools,
+/// libraries or no User-Agent are banned as usual.
 const RATE_STORM_BANS: usize = 20;
-pub(super) const STORM_FACTOR: u64 = 10;
+pub(super) const STORM_FACTOR: u64 = 3;
+/// Cycles after a gap that may still be reading its backlog (each read hit its
+/// byte cap): `rate` and `scanner` wait until the reads reach the end of the
+/// logs, but not longer than this, so a flood that keeps the reads capped is
+/// judged again soon.
+const GAP_CATCH_UP_CYCLES: u32 = 3;
+/// How long after the admin unbanned an address from the hub `rate` and
+/// `scanner` only report it (unless it passes the ceiling).
+pub(super) const UNBAN_GRACE_SECS: i64 = 6 * 3600;
+/// Most unbanned addresses remembered for that grace.
+const MAX_UNBANNED: usize = 10_000;
 
 /// Seconds of log this cycle covers: since the last cycle started, at least one
 /// interval, at most [`MAX_SPAN`]. One interval when there was no earlier cycle
@@ -41,7 +54,59 @@ pub(super) fn cycle_span(prev: i64, now: i64) -> i64 {
 
 /// A per-interval count scaled to a span of log.
 pub(super) fn scale(per_cycle: u64, span: i64) -> u64 {
-    per_cycle.saturating_mul(span.max(CYCLE_SECS) as u64) / CYCLE_SECS as u64
+    per_cycle.saturating_mul(span.clamp(CYCLE_SECS, MAX_SPAN) as u64) / CYCLE_SECS as u64
+}
+
+/// A count over a span of log brought back to one interval.
+pub(super) fn per_cycle(count: u64, span: i64) -> u64 {
+    count.saturating_mul(CYCLE_SECS as u64) / span.clamp(CYCLE_SECS, MAX_SPAN) as u64
+}
+
+/// Is this cycle's read a backlog, so `rate` and `scanner` are not judged? Only
+/// after a real gap: more than [`MAX_SPAN_JUDGED`] since the last cycle, or one
+/// of the next [`GAP_CATCH_UP_CYCLES`] cycles while the reads still hit their
+/// byte cap. A read cut short by a flood without a gap is judged: it covers
+/// less time than the span, so the thresholds only err on the high side.
+/// Returns `(backlog, catch-up cycles left after this one)`.
+pub(super) fn backlog_state(span: i64, catch_up: bool, left: u32) -> (bool, u32) {
+    let gap = span > MAX_SPAN_JUDGED;
+    let backlog = gap || left > 0;
+    let next = if !catch_up {
+        0
+    } else if gap {
+        GAP_CATCH_UP_CYCLES
+    } else {
+        left.saturating_sub(1)
+    };
+    (backlog, next)
+}
+
+/// Is `key` within the grace that follows an unban from the hub?
+pub(crate) fn unban_grace(unbanned: &HashMap<String, i64>, key: &str, now: i64) -> bool {
+    unbanned
+        .get(key)
+        .is_some_and(|at| *at <= now + 60 && now - at < UNBAN_GRACE_SECS)
+}
+
+/// Forget unbans past their grace, and keep at most [`MAX_UNBANNED`] (the
+/// most recent).
+pub(crate) fn prune_unbanned(unbanned: &mut HashMap<String, i64>, now: i64) {
+    unbanned.retain(|_, at| *at <= now + 60 && now - *at < UNBAN_GRACE_SECS);
+    if unbanned.len() > MAX_UNBANNED {
+        let mut by_age: Vec<(i64, String)> =
+            unbanned.iter().map(|(k, at)| (*at, k.clone())).collect();
+        by_age.sort_unstable_by(|a, b| b.cmp(a));
+        for (_, k) in by_age.into_iter().skip(MAX_UNBANNED) {
+            unbanned.remove(&k);
+        }
+    }
+}
+
+/// Keep the bans still running, and those that ended within the longest span
+/// a cycle judges: the log of the next cycle may still have been written
+/// while they were in force.
+pub(super) fn prune_active(active: &mut HashMap<String, ActiveBan>, now: i64) {
+    active.retain(|_, b| b.expires_ts > now - MAX_SPAN_JUDGED);
 }
 
 /// Report-only entries one report carries; the rest are only counted.
@@ -68,26 +133,37 @@ pub(super) struct Decisions {
     pub(super) storm: Option<(usize, usize)>,
 }
 
+/// What one cycle's decisions need besides the candidates.
+pub(super) struct Cycle {
+    /// Dynamic requests (per site) from which a `rate` hit is banned even in
+    /// a storm: [`STORM_FACTOR`] times the threshold.
+    pub(super) storm_floor: u64,
+    pub(super) ban_cap: usize,
+    pub(super) enforce: bool,
+    pub(super) now: i64,
+    /// Seconds of log this cycle covers.
+    pub(super) span: i64,
+}
+
 /// Decide what to do with `candidates`, busiest first and none of them
 /// protected. At most `ban_cap` bans (enforce stops there and raises
 /// `ban_cap`) and [`MAX_REPORT_ONLY`] report-only entries are listed, so
 /// however many addresses a flood brings the report stays small.
 ///
-/// More than [`RATE_STORM_BANS`] `rate` bans in one cycle is a storm: only those
-/// at `storm_floor` dynamic requests or more are applied, the rest reported. An
-/// address already banned for the same reason, or for longer than this offence
-/// asks, is left alone: its established connections keep showing up in the log
-/// for a while, and that is no new offence. Strikes change only in enforce mode,
-/// and only for the bans applied.
+/// More than [`RATE_STORM_BANS`] `rate` bans in one cycle is a storm: the
+/// browser-looking and shared ones under `storm_floor` are only reported. An
+/// address whose ban was in force during any of this cycle's stretch of log is
+/// left alone for the same reason, or when its ban lasts longer than this
+/// offence asks: its established connections kept showing up in the log while
+/// it was banned, and that is no new offence. Strikes change only in enforce
+/// mode, and only for the bans applied.
 pub(super) fn decide_bans(
     candidates: &[Candidate],
-    storm_floor: u64,
-    ban_cap: usize,
-    enforce: bool,
-    now: i64,
+    cy: &Cycle,
     strikes: &mut HashMap<String, Strike>,
     active: &mut HashMap<String, ActiveBan>,
 ) -> Decisions {
+    let (now, enforce, ban_cap) = (cy.now, cy.enforce, cy.ban_cap);
     let mut d = Decisions {
         applied: Vec::new(),
         would: Vec::new(),
@@ -97,23 +173,29 @@ pub(super) fn decide_bans(
     };
     let is_rate_ban = |h: &PatternHit| h.ban && h.reason == "rate";
     let far_over = |a: &IpAgg| {
-        a.site_dynamic() >= storm_floor
-            || a.requests >= storm_floor.saturating_mul(patterns::TOTAL_FACTOR)
+        a.site_dynamic() >= cy.storm_floor
+            || a.lines() >= cy.storm_floor.saturating_mul(patterns::TOTAL_FACTOR)
     };
+    // What a threshold set too low for this traffic bans: browsers and shared
+    // addresses. A flood from a tool, a library or no User-Agent is banned in a
+    // storm too.
     let rate_bans = candidates.iter().filter(|c| is_rate_ban(&c.hit)).count();
     let storm = rate_bans > RATE_STORM_BANS;
+    let held_back = |c: &Candidate| {
+        storm
+            && is_rate_ban(&c.hit)
+            && (c.agg.browser_looking() || !c.hit.escalate)
+            && !far_over(c.agg)
+    };
     if storm {
-        let kept = candidates
-            .iter()
-            .filter(|c| is_rate_ban(&c.hit) && far_over(c.agg))
-            .count();
-        d.storm = Some((kept, rate_bans - kept));
+        let held = candidates.iter().filter(|c| held_back(c)).count();
+        d.storm = Some((rate_bans - held, held));
     }
     let (mut banned, mut reported) = (0usize, 0usize);
     for c in candidates {
         let key = c.key;
         let mut hit = c.hit.clone();
-        if storm && is_rate_ban(&hit) && !far_over(c.agg) {
+        if held_back(c) {
             hit = PatternHit {
                 ttl_secs: 0,
                 ban: false,
@@ -141,8 +223,8 @@ pub(super) fn decide_bans(
             continue;
         }
         if let Some(b) = active.get(key.as_str())
-            && b.expires_ts > now
-            && (b.reason == hit.reason || hit.ttl_secs <= (b.expires_ts - now) as u64)
+            && b.expires_ts > now - cy.span
+            && (b.reason == hit.reason || hit.ttl_secs <= (b.expires_ts - now).max(0) as u64)
         {
             continue;
         }
@@ -185,7 +267,7 @@ pub(super) fn decide_bans(
 }
 
 /// Addresses whose `rate` hit was only reported because they look like a proxy
-/// or CDN edge (many browsers, several sites): the operator should know.
+/// or CDN edge (many rendering browsers): the operator should know.
 pub(super) fn proxy_keys(candidates: &[Candidate]) -> Vec<String> {
     candidates
         .iter()
@@ -290,17 +372,33 @@ pub(super) fn alert(kind: &str, severity: &str, message: String) -> Alert {
     }
 }
 
-/// Too many `rate` bans at once: most were held back as reports.
+/// Too many `rate` bans at once: the browser-looking ones were held back.
+/// Urgent: either the threshold is wrong for this traffic, or a wave of
+/// browser-looking addresses is under way that only a WAF rule can stop.
 pub(super) fn storm_alert(storm: Option<(usize, usize)>, threshold: u64) -> Option<Alert> {
     let (kept, held) = storm?;
     Some(alert(
         "rate_storm",
-        "warn",
+        "urgent",
         format!(
-            "{} addresses passed the request-rate threshold ({threshold} dynamic requests per site) in one cycle; only the {kept} at {STORM_FACTOR}x or more were banned, {held} only reported. The threshold may be too low for this traffic, or this is a wave too wide for address bans",
+            "{} addresses passed the request-rate threshold ({threshold} dynamic requests per site) in one cycle; {kept} were banned (floods from tools, libraries or no User-Agent, and anything at {STORM_FACTOR}x or more), {held} browser-looking or shared ones only reported. The threshold may be too low for this traffic, or this is a wave of browser-looking bots that needs a WAF rule",
             kept + held
         ),
     ))
+}
+
+/// The first few of `keys`, joined, with "..." when there are more.
+fn some_of(keys: &[String]) -> String {
+    let shown: Vec<&str> = keys.iter().take(5).map(String::as_str).collect();
+    format!(
+        "{}{}",
+        shown.join(", "),
+        if keys.len() > shown.len() {
+            ", ..."
+        } else {
+            ""
+        }
+    )
 }
 
 /// Proxy-looking addresses whose rate hit was only reported.
@@ -308,19 +406,31 @@ pub(super) fn proxy_alert(keys: &[String]) -> Option<Alert> {
     if keys.is_empty() {
         return None;
     }
-    let shown: Vec<&str> = keys.iter().take(5).map(String::as_str).collect();
     Some(alert(
         "proxy_in_logs",
         "warn",
         format!(
-            "{} address(es) carry many different browsers across several sites, like a proxy or CDN edge, and passed the request-rate threshold: {}{}. They were not banned (banning an edge cuts off everyone behind it). If it is a proxy, add its ranges to trusted_proxies so the real visitors are seen",
+            "{} address(es) carry many different browsers, like a proxy or CDN edge, and passed the request-rate threshold: {}. They were not banned (banning an edge cuts off everyone behind it). If it is a proxy, add its ranges to trusted_proxies so the real visitors are seen",
             keys.len(),
-            shown.join(", "),
-            if keys.len() > shown.len() {
-                ", ..."
-            } else {
-                ""
-            }
+            some_of(keys)
+        ),
+    ))
+}
+
+/// Attack patterns from Cloudflare addresses that carry visitors: never
+/// banned here (it would cut every visitor routed through that edge off), so
+/// the operator must stop them at Cloudflare or in the WAF.
+pub(super) fn cloudflare_alert(keys: &[String]) -> Option<Alert> {
+    if keys.is_empty() {
+        return None;
+    }
+    Some(alert(
+        "attack_via_cloudflare",
+        "warn",
+        format!(
+            "{} Cloudflare address(es) sent requests that match an attack rule (password guessing, probes, scanning tools): {}. A Cloudflare edge is not banned on the VPS, as every visitor behind it would be cut off; block the attacker in Cloudflare (WAF rule) or restore real visitor addresses (trusted_proxies with a log format that carries them)",
+            keys.len(),
+            some_of(keys)
         ),
     ))
 }
@@ -365,6 +475,14 @@ pub(super) fn unlisted_alert(unlisted: u64) -> Option<Alert> {
         ),
         severity: "warn".into(),
     })
+}
+
+/// What the baseline learns from one cycle: of the ordinary addresses (none
+/// that matched a rule or reached the bar, sorted busiest first), the third
+/// busiest, or the least busy of fewer. One or two flooders never set what is
+/// normal.
+pub(super) fn robust_busiest(desc: &[u64]) -> u64 {
+    desc.get(2).or(desc.last()).copied().unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -434,6 +552,8 @@ mod tests {
             ceiling: ABS_CEILING,
             volume: true,
             crawler: false,
+            span: CYCLE_SECS,
+            volume_exempt: false,
         }
     }
 
@@ -445,6 +565,16 @@ mod tests {
                 patterns::judge(agg, &ready(threshold)).map(|hit| Candidate { key, agg, hit })
             })
             .collect()
+    }
+
+    fn cycle(threshold: u64, ban_cap: usize, enforce: bool, now: i64) -> Cycle {
+        Cycle {
+            storm_floor: threshold * STORM_FACTOR,
+            ban_cap,
+            enforce,
+            now,
+            span: CYCLE_SECS,
+        }
     }
 
     /// What a page with a few `<img>` tags makes its visitor's browser send.
@@ -469,10 +599,7 @@ mod tests {
         let aggs = [a];
         decide_bans(
             &cands(&keys, &aggs, 300),
-            300 * STORM_FACTOR,
-            200,
-            enforce,
-            NOW,
+            &cycle(300, 200, enforce, NOW),
             strikes,
             active,
         )
@@ -533,39 +660,82 @@ mod tests {
         assert!(empty.is_empty());
     }
 
+    fn running(reason: &str, left: i64) -> ActiveBan {
+        ActiveBan {
+            reason: reason.into(),
+            expires_ts: NOW + left,
+            strike: 1,
+            layer: "l3".into(),
+        }
+    }
+
     #[test]
     fn an_address_already_banned_is_not_struck_again_for_the_same_thing() {
         // An office NAT banned at 09:00 keeps loading pages over its open
         // connections: the 09:05 log shows the same volume. No new strike.
         let flood = || agg(&[("/?s=x", 200, "curl/8.5", 400)]);
         let mut active: HashMap<String, ActiveBan> = HashMap::new();
-        let ban = |reason: &str, left: i64| ActiveBan {
-            reason: reason.into(),
-            expires_ts: NOW + left,
-            strike: 1,
-            layer: "l3".into(),
-        };
-        active.insert("198.51.100.7".into(), ban("rate", 300));
+        active.insert("198.51.100.7".into(), running("rate", 300));
         let mut strikes = HashMap::new();
         let d = decide_with(flood(), true, &mut strikes, &mut active);
         assert!(d.applied.is_empty() && d.to_add.is_empty());
         assert!(strikes.is_empty());
         // Nor while a longer admin ban from the hub is running.
-        active.insert("198.51.100.7".into(), ban("hub", 20 * 3600));
+        active.insert("198.51.100.7".into(), running("hub", 20 * 3600));
         assert!(
             decide_with(flood(), true, &mut strikes, &mut active)
                 .applied
                 .is_empty()
         );
         // A worse offence than the running ban still applies.
-        active.insert("198.51.100.7".into(), ban("rate", 300));
+        active.insert("198.51.100.7".into(), running("rate", 300));
         let probe = agg(&[("/.env", 404, "sqlmap/1.7", 1)]);
         let d = decide_with(probe, true, &mut strikes, &mut active);
         assert_eq!(d.applied[0].reason, "probe");
-        // Once the ban is over, a new offence counts again.
-        active.insert("198.51.100.7".into(), ban("rate", -1));
-        let d = decide_with(flood(), true, &mut HashMap::new(), &mut active);
+    }
+
+    #[test]
+    fn the_cycle_right_after_a_ban_ends_still_reads_the_log_of_its_last_minutes() {
+        // 09:00 banned for ten minutes. At 09:10 the ban has just ended, but
+        // the 09:05-09:10 log was written while it ran (keep-alive
+        // connections, accepted before the drop): no second strike for that.
+        let flood = || agg(&[("/?s=x", 200, "curl/8.5", 400)]);
+        let mut active: HashMap<String, ActiveBan> = HashMap::new();
+        let mut strikes = HashMap::new();
+        for ended in [0, 1, 100, CYCLE_SECS - 1] {
+            active.insert("198.51.100.7".into(), running("rate", -ended));
+            let d = decide_with(flood(), true, &mut strikes, &mut active);
+            assert!(d.applied.is_empty(), "ended {ended}s ago");
+        }
+        assert!(strikes.is_empty());
+        // The next cycle's log was written after the ban: a new offence.
+        active.insert("198.51.100.7".into(), running("rate", -CYCLE_SECS));
+        let d = decide_with(flood(), true, &mut strikes, &mut active);
         assert_eq!(d.applied[0].reason, "rate");
+        // A longer stretch of log reaches further back.
+        active.insert("198.51.100.7".into(), running("rate", -500));
+        let keys = ["198.51.100.7".to_string()];
+        let aggs = [flood()];
+        let long = Cycle {
+            span: 600,
+            ..cycle(300, 200, true, NOW)
+        };
+        let d = decide_bans(
+            &cands(&keys, &aggs, 300),
+            &long,
+            &mut HashMap::new(),
+            &mut active,
+        );
+        assert!(d.applied.is_empty());
+        // Kept in state that long, and no longer.
+        let mut a: HashMap<String, ActiveBan> = HashMap::new();
+        a.insert("ended".into(), running("rate", -(MAX_SPAN_JUDGED - 1)));
+        a.insert("long-gone".into(), running("rate", -MAX_SPAN_JUDGED));
+        a.insert("running".into(), running("rate", 60));
+        prune_active(&mut a, NOW);
+        let mut kept: Vec<&str> = a.keys().map(String::as_str).collect();
+        kept.sort_unstable();
+        assert_eq!(kept, ["ended", "running"]);
     }
 
     #[test]
@@ -613,42 +783,74 @@ mod tests {
     }
 
     #[test]
-    fn a_rate_storm_bans_only_the_worst_and_says_so() {
-        // 30 addresses over the rate threshold at once: the threshold is too low
-        // for this traffic, or a wave no address ban will stop.
-        let keys: Vec<String> = (0..31).map(|i| format!("203.0.113.{i}")).collect();
+    fn a_rate_storm_holds_back_only_browsers_and_still_bans_tool_floods() {
+        // Thirty browser-looking addresses over the threshold at once: the
+        // threshold is too low for this traffic, or a wave only a WAF stops.
+        let mut keys: Vec<String> = (0..31).map(|i| format!("203.0.113.{i}")).collect();
         let mut aggs: Vec<IpAgg> = (0..30)
-            .map(|_| agg(&[("/?s=x", 200, "curl/8.5", 400)]))
+            .map(|_| agg(&[("/?s=x", 200, BROWSER, 400)]))
             .collect();
         // One of them floods far harder.
-        aggs.push(agg(&[("/?s=x", 200, "curl/8.5", 3500)]));
+        aggs.push(agg(&[("/?s=x", 200, BROWSER, 1000)]));
+        // And five flood with curl and python: banned, storm or not.
+        for i in 0..5 {
+            keys.push(format!("198.51.100.{i}"));
+            let ua = if i % 2 == 0 {
+                "curl/8.5"
+            } else {
+                "python-requests/2.31"
+            };
+            aggs.push(agg(&[("/?s=x", 200, ua, 400)]));
+        }
         let c = cands(&keys, &aggs, 300);
+        assert_eq!(c.len(), 36);
         let (mut strikes, mut active) = (HashMap::new(), HashMap::new());
-        let d = decide_bans(&c, 3000, 200, true, NOW, &mut strikes, &mut active);
-        assert_eq!(d.applied.len(), 1);
-        assert_eq!(d.applied[0].ip, "203.0.113.30");
+        let d = decide_bans(&c, &cycle(300, 200, true, NOW), &mut strikes, &mut active);
+        let mut banned: Vec<&str> = d.applied.iter().map(|e| e.ip.as_str()).collect();
+        banned.sort_unstable();
+        assert_eq!(
+            banned,
+            [
+                "198.51.100.0",
+                "198.51.100.1",
+                "198.51.100.2",
+                "198.51.100.3",
+                "198.51.100.4",
+                "203.0.113.30"
+            ]
+        );
         assert_eq!(d.would.len(), 30);
         assert!(
             d.would
                 .iter()
-                .all(|e| e.reason == "rate" && e.layer == "report")
+                .all(|e| e.reason == "rate" && e.layer == "report" && e.ip.starts_with("203."))
         );
-        assert_eq!(d.storm, Some((1, 30)));
-        assert_eq!(strikes.len(), 1);
+        assert_eq!(d.storm, Some((6, 30)));
+        assert_eq!(strikes.len(), 6);
         let a = storm_alert(d.storm, 300).unwrap();
         assert_eq!(
             (a.kind.as_str(), a.severity.as_str()),
-            ("rate_storm", "warn")
+            ("rate_storm", "urgent")
         );
-        assert!(a.message.contains("31 addresses"), "{}", a.message);
+        assert!(a.message.contains("36 addresses"), "{}", a.message);
+        // A botnet of curl floods is no storm to hold back: every one banned.
+        let bots: Vec<String> = (0..40).map(|i| format!("192.0.2.{i}")).collect();
+        let floods: Vec<IpAgg> = (0..40)
+            .map(|_| agg(&[("/?s=x", 200, "curl/8.5", 350)]))
+            .collect();
+        let d = decide_bans(
+            &cands(&bots, &floods, 300),
+            &cycle(300, 200, true, NOW),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+        );
+        assert_eq!((d.applied.len(), d.would.len()), (40, 0));
+        assert_eq!(d.storm, Some((40, 0)));
         // Twenty is not yet a storm.
         let c = cands(&keys[..20], &aggs[..20], 300);
         let d = decide_bans(
             &c,
-            3000,
-            200,
-            true,
-            NOW,
+            &cycle(300, 200, true, NOW),
             &mut HashMap::new(),
             &mut HashMap::new(),
         );
@@ -669,10 +871,7 @@ mod tests {
             let mut strikes = HashMap::new();
             let d = decide_bans(
                 &candidates,
-                10_000,
-                5,
-                enforce,
-                0,
+                &cycle(1000, 5, enforce, 0),
                 &mut strikes,
                 &mut HashMap::new(),
             );
@@ -696,10 +895,7 @@ mod tests {
             let (mut strikes, mut active) = (HashMap::new(), HashMap::new());
             let d = decide_bans(
                 &candidates,
-                10_000,
-                5,
-                enforce,
-                0,
+                &cycle(1000, 5, enforce, 0),
                 &mut strikes,
                 &mut active,
             );
@@ -735,6 +931,7 @@ mod tests {
         // Ten minutes of log get twice the five-minute bar.
         assert_eq!(scale(300, 600), 600);
         assert_eq!(scale(300, CYCLE_SECS), 300);
+        assert_eq!(scale(10, 7200), 120, "at most an hour's worth");
         assert!(cycle_span(now - 7200, now) > MAX_SPAN_JUDGED);
         let a = backlog_alert(true, 7200).unwrap();
         assert_eq!(
@@ -742,6 +939,70 @@ mod tests {
             ("backlog_skipped", "info")
         );
         assert!(backlog_alert(false, 7200).is_none());
+    }
+
+    #[test]
+    fn a_flood_that_fills_the_read_is_judged_but_a_backlog_after_a_gap_is_not() {
+        // A flood big enough that this cycle's read hit its byte cap, with no
+        // gap before it: judged (the old code skipped `rate` for as long as
+        // the flood kept the reads capped).
+        assert_eq!(backlog_state(CYCLE_SECS, true, 0), (false, 0));
+        assert_eq!(backlog_state(CYCLE_SECS, false, 0), (false, 0));
+        // Two hours off: not judged, nor the next reads while they still
+        // catch up...
+        assert_eq!(backlog_state(7200, true, 0), (true, GAP_CATCH_UP_CYCLES));
+        assert_eq!(
+            backlog_state(CYCLE_SECS, true, GAP_CATCH_UP_CYCLES),
+            (true, GAP_CATCH_UP_CYCLES - 1)
+        );
+        // ...until a read reaches the end of the logs (that one still holds
+        // backlog)...
+        assert_eq!(backlog_state(CYCLE_SECS, false, 2), (true, 0));
+        assert_eq!(backlog_state(CYCLE_SECS, true, 0), (false, 0));
+        // ...or a few cycles have passed: a flood that keeps the reads capped
+        // after a gap is judged again soon.
+        let mut left = backlog_state(7200, true, 0).1;
+        let mut skipped = 1;
+        loop {
+            let (backlog, next) = backlog_state(CYCLE_SECS, true, left);
+            if !backlog {
+                break;
+            }
+            skipped += 1;
+            left = next;
+        }
+        assert_eq!(skipped, 1 + GAP_CATCH_UP_CYCLES);
+        // A gap with nothing more to read is one backlog cycle.
+        assert_eq!(backlog_state(7200, false, 0), (true, 0));
+    }
+
+    #[test]
+    fn an_unbanned_address_gets_a_grace_and_the_list_stays_small() {
+        let mut u: HashMap<String, i64> = HashMap::new();
+        u.insert("203.0.113.7".into(), NOW - 60);
+        u.insert("old".into(), NOW - UNBAN_GRACE_SECS);
+        u.insert("future".into(), NOW + 3600);
+        assert!(unban_grace(&u, "203.0.113.7", NOW));
+        assert!(!unban_grace(&u, "old", NOW));
+        assert!(!unban_grace(&u, "future", NOW), "a clock that jumped");
+        assert!(!unban_grace(&u, "198.51.100.1", NOW));
+        prune_unbanned(&mut u, NOW);
+        assert_eq!(u.keys().collect::<Vec<_>>(), ["203.0.113.7"]);
+        let mut u: HashMap<String, i64> = (0..MAX_UNBANNED as i64 + 10)
+            .map(|i| (format!("k{i}"), NOW - 1000 + i / 100))
+            .collect();
+        prune_unbanned(&mut u, NOW);
+        assert_eq!(u.len(), MAX_UNBANNED);
+        assert!(u.contains_key(&format!("k{}", MAX_UNBANNED + 9)));
+    }
+
+    #[test]
+    fn the_baseline_learns_from_ordinary_addresses_not_the_busiest_one() {
+        assert_eq!(robust_busiest(&[]), 0);
+        assert_eq!(robust_busiest(&[40]), 40);
+        assert_eq!(robust_busiest(&[90, 40]), 40);
+        // Two flooders just under the bar do not set what is normal.
+        assert_eq!(robust_busiest(&[2900, 2800, 35, 20, 3]), 35);
     }
 
     #[test]
@@ -754,5 +1015,10 @@ mod tests {
         assert_eq!(a.kind, "proxy_in_logs");
         assert!(a.message.contains("trusted_proxies"));
         assert!(proxy_alert(&[]).is_none());
+        let keys: Vec<String> = (0..7).map(|i| format!("104.16.0.{i}")).collect();
+        let a = cloudflare_alert(&keys).unwrap();
+        assert_eq!(a.kind, "attack_via_cloudflare");
+        assert!(a.message.contains("104.16.0.4, ...") && !a.message.contains("104.16.0.5"));
+        assert!(cloudflare_alert(&[]).is_none());
     }
 }

@@ -10,14 +10,15 @@ pub mod decide;
 pub mod patterns;
 pub mod tail;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use snsec_common::logfmt::{self, LogFormat, LogLine};
 use snsec_common::net::{self, Cidr};
 use snsec_common::ranges;
-use snsec_common::schema::{Alert, CycleStats, IpCount};
+use snsec_common::schema::{Alert, CycleStats, IpCount, Mode};
 
 use crate::config::{Config, LogSource, SourcesMode};
 use crate::discover;
@@ -28,11 +29,12 @@ use crate::whitelist;
 
 use baseline::Baseline;
 use decide::{
-    ABS_CEILING, Candidate, Decisions, MAX_SPAN_JUDGED, STORM_FACTOR, alert, backlog_alert,
-    cycle_span, decide_bans, misplaced_alert, proxy_alert, proxy_keys, prune_strikes, scale,
-    storm_alert, unlisted_alert,
+    ABS_CEILING, Candidate, Cycle, Decisions, STORM_FACTOR, alert, backlog_alert, backlog_state,
+    cloudflare_alert, cycle_span, decide_bans, misplaced_alert, per_cycle, proxy_alert, proxy_keys,
+    prune_active, prune_strikes, prune_unbanned, robust_busiest, scale, storm_alert, unban_grace,
+    unlisted_alert,
 };
-use patterns::{IpAgg, Judge};
+use patterns::{IpAgg, Judge, PatternHit};
 
 /// Per-cycle, in-memory result before we decide bans.
 struct CycleData {
@@ -55,8 +57,7 @@ struct CycleData {
     first_refused: Option<String>,
     /// What the dynamic requests looked like (User-Agents, request shapes).
     bots: bots::Aggregates,
-    /// A read hit its byte cap, so this cycle holds more than one cycle's worth
-    /// of traffic.
+    /// A read hit its byte cap, so the logs hold more than this cycle read.
     catch_up: bool,
 }
 
@@ -71,7 +72,11 @@ impl CycleData {
     }
 }
 
-const MAX_TRACKED_IPS: usize = 100_000;
+/// Addresses (IPv6 /64s) tracked per cycle. With at most about a kilobyte per
+/// address however it is used (see `patterns::IpAgg`), the worst case stays
+/// well inside sn-watch's 192 MB memory limit; past it, new addresses only
+/// count in the cycle's totals (and the report says `overload`).
+const MAX_TRACKED_IPS: usize = 50_000;
 const MAX_BYTES_PER_FILE: u64 = 64 * 1024 * 1024;
 /// Total log bytes a single cycle will parse before stopping (offsets still
 /// advance so the next cycle resumes). Bounds worst-case cycle time under flood.
@@ -90,6 +95,17 @@ pub struct Options {
     pub force: bool,
 }
 
+/// The same hit, only reported.
+fn report_only(hit: PatternHit) -> PatternHit {
+    PatternHit {
+        ttl_secs: 0,
+        ban: false,
+        escalate: false,
+        ttl_cap: 0,
+        ..hit
+    }
+}
+
 pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<()> {
     let _ = opts.force;
     if let Some(path) = &opts.replay {
@@ -99,94 +115,141 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<()> {
     let started = util::now_secs();
     let start_ms = util::now_millis();
     let trusted = cfg.trusted_cidrs();
-    // The trusted proxies and (unless switched off) every Cloudflare range.
+    // Never banned here: the trusted proxies and, unless switched off,
+    // Cloudflare (one that carries a single client aside, see below).
     let never_ban = cfg.never_ban_cidrs();
     let conns = netstat::all();
     let wl = whitelist::build(cfg, &conns, Some(state));
+    let meta = state.meta();
 
     // How much log this cycle covers: since the last one started.
-    let prev_cycle = match state.meta().last_cycle_ts {
+    let prev_cycle = match meta.last_cycle_ts {
         0 => state.cpu_sample().at, // the first cycle of an upgraded agent
         t => t,
     };
     let span = cycle_span(prev_cycle, started);
-    state.update_meta(|m| m.last_cycle_ts = started)?;
+    // Effective mode: the hub-pushed override (if any) wins over local config.
+    let effective_mode = meta.mode_override.unwrap_or(cfg.watch.mode);
+    let enforce = effective_mode == Mode::Enforce;
+    state.update_meta(|m| {
+        m.last_cycle_ts = started;
+        m.last_mode = Some(effective_mode);
+    })?;
 
     // Work out which logs to follow (detected each cycle), then read them.
-    let resolved = resolve_sources(cfg, &conns);
-    let data = collect(state, &trusted, &resolved.sources)?;
-    // A backlog: the agent was off a while, or a read hit its byte cap.
-    let backlog = data.catch_up || span > MAX_SPAN_JUDGED;
-    let protected = |k: &str| whitelist::key_protected(k, &wl, &never_ban);
-
-    // The busiest address's dynamic requests on one site, for the baseline:
-    // not a protected address, nor a search crawler (its volume is its own).
-    let busiest = {
-        let mut by_volume: Vec<(u64, &String)> = data
-            .per_ip
-            .iter()
-            .map(|(k, a)| (a.site_dynamic(), k))
-            .filter(|(n, _)| *n > 0)
-            .collect();
-        by_volume.sort_unstable_by(|a, b| b.cmp(a));
-        by_volume
-            .into_iter()
-            .find(|(_, k)| !protected(k) && crawler_of(k).is_none())
-            .map_or(0, |(n, _)| n)
+    let resolved = resolve_sources(cfg, &conns, &meta.log_sets);
+    let data = collect(
+        state,
+        &trusted,
+        wl.own_addrs(),
+        &resolved.sources,
+        &resolved.dropped,
+    )?;
+    // A backlog after a gap: `rate` and `scanner` are not judged on it.
+    let (backlog, gap_left) = backlog_state(span, data.catch_up, meta.gap_cycles_left);
+    let log_sets = if resolved.dropped.is_empty() {
+        Vec::new()
+    } else {
+        resolved.kept.clone()
     };
+    state.update_meta(|m| {
+        m.gap_cycles_left = gap_left;
+        if m.log_sets != log_sets {
+            m.log_sets = log_sets;
+        }
+    })?;
+    let protected = |k: &str| whitelist::key_protected(k, &wl, &never_ban);
 
     let slot = baseline::slot_of(started);
     let mut base: Baseline = load_baseline(state);
-    // Only a cycle of ordinary traffic teaches it anything: not an idle one,
-    // not a backlog after a gap.
-    if data.lines_read > 0 && busiest > 0 && !backlog {
-        base.observe(slot, busiest);
-        save_baseline(state, &base);
-    }
+    let ceiling = scale(ABS_CEILING, span);
+    let floor = scale(u64::from(cfg.watch.min_requests), span);
+    // Never above the ceiling (unless the configured floor is): however the
+    // baseline was fed, ten dynamic requests a second on one site is a flood.
     let threshold = scale(
         base.threshold(slot, cfg.watch.k, cfg.watch.min_requests),
         span,
-    );
+    )
+    .min(ceiling.max(floor));
     let baseline_ready = base.ready(slot);
     let judge = Judge {
         threshold,
         baseline_ready,
-        ceiling: scale(ABS_CEILING, span),
+        ceiling,
         volume: !backlog,
         crawler: false,
+        span,
+        volume_exempt: false,
     };
 
     // Decide bans.
     let mut strikes = state.strikes();
+    // Start enforcing with a clean slate, whoever switched the mode (the hub,
+    // or `mode` in agent.toml): offences counted before (an older agent
+    // counted them in observe mode too, and wrote them without `rate_only`)
+    // must not make the first real bans long.
+    if enforce && meta.last_mode != Some(Mode::Enforce) {
+        strikes.clear();
+    }
     let mut active = state.bans();
-    // Effective mode: the hub-pushed override (if any) wins over local config.
-    let effective_mode = state.meta().mode_override.unwrap_or(cfg.watch.mode);
-    let enforce = effective_mode == snsec_common::schema::Mode::Enforce;
+    let mut unbanned = state.unbanned();
+    let unbanned_before = unbanned.len();
+    prune_unbanned(&mut unbanned, started);
 
-    let mut candidates: Vec<Candidate> = data
-        .per_ip
-        .iter()
-        .filter_map(|(key, agg)| {
-            let hit = patterns::judge(agg, &judge)?;
-            if protected(key) {
-                return None;
+    // Addresses that matched anything (left out of what the baseline learns),
+    // the candidates, and Cloudflare addresses that sent attack traffic.
+    let mut matched: HashSet<&String> = HashSet::new();
+    let mut candidates: Vec<Candidate> = Vec::new();
+    let mut via_cloudflare: Vec<String> = Vec::new();
+    for (key, agg) in &data.per_ip {
+        let Some(hit) = patterns::judge(agg, &judge) else {
+            continue;
+        };
+        matched.insert(key);
+        // A crawler, a panel or FTP session, an address the admin unbanned a
+        // little while ago: only ever judged more leniently, so only an
+        // address that matched something needs looking up.
+        let lenient = Judge {
+            crawler: crawler_of(key).is_some(),
+            volume_exempt: wl.session_peer(key) || unban_grace(&unbanned, key, started),
+            ..judge
+        };
+        let hit = if lenient.crawler || lenient.volume_exempt {
+            match patterns::judge(agg, &lenient) {
+                Some(h) => h,
+                None => continue,
             }
-            // A crawler is only ever judged more leniently, so only an address
-            // that matched something needs looking up.
-            let hit = if crawler_of(key).is_some() {
-                patterns::judge(
-                    agg,
-                    &Judge {
-                        crawler: true,
-                        ..judge
-                    },
-                )?
-            } else {
-                hit
+        } else {
+            hit
+        };
+        if protected(key) {
+            let Some(net) = Cidr::parse(key) else {
+                continue;
             };
-            Some(Candidate { key, agg, hit })
-        })
-        .collect();
+            let cloudflare = ranges::is_cloudflare(net.addr) && !wl.protects_net(net);
+            if !cloudflare {
+                continue;
+            }
+            let trusted_edge = trusted.iter().any(|c| c.overlaps(&net));
+            if trusted_edge || agg.clients() >= 2 {
+                // An edge that carries visitors: never banned here. Attack
+                // traffic through it is reported, for a rule at Cloudflare.
+                if hit.ban && hit.reason != "rate" {
+                    via_cloudflare.push(key.clone());
+                    candidates.push(Candidate {
+                        key,
+                        agg,
+                        hit: report_only(hit),
+                    });
+                }
+                continue;
+            }
+            // A Cloudflare address with one client that is no trusted proxy
+            // here (a Worker, say): judged like any other.
+        }
+        candidates.push(Candidate { key, agg, hit });
+    }
+    via_cloudflare.sort_unstable();
     // Stable order: busiest first, so the per-cycle cap keeps the worst.
     candidates.sort_by(|a, b| b.agg.requests.cmp(&a.agg.requests).then(a.key.cmp(b.key)));
     let proxies = proxy_keys(&candidates);
@@ -198,13 +261,47 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<()> {
         storm,
     } = decide_bans(
         &candidates,
-        threshold.saturating_mul(STORM_FACTOR),
-        cfg.fw.max_bans_per_cycle as usize,
-        enforce,
-        started,
+        &Cycle {
+            storm_floor: threshold.saturating_mul(STORM_FACTOR),
+            ban_cap: cfg.fw.max_bans_per_cycle as usize,
+            enforce,
+            now: started,
+            span,
+        },
         &mut strikes,
         &mut active,
     );
+
+    // What the baseline learns: only a cycle of ordinary traffic (not an idle
+    // one, not a backlog after a gap, not a read cut short by a flood), and
+    // from it the third busiest of the addresses that matched nothing, stayed
+    // under the bar, are not protected and are no verified crawler.
+    if data.lines_read > 0 && !backlog && !data.catch_up {
+        let mut quiet: Vec<(u64, &String)> = data
+            .per_ip
+            .iter()
+            .filter(|(k, _)| !matched.contains(k))
+            .map(|(k, a)| (a.site_dynamic(), k))
+            .filter(|(n, _)| *n > 0 && *n < threshold)
+            .collect();
+        quiet.sort_unstable_by(|a, b| b.cmp(a));
+        let ordinary: Vec<u64> = quiet
+            .into_iter()
+            .filter(|(_, k)| !protected(k) && crawler_of(k).is_none())
+            .take(3)
+            .map(|(n, _)| n)
+            .collect();
+        let value = robust_busiest(&ordinary);
+        if value > 0 {
+            base.learn(
+                slot,
+                per_cycle(value, span),
+                cfg.watch.k,
+                cfg.watch.min_requests,
+            );
+            save_baseline(state, &base);
+        }
+    }
 
     let over_cap = applied.len() >= cfg.fw.max_bans_per_cycle as usize;
 
@@ -212,9 +309,8 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<()> {
     // accepted by the firewall before any ban rule.
     if enforce {
         if fw::available() {
-            let mut white = wl.keys();
-            white.extend(whitelist::cidr_keys(&never_ban));
-            if let Err(e) = fw::prepare(&cfg.fw.web_ports, &white) {
+            let white = wl.keys(&trusted);
+            if let Err(e) = fw::prepare(&cfg.fw.web_ports, cfg.fw.block_quic, &white) {
                 eprintln!("watch: preparing the firewall: {e:#}");
             }
             if let Err(e) = fw::apply_bans(&to_add, &[]) {
@@ -225,12 +321,16 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<()> {
         }
     }
 
-    // Prune expired bans from state (nft expires its own).
+    // Prune bans from state (nft expires its own), keeping those that ended
+    // within the stretch of log the next cycle may still read.
     let now = started;
-    active.retain(|_, b| b.expires_ts > now);
+    prune_active(&mut active, now);
     state.save_bans(&active)?;
     prune_strikes(&mut strikes, now);
     state.save_strikes(&strikes)?;
+    if unbanned.len() != unbanned_before {
+        state.save_unbanned(&unbanned)?;
+    }
 
     // Build cycle stats + top IPs.
     let top_ips = top_ips(&data);
@@ -274,8 +374,9 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<()> {
     // Distributed bots: one User-Agent or request shape from many addresses.
     // Only a cycle that looks like ordinary traffic is judged and learned from:
     // not one with no lines, not a catch-up read after the agent was off (hours
-    // of traffic in one cycle look like a surge of everything).
-    let representative = data.lines_read > 0 && !backlog && !cpu_now.gap;
+    // of traffic in one cycle look like a surge of everything), not one cut
+    // short by its byte cap.
+    let representative = data.lines_read > 0 && !backlog && !data.catch_up && !cpu_now.gap;
     let mut base_bots = state.bot_baseline();
     let (flagged_ua, flagged_shape) = if cfg.watch.bot_detection && representative {
         let verdict = bots::assess(
@@ -326,6 +427,7 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<()> {
     alerts.extend(unlisted_alert(unlisted));
     alerts.extend(storm_alert(storm, threshold));
     alerts.extend(proxy_alert(&proxies));
+    alerts.extend(cloudflare_alert(&via_cloudflare));
     alerts.extend(backlog_alert(backlog && data.lines_read > 0, span));
     alerts.extend(misplaced_alert(&cfg.misplaced_keys()));
     let web_listening = conns
@@ -348,7 +450,7 @@ fn listener_alert(resolved: &Resolved, files: u32, web_listening: bool) -> Optio
         String::new()
     } else {
         format!(
-            "; of log sets that name the same sites only the most recently written is read, left out: {}",
+            "; of log sets that name the same sites only one is read (the one read before, while it is written; else the newest), left out: {}",
             resolved.dropped.join(", ")
         )
     };
@@ -361,7 +463,25 @@ fn listener_alert(resolved: &Resolved, files: u32, web_listening: bool) -> Optio
     ))
 }
 
-fn collect(state: &State, trusted: &[Cidr], sources: &[LogSource]) -> Result<CycleData> {
+/// Is this request's client one to leave out entirely: loopback, or one of
+/// this VPS's own addresses (its cron, loopback and cache-preload requests
+/// over its public address)?
+fn not_a_visitor(ip: IpAddr, own: &[IpAddr]) -> bool {
+    let ip = net::normalize(ip);
+    ip.is_loopback() || own.contains(&ip)
+}
+
+/// Read the new lines of every log in `sources` and count them per address.
+/// `own`: this VPS's (and the hub's) addresses, not counted. `dropped`: log
+/// patterns left out this cycle (another set names the same sites): their
+/// files are moved to their end, so a later switch to them starts from now.
+fn collect(
+    state: &State,
+    trusted: &[Cidr],
+    own: &[IpAddr],
+    sources: &[LogSource],
+    dropped: &[String],
+) -> Result<CycleData> {
     let mut offsets = state.offsets();
     let mut data = CycleData {
         per_ip: HashMap::new(),
@@ -381,11 +501,11 @@ fn collect(state: &State, trusted: &[Cidr], sources: &[LogSource]) -> Result<Cyc
     let mut total_bytes: u64 = 0;
     // Files matched this cycle, readable or not; `cut_short` when the byte
     // budget ended the cycle before the last of them.
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     let mut cut_short = false;
     // Each log file is a site of its own (panels write one per vhost), unless
     // the format names the vhost.
-    let mut file_no: u64 = 0;
+    let mut file_no: u32 = 0;
 
     'outer: for src in sources {
         let fmt = LogFormat::from_str_opt(&src.format).unwrap_or(LogFormat::Combined);
@@ -396,7 +516,7 @@ fn collect(state: &State, trusted: &[Cidr], sources: &[LogSource]) -> Result<Cyc
                 break 'outer; // offsets already saved advance next cycle
             }
             data.files_matched += 1;
-            file_no += 1;
+            file_no = file_no.wrapping_add(1);
             let key = path.to_string_lossy().to_string();
             seen.insert(key.clone());
             let prev = offsets.get(&key).copied();
@@ -430,7 +550,7 @@ fn collect(state: &State, trusted: &[Cidr], sources: &[LogSource]) -> Result<Cyc
                 data.lines_read += 1;
                 match logfmt::parse_line(fmt, line, trusted) {
                     Some(parsed) => {
-                        if parsed.client.is_loopback() {
+                        if not_a_visitor(parsed.client, own) {
                             continue;
                         }
                         data.requests += 1;
@@ -455,14 +575,30 @@ fn collect(state: &State, trusted: &[Cidr], sources: &[LogSource]) -> Result<Cyc
                         // format that breaks a line must not hide its sender
                         // from the rate check.
                         if let Some(ip) = logfmt::leading_ip(line)
-                            && !ip.is_loopback()
+                            && !not_a_visitor(ip, own)
                             && !net::in_any(trusted, ip)
                             && let Some(agg) = data.track(net::ban_key(ip))
                         {
-                            agg.observe_unparsed();
+                            agg.observe_unparsed(file_no);
                         }
                     }
                 }
+            }
+        }
+    }
+
+    // The log sets left out this cycle: at their end now, so that if they are
+    // read again later they start from there (not from where they were left
+    // long ago, and not from their end then, losing what came between).
+    for glob in dropped {
+        for path in expand_glob(glob) {
+            let key = path.to_string_lossy().to_string();
+            if seen.contains(&key) {
+                continue;
+            }
+            if let Ok(at) = tail::offset_at_end(&path) {
+                offsets.insert(key.clone(), at);
+                seen.insert(key);
             }
         }
     }
@@ -481,11 +617,11 @@ fn collect(state: &State, trusted: &[Cidr], sources: &[LogSource]) -> Result<Cyc
 /// The site a request counts on: its vhost where the log format names it,
 /// else the log file it was read from (`file_no`), which on a panel is one per
 /// vhost. The two kinds of id never meet.
-fn site_of(line: &LogLine, file_no: u64) -> u64 {
+fn site_of(line: &LogLine, file_no: u32) -> u32 {
     if line.host.is_empty() {
-        file_no
+        file_no & !(1 << 31)
     } else {
-        bots::hash64(line.host.to_ascii_lowercase().as_bytes()) | (1 << 63)
+        bots::hash64(line.host.to_ascii_lowercase().as_bytes()) as u32 | (1 << 31)
     }
 }
 
@@ -499,6 +635,8 @@ pub struct Resolved {
     /// Log sets left out because another set names the same sites (an
     /// unrecognised front server, where both nginx's and Apache's logs exist).
     pub dropped: Vec<String>,
+    /// The patterns read (auto mode), remembered when some were left out.
+    pub kept: Vec<String>,
 }
 
 /// What the config file lists explicitly (`sources`, or the older `logs`).
@@ -517,7 +655,8 @@ fn configured_sources(cfg: &Config) -> Vec<LogSource> {
 /// web server and reads its logs, which is what makes one agent build work on
 /// every panel and keeps working after a web-server switch. The explicit sources
 /// in the config are only a fallback there. `manual` uses them and nothing else.
-fn resolve_sources(cfg: &Config, conns: &[netstat::Conn]) -> Resolved {
+/// `prefer`: the log sets read last cycle (see `discover::discover`).
+fn resolve_sources(cfg: &Config, conns: &[netstat::Conn], prefer: &[String]) -> Resolved {
     let configured = configured_sources(cfg);
     match cfg.watch.sources_mode {
         SourcesMode::Manual => Resolved {
@@ -525,10 +664,11 @@ fn resolve_sources(cfg: &Config, conns: &[netstat::Conn]) -> Resolved {
             sources: configured,
             listener: None,
             dropped: Vec::new(),
+            kept: Vec::new(),
         },
         SourcesMode::Auto => {
             let listener = discover::detect_listener(conns);
-            let found = discover::discover(listener, "");
+            let found = discover::discover(listener, "", prefer);
             let mut tried = found.tried;
             if found.found.is_empty() {
                 // Nothing at the usual places: fall back to whatever is configured.
@@ -538,6 +678,7 @@ fn resolve_sources(cfg: &Config, conns: &[netstat::Conn]) -> Resolved {
                     tried,
                     listener: Some(listener),
                     dropped: Vec::new(),
+                    kept: Vec::new(),
                 }
             } else {
                 Resolved {
@@ -545,6 +686,7 @@ fn resolve_sources(cfg: &Config, conns: &[netstat::Conn]) -> Resolved {
                     tried,
                     listener: Some(listener),
                     dropped: found.dropped,
+                    kept: found.kept,
                 }
             }
         }
@@ -585,7 +727,9 @@ fn is_access_log_candidate(path: &Path) -> bool {
 /// What is being followed right now, for `sn env`: how it was chosen, and the
 /// files each source matches.
 pub fn describe_sources(cfg: &Config) -> (Resolved, Vec<(LogSource, Vec<PathBuf>)>) {
-    let resolved = resolve_sources(cfg, &netstat::all());
+    // The sets the watch cycles have been reading, as they would pick again.
+    let prefer = State::open().map(|s| s.meta().log_sets).unwrap_or_default();
+    let resolved = resolve_sources(cfg, &netstat::all(), &prefer);
     let files = resolved
         .sources
         .iter()
@@ -689,9 +833,9 @@ fn top_ips(data: &CycleData) -> Vec<IpCount> {
         .iter()
         .map(|(k, a)| IpCount {
             ip: k.clone(),
-            requests: a.requests,
-            err4xx: a.err4xx,
-            sensitive_posts: a.login_posts + a.xmlrpc_posts,
+            requests: u64::from(a.requests),
+            err4xx: u64::from(a.err4xx),
+            sensitive_posts: u64::from(a.login_posts) + u64::from(a.xmlrpc_posts),
         })
         .collect();
     v.sort_by_key(|a| std::cmp::Reverse(a.requests));
@@ -834,6 +978,8 @@ fn replay(cfg: &Config, path: &PathBuf) -> Result<()> {
         ceiling: ABS_CEILING,
         volume: true,
         crawler: false,
+        span: 300,
+        volume_exempt: false,
     };
     let never_ban = cfg.never_ban_cidrs();
     let mut bans = 0u64;
@@ -858,7 +1004,7 @@ fn replay(cfg: &Config, path: &PathBuf) -> Result<()> {
                 agg.requests,
                 agg.dynamic(),
                 agg.err404,
-                agg.login_posts + agg.xmlrpc_posts
+                u64::from(agg.login_posts) + u64::from(agg.xmlrpc_posts)
             );
         }
     }
@@ -1028,18 +1174,18 @@ mod tests {
             std::fs::write(p, "x\n").unwrap();
             std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o644)).unwrap();
         }
-        collect(&state, &[], &src).unwrap();
+        collect(&state, &[], &[], &src, &[]).unwrap();
         assert_eq!(state.offsets().len(), 2);
 
         // A file that cannot be read this cycle keeps its place.
         std::fs::set_permissions(&a, std::fs::Permissions::from_mode(0o666)).unwrap();
-        let d = collect(&state, &[], &src).unwrap();
+        let d = collect(&state, &[], &[], &src, &[]).unwrap();
         assert_eq!(d.unreadable, 1);
         assert_eq!(state.offsets().len(), 2);
 
         // A file no glob matches any more is forgotten.
         std::fs::remove_file(&b).unwrap();
-        collect(&state, &[], &src).unwrap();
+        collect(&state, &[], &[], &src, &[]).unwrap();
         let keys: Vec<String> = state.offsets().into_keys().collect();
         assert_eq!(keys, [a.to_string_lossy().to_string()]);
     }
@@ -1070,6 +1216,7 @@ mod tests {
             tried: Vec::new(),
             listener,
             dropped,
+            kept: Vec::new(),
         };
         let unknown = resolved(
             Some(discover::Listener::Unknown),
@@ -1111,7 +1258,7 @@ mod tests {
             std::fs::write(p, "").unwrap();
             std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o644)).unwrap();
         }
-        collect(&state, &[], &src).unwrap();
+        collect(&state, &[], &[], &src, &[]).unwrap();
         for p in &sites {
             let mut f = std::fs::OpenOptions::new().append(true).open(p).unwrap();
             for i in 0..200 {
@@ -1122,7 +1269,7 @@ mod tests {
                 .unwrap();
             }
         }
-        let d = collect(&state, &[], &src).unwrap();
+        let d = collect(&state, &[], &[], &src, &[]).unwrap();
         let a = &d.per_ip["203.0.113.9"];
         assert_eq!((a.dynamic(), a.site_dynamic()), (400, 200));
         // A format that names the vhost counts by vhost instead.
@@ -1163,7 +1310,7 @@ mod tests {
             std::fs::write(p, "x\n").unwrap();
             std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
         }
-        let d = collect(&state, &[], &src).unwrap();
+        let d = collect(&state, &[], &[], &src, &[]).unwrap();
         assert_eq!((d.unreadable, d.refused), (1, 1));
         let first = d.first_refused.as_deref().unwrap();
         assert!(
@@ -1193,9 +1340,67 @@ mod tests {
         writeln!(f, "127.0.0.1 local junk").unwrap();
         writeln!(f, "junk without an address").unwrap();
         drop(f);
-        let d = collect(&state, &[], &src).unwrap();
+        let d = collect(&state, &[], &[], &src, &[]).unwrap();
         assert_eq!((d.lines_read, d.parse_errors, d.requests), (5, 4, 1));
         assert_eq!(d.per_ip["203.0.113.9"].requests, 3);
         assert_eq!(d.per_ip.len(), 1);
+    }
+
+    #[test]
+    fn the_vps_own_requests_are_not_counted_and_a_set_left_out_moves_to_its_end() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let read = dir.path().join("nginx");
+        let left = dir.path().join("httpd");
+        for d in [&read, &left] {
+            std::fs::create_dir(d).unwrap();
+        }
+        let state = State::at(dir.path().join("state"));
+        let src = [LogSource::new(
+            format!("{}/*.log", read.display()),
+            "combined".into(),
+        )];
+        let dropped = [format!("{}/*.log", left.display())];
+        let (a, b) = (read.join("shop.log"), left.join("shop.log"));
+        for p in [&a, &b] {
+            std::fs::write(p, "").unwrap();
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        collect(&state, &[], &[], &src, &dropped).unwrap();
+        let line = |ip: &str| {
+            format!(
+                r#"{ip} - - [10/Oct/2026:01:02:03 +0000] "GET /wp-cron.php HTTP/1.1" 200 1 "-" "WordPress/6.6""#
+            )
+        };
+        for p in [&a, &b] {
+            let mut f = std::fs::OpenOptions::new().append(true).open(p).unwrap();
+            for ip in [
+                "198.51.100.20",
+                "2001:db8:5:6::10",
+                "2001:db8:5:6::99",
+                "203.0.113.9",
+            ] {
+                writeln!(f, "{}", line(ip)).unwrap();
+            }
+        }
+        // The VPS's own addresses (its public one behind a cloud's NAT, its
+        // IPv6): their cron, loopback and preload requests are not visitors.
+        let own: [IpAddr; 2] = [
+            "198.51.100.20".parse().unwrap(),
+            "2001:db8:5:6::10".parse().unwrap(),
+        ];
+        let d = collect(&state, &[], &own, &src, &dropped).unwrap();
+        let mut keys: Vec<&str> = d.per_ip.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        // A neighbour in the same /64 still counts.
+        assert_eq!(keys, ["2001:db8:5:6::/64", "203.0.113.9"]);
+        assert_eq!(d.per_ip["2001:db8:5:6::/64"].requests, 1);
+        // The set left out was not read, but its place moved with it.
+        assert_eq!(d.lines_read, 4);
+        let offsets = state.offsets();
+        let at = offsets[&b.to_string_lossy().to_string()];
+        assert_eq!(at.pos, std::fs::metadata(&b).unwrap().len());
+        assert!(at.pos > 0);
     }
 }

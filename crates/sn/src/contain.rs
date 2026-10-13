@@ -202,10 +202,11 @@ fn ban_flood_sources(state: &State, cfg: &Config, dry_run: bool) -> Result<usize
         }
         return Ok(adds.len());
     }
-    let mut white = wl.keys();
-    white.extend(whitelist::cidr_keys(&never_ban));
-    fw::prepare(&cfg.fw.web_ports, &white)?;
-    fw::apply_bans(&adds, &[])?;
+    // The table first; a whitelist that cannot be refreshed is only logged
+    // (`prepare`), it must not keep the flood sources unbanned.
+    let white = wl.keys(&cfg.trusted_cidrs());
+    fw::prepare(&cfg.fw.web_ports, cfg.fw.block_quic, &white)
+        .and_then(|()| fw::apply_bans(&adds, &[]))?;
     for (k, _) in &adds {
         undo::record(&state.dir, &UndoOp::Unban { key: k.clone() })?;
     }

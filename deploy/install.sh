@@ -211,6 +211,14 @@ if [ "$UPGRADE" -eq 1 ]; then
   # anything; drop them so nobody reads them as a setting that still applies.
   if [ -f /etc/sn/agent.toml ]; then
     sed -i -E '/^(allow_mode_observe|allow_undo|allow_install_clamav|allow_evidence|allow_remediate)[[:space:]]*=/d' /etc/sn/agent.toml
+    # Earlier installers wrote `min_requests = 120`, a floor that
+    # counted every log line. The rule now counts dynamic requests only, with
+    # a floor of 300; raise the old default (and only it: a value someone
+    # chose is kept).
+    if grep -Eq '^min_requests[[:space:]]*=[[:space:]]*120([[:space:]]*(#.*)?)$' /etc/sn/agent.toml; then
+      sed -i -E 's/^(min_requests[[:space:]]*=[[:space:]]*)120([[:space:]]*(#.*)?)$/\1300\2/' /etc/sn/agent.toml
+      echo ">> /etc/sn/agent.toml: min_requests 120 -> 300 (the old default; dynamic requests per site per cycle now)"
+    fi
   fi
   echo ">> upgraded. Rollback: cp /usr/local/bin/sn.bak /usr/local/bin/sn"
   exit 0
@@ -276,6 +284,8 @@ sources_mode = "auto"
 whitelist = []
 max_bans_per_cycle = 200
 web_ports = [80, 443]
+# A ban also drops UDP 443 (HTTP/3). false if a VPN listens on UDP 443.
+block_quic = true
 
 [hunt]
 allowed_roots = $ROOTS

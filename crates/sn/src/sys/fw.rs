@@ -83,11 +83,32 @@ fn ban_lines(adds: &[(String, u64)], dels: &[String]) -> Result<(Vec<String>, Ve
     Ok((add_lines, del_lines))
 }
 
+/// The script that replaces the whitelist sets with `keys`. The sets are
+/// interval sets without `auto-merge`, where an element that overlaps another
+/// aborts the whole transaction: so the keys are written as a cover with no
+/// element inside another, whatever the caller passed (a range twice, an
+/// address inside a configured range).
 fn whitelist_script(keys: &[String]) -> Result<String> {
-    let mut script = String::from("flush set inet sn sn_white4\nflush set inet sn sn_white6\n");
+    let mut cidrs = Vec::with_capacity(keys.len());
     for key in keys {
-        let (elem, v6) = element(key, Kind::White)?;
-        let set = if v6 { "sn_white6" } else { "sn_white4" };
+        let (elem, _) = element(key, Kind::White)?;
+        let cidr = snsec_common::net::Cidr::parse(&elem)
+            .with_context(|| format!("whitelist key {elem:?}"))?;
+        cidrs.push(cidr);
+    }
+    let mut script = String::from("flush set inet sn sn_white4\nflush set inet sn sn_white6\n");
+    for c in snsec_common::net::minimal_cover(&cidrs) {
+        let max = if c.addr.is_ipv4() { 32 } else { 128 };
+        let elem = if c.prefix == max {
+            c.addr.to_string()
+        } else {
+            format!("{}/{}", c.addr, c.prefix)
+        };
+        let set = if c.addr.is_ipv6() {
+            "sn_white6"
+        } else {
+            "sn_white4"
+        };
         script.push_str(&format!("add element inet sn {set} {{ {elem} }}\n"));
     }
     Ok(script)
@@ -147,17 +168,20 @@ pub fn available() -> bool {
 }
 
 /// The script that creates (idempotently) the `inet sn` table, sets and input
-/// chain. A ban drops new TCP and UDP flows to the web ports: browsers speak
-/// HTTP/3 over UDP 443, so a TCP-only drop let a banned address keep loading
-/// pages (and keep showing up over the threshold in the log). Two rules per
-/// family rather than `th dport`, which older nft releases lack.
-fn table_script(web_ports: &[u16]) -> String {
+/// chain. A ban drops new TCP flows to the web ports and, with `quic`, new UDP
+/// flows to 443: browsers speak HTTP/3 there, so a TCP-only drop let a banned
+/// address keep loading pages (and keep showing up over the threshold in the
+/// log). UDP to 443 only, and only when 443 is a web port: a VPN on UDP 443
+/// (`block_quic = false`) or on another port keeps working for a banned
+/// address. Two rules per family rather than `th dport`, which older nft
+/// releases lack.
+fn table_script(web_ports: &[u16], quic: bool) -> String {
     let ports = web_ports
         .iter()
         .map(u16::to_string)
         .collect::<Vec<_>>()
         .join(", ");
-    format!(
+    let mut script = format!(
         r#"add table inet sn
 add set inet sn sn_ban4 {{ type ipv4_addr; flags timeout; }}
 add set inet sn sn_ban6 {{ type ipv6_addr; flags interval, timeout; }}
@@ -170,26 +194,33 @@ add rule inet sn input iif "lo" accept
 add rule inet sn input ip saddr @sn_white4 accept
 add rule inet sn input ip6 saddr @sn_white6 accept
 add rule inet sn input ip saddr @sn_ban4 tcp dport {{ {ports} }} drop
-add rule inet sn input ip saddr @sn_ban4 udp dport {{ {ports} }} drop
 add rule inet sn input ip6 saddr @sn_ban6 tcp dport {{ {ports} }} drop
-add rule inet sn input ip6 saddr @sn_ban6 udp dport {{ {ports} }} drop
 "#
-    )
+    );
+    if quic && web_ports.contains(&443) {
+        script.push_str("add rule inet sn input ip saddr @sn_ban4 udp dport 443 drop\n");
+        script.push_str("add rule inet sn input ip6 saddr @sn_ban6 udp dport 443 drop\n");
+    }
+    script
 }
 
 /// Create (idempotently) the `inet sn` table, sets and input chain. Existing
 /// ban/white set contents are preserved — only the chain's rules are rebuilt.
-pub fn ensure_table(web_ports: &[u16]) -> Result<()> {
-    run_nft_script(&table_script(web_ports))
+pub fn ensure_table(web_ports: &[u16], quic: bool) -> Result<()> {
+    run_nft_script(&table_script(web_ports, quic))
 }
 
-/// [`ensure_table`], then replace the whitelist sets with `white_keys`: done
-/// together wherever bans are about to be applied, so what may never be
-/// banned (the whitelist, trusted proxies, Cloudflare) is accepted by the
-/// firewall before any ban rule, whoever ordered the ban.
-pub fn prepare(web_ports: &[u16], white_keys: &[String]) -> Result<()> {
-    ensure_table(web_ports)?;
-    set_whitelist(white_keys)
+/// [`ensure_table`], then replace the whitelist sets with `white_keys`, done
+/// wherever bans are about to be applied: what may never be banned (the
+/// whitelist, the trusted proxies) is accepted by the firewall before any ban
+/// rule, whoever ordered the ban. Only a failure to create the table is an
+/// error: one to refresh the whitelist is logged, and the bans still go on.
+pub fn prepare(web_ports: &[u16], quic: bool, white_keys: &[String]) -> Result<()> {
+    ensure_table(web_ports, quic)?;
+    if let Err(e) = set_whitelist(white_keys) {
+        eprintln!("firewall: could not refresh the whitelist ({e:#}); applying bans anyway");
+    }
+    Ok(())
 }
 
 /// Apply a batch of bans (add with per-element timeout) and unbans in one
@@ -355,14 +386,16 @@ mod tests {
     }
 
     #[test]
-    fn a_ban_drops_new_tcp_and_udp_flows_to_the_web_ports_only() {
-        let s = table_script(&[80, 443]);
+    fn a_ban_drops_new_tcp_flows_to_the_web_ports_and_http3_only_on_443() {
+        let s = table_script(&[80, 443], true);
         for fam in ["ip saddr @sn_ban4", "ip6 saddr @sn_ban6"] {
-            for proto in ["tcp", "udp"] {
-                let rule = format!("add rule inet sn input {fam} {proto} dport {{ 80, 443 }} drop");
-                assert!(s.contains(&rule), "missing: {rule}");
-            }
+            let rule = format!("add rule inet sn input {fam} tcp dport {{ 80, 443 }} drop");
+            assert!(s.contains(&rule), "missing: {rule}");
+            let rule = format!("add rule inet sn input {fam} udp dport 443 drop");
+            assert!(s.contains(&rule), "missing: {rule}");
         }
+        // UDP to port 80 (or anything else) is never dropped.
+        assert!(!s.contains("udp dport {"));
         // The whitelist and established flows are still accepted first.
         let first_drop = s.find("drop").unwrap();
         for accept in [
@@ -374,6 +407,15 @@ mod tests {
         }
         // Nothing else is dropped: SSH, panels, mail stay reachable.
         assert_eq!(s.matches("drop").count(), 4);
+        // A VPN on UDP 443 (`block_quic = false`), or no 443 among the web
+        // ports: TCP only.
+        for s in [
+            table_script(&[80, 443], false),
+            table_script(&[80, 8080], true),
+        ] {
+            assert!(!s.contains("udp"), "{s}");
+            assert_eq!(s.matches("drop").count(), 2);
+        }
     }
 
     #[test]
@@ -388,5 +430,32 @@ mod tests {
         assert!(s.contains("add element inet sn sn_white4 { 198.51.100.4 }\n"));
         assert!(s.contains("add element inet sn sn_white6 { 2001:db8::/32 }\n"));
         assert_eq!(s.lines().count(), 5);
+    }
+
+    #[test]
+    fn the_whitelist_never_writes_an_element_inside_another() {
+        // nft refuses an interval that overlaps another, and with it the
+        // whole transaction: loopback and `lo`'s 127.0.0.1, a range twice, an
+        // admin /64 inside an office /48.
+        let s = whitelist_script(&[
+            "127.0.0.0/8".to_string(),
+            "127.0.0.1".to_string(),
+            "104.16.0.0/13".to_string(),
+            "104.16.0.0/13".to_string(),
+            "2001:db8::/48".to_string(),
+            "2001:db8:0:5::/64".to_string(),
+            "::1".to_string(),
+        ])
+        .unwrap();
+        let adds: Vec<&str> = s.lines().filter(|l| l.starts_with("add")).collect();
+        assert_eq!(
+            adds,
+            [
+                "add element inet sn sn_white4 { 127.0.0.0/8 }",
+                "add element inet sn sn_white4 { 104.16.0.0/13 }",
+                "add element inet sn sn_white6 { 2001:db8::/48 }",
+                "add element inet sn sn_white6 { ::1 }",
+            ]
+        );
     }
 }

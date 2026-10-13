@@ -470,20 +470,22 @@ impl Db {
         })
     }
 
-    /// Remember the address a signed report from this agent came from, so the
-    /// agent learns its own public address and never bans it (on a cloud that
-    /// NATs the VPS, its loopback, cron and cache-preload requests arrive from
-    /// that address, which is on none of its interfaces). Only a public address
-    /// the desired state does not list yet changes it (newest first, at most
-    /// `MAX_SELF_IPS`), so an unchanged address costs no new version; once one
-    /// is known, another is taken at most every [`SELF_IP_EVERY_SECS`], so a VPS
-    /// that leaves through a pool of addresses does not change its desired state
-    /// on every report. Returns whether it changed.
+    /// Remember the address a signed report or desired-state pull from this
+    /// agent came from, so the agent learns its own public address and never
+    /// bans it (on a cloud that NATs the VPS, its loopback, cron and
+    /// cache-preload requests arrive from that address, which is on none of its
+    /// interfaces). Only a public address the desired state does not list yet
+    /// changes it (newest first, at most `MAX_SELF_IPS`, the newest of each
+    /// family always kept), so an unchanged address costs no new version. The
+    /// first address of a family is taken at once (a dual-stack VPS reports
+    /// over one and pulls over the other); once a family is known, another is
+    /// taken at most every [`SELF_IP_EVERY_SECS`], so a VPS that leaves through
+    /// a pool of addresses does not change its desired state on every report.
+    /// Returns whether it changed.
     ///
     /// # Errors
     /// A database error.
     pub fn note_self_ip(&self, agent_id: &str, raw: &str, now: i64) -> Result<bool> {
-        use snsec_common::schema::MAX_SELF_IPS;
         let Some(ip) = self_ip_candidate(raw) else {
             return Ok(false);
         };
@@ -493,7 +495,8 @@ impl Db {
         if body.self_ips.contains(&ip) {
             return Ok(false);
         }
-        if !body.self_ips.is_empty() {
+        let v6 = ip.contains(':');
+        if body.self_ips.iter().any(|x| x.contains(':') == v6) {
             let last: Option<i64> = self.conn.query_row(
                 "SELECT MAX(ts) FROM decisions WHERE agent_id = ?1 AND action = 'self_ip'",
                 params![agent_id],
@@ -507,7 +510,7 @@ impl Db {
         self.update_desired(agent_id, now, "system", "self_ip", &detail, |d| {
             d.self_ips.retain(|x| *x != ip);
             d.self_ips.insert(0, ip.clone());
-            d.self_ips.truncate(MAX_SELF_IPS);
+            trim_self_ips(&mut d.self_ips);
         })?;
         Ok(true)
     }
@@ -673,6 +676,25 @@ pub(crate) fn never_ban_reason(target: &str) -> Option<&'static str> {
 /// The address this agent's report came from, if it is one worth telling the
 /// agent about: a single public address (not private, CGNAT, link-local or
 /// Cloudflare, which it would never ban anyway).
+/// Cut a VPS's own addresses (newest first) to `MAX_SELF_IPS`, dropping the
+/// oldest whose family still has a newer one: the IPv4 a dual-stack VPS pulls
+/// over is never pushed out by its IPv6 addresses, nor the other way round.
+fn trim_self_ips(list: &mut Vec<String>) {
+    use snsec_common::schema::MAX_SELF_IPS;
+    while list.len() > MAX_SELF_IPS {
+        let family_has_newer = |i: usize| {
+            let v6 = list[i].contains(':');
+            list[..i].iter().any(|x| x.contains(':') == v6)
+        };
+        match (0..list.len()).rev().find(|&i| family_has_newer(i)) {
+            Some(i) => {
+                list.remove(i);
+            }
+            None => list.truncate(MAX_SELF_IPS),
+        }
+    }
+}
+
 fn self_ip_candidate(raw: &str) -> Option<String> {
     let ip = snsec_common::net::normalize(raw.trim().parse::<IpAddr>().ok()?);
     (banable(ip) && snsec_common::ranges::never_ban_reason(ip).is_none()).then(|| ip.to_string())
@@ -973,6 +995,46 @@ mod tests {
         );
         // An unknown VPS gets nothing stored.
         assert!(!db.note_self_ip("nobody", "203.0.113.9", 50).unwrap());
+    }
+
+    #[test]
+    fn a_dual_stack_vps_gets_both_its_addresses_known() {
+        // Reports over IPv6, desired-state pulls over IPv4 (the agent prefers
+        // it there): the IPv4 behind a cloud's NAT must not wait six hours,
+        // nor be pushed out by IPv6 addresses later.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let id = db.enroll_agent("web", "pk", 1).unwrap();
+        assert!(db.note_self_ip(&id, "2001:db8:5:6::10", 10).unwrap());
+        assert!(db.note_self_ip(&id, "198.51.100.20", 20).unwrap());
+        // Another of a known family still waits.
+        assert!(!db.note_self_ip(&id, "2001:db8:5:6::11", 30).unwrap());
+        let mut at = 30;
+        for i in 1..=5 {
+            at += SELF_IP_EVERY_SECS;
+            assert!(
+                db.note_self_ip(&id, &format!("2001:db8:5:7::{i}"), at)
+                    .unwrap()
+            );
+        }
+        let d = db.get_desired(&id).unwrap().unwrap().2;
+        assert_eq!(d.self_ips.len(), snsec_common::schema::MAX_SELF_IPS);
+        assert_eq!(d.self_ips[0], "2001:db8:5:7::5");
+        assert!(
+            d.self_ips.contains(&"198.51.100.20".to_string()),
+            "{:?}",
+            d.self_ips
+        );
+        let mut l: Vec<String> = ["a:1", "1.1.1.1", "a:2", "a:3", "a:4"]
+            .map(String::from)
+            .to_vec();
+        trim_self_ips(&mut l);
+        assert_eq!(l, ["a:1", "1.1.1.1", "a:2", "a:3"]);
+        let mut l: Vec<String> = ["a:1", "a:2", "a:3", "a:4", "1.1.1.1"]
+            .map(String::from)
+            .to_vec();
+        trim_self_ips(&mut l);
+        assert_eq!(l, ["a:1", "a:2", "a:3", "1.1.1.1"]);
     }
 
     fn seed_desired(db: &Db, id: &str, json: &str) {
