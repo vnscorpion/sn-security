@@ -196,6 +196,9 @@ const RENDER_RATIO: u64 = 3;
 const SHORT_RATE_TTL: u64 = 600;
 /// Longest a rate ban from browsers alone may get on the ladder.
 const BROWSER_RATE_CAP: u64 = 3600;
+/// A browser-looking address is banned for `rate` only this many times over
+/// its bar (below the absolute ceiling): plain busy browsing is reported.
+const CLEAR_FACTOR: u64 = 3;
 /// Rendering browsers that make an address look like a proxy or CDN edge.
 const PROXY_BROWSERS: usize = 20;
 
@@ -898,6 +901,21 @@ fn rate_hit(a: &IpAgg, j: &Judge) -> Option<PatternHit> {
         })
     };
     if (j.volume_exempt || !j.baseline_ready || a.looks_like_proxy()) && !at_ceiling {
+        return rate(0, false, false, 0);
+    }
+    // An address browsing the way people do (browsers, many different pages)
+    // loses its access only for a clear attack: pages well past the bar,
+    // missing files, or the absolute ceiling. Busy but plausible browsing is
+    // reported; a bot dressed as a browser is a job for the WAF (its
+    // User-Agent or request shape), not for a ban that also hits whoever
+    // shares the address. Rotating User-Agents over a few paths is no
+    // browsing and is judged below.
+    let clear_flood = at_ceiling
+        || over_lines
+        || over_misses
+        || site_dynamic >= bar.saturating_mul(CLEAR_FACTOR)
+        || a.dynamic() >= bar.saturating_mul(CLEAR_FACTOR * BACKSTOP);
+    if browsing && !clear_flood {
         return rate(0, false, false, 0);
     }
     // A search engine (or one by name), browsers rendering pages, several

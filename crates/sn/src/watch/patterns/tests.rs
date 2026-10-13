@@ -356,13 +356,61 @@ fn a_carrier_nat_browsing_many_pages_gets_a_higher_bar_and_a_short_ban() {
     assert_eq!(a.clients(), 3);
     assert_eq!(a.site_dynamic(), 750);
     assert!(judge(&a, &ready()).is_none(), "750 < 3 x 300");
-    // Very busy: banned, but briefly and never up the ladder.
+    // Busier than the bar: people browsing, so only reported.
     send(&mut a, 1, "GET", "/san-pham/", 200, BROWSER, 200);
+    let h = judge(&a, &ready()).unwrap();
+    assert_eq!(
+        (h.reason, h.ban, h.escalate, h.ttl_secs),
+        ("rate", false, false, 0)
+    );
+    // Three times the bar is a flood: banned, but briefly and never up the
+    // ladder.
+    send(&mut a, 1, "GET", "/san-pham/", 200, BROWSER, 1800);
     let h = judge(&a, &ready()).unwrap();
     assert_eq!(
         (h.reason, h.ban, h.escalate, h.ttl_secs),
         ("rate", true, false, 600)
     );
+}
+
+#[test]
+fn one_busy_browser_is_reported_and_only_a_clear_flood_is_banned() {
+    // One browser going through many pages faster than the bar (a buyer
+    // comparing products, an editor clicking through the site): reported.
+    let mut a = IpAgg::default();
+    for i in 0..400 {
+        send(
+            &mut a,
+            1,
+            "GET",
+            &format!("/san-pham/{i}/"),
+            200,
+            BROWSER,
+            1,
+        );
+    }
+    let h = judge(&a, &ready()).unwrap();
+    assert_eq!((h.reason, h.ban), ("rate", false));
+    // Three times the bar is not browsing any more: banned (an hour at most,
+    // as for every browser-looking address).
+    for i in 400..950 {
+        send(
+            &mut a,
+            1,
+            "GET",
+            &format!("/san-pham/{i}/"),
+            200,
+            BROWSER,
+            1,
+        );
+    }
+    let h = judge(&a, &ready()).unwrap();
+    assert_eq!((h.reason, h.ban), ("rate", true));
+    assert!(h.ttl_cap > 0 && h.ttl_cap <= 3600);
+    // The same volume on a few pages is no browsing at all: banned at the bar.
+    let mut b = IpAgg::default();
+    send(&mut b, 1, "GET", "/?add-to-cart=1", 200, BROWSER, 400);
+    assert_eq!(judge(&b, &ready()).map(|h| h.ban), Some(true));
 }
 
 #[test]
@@ -391,7 +439,7 @@ fn an_office_on_one_chrome_version_rendering_pages_is_not_one_person() {
     assert_eq!(a.site_dynamic(), 396);
     assert_eq!(a.clients(), 2);
     assert!(judge(&a, &ready()).is_none(), "396 < 2 x 300");
-    // Busier still: a short ban that never climbs.
+    // Busier still, but people at work: only reported.
     send(
         &mut a,
         1,
@@ -404,8 +452,22 @@ fn an_office_on_one_chrome_version_rendering_pages_is_not_one_person() {
     let h = judge(&a, &ready()).unwrap();
     assert_eq!(
         (h.reason, h.ban, h.escalate, h.ttl_secs),
-        ("rate", true, false, 600)
+        ("rate", false, false, 0)
     );
+    // Three times the bar of one API call: banned, an hour at most (a
+    // browser-looking address never climbs past that).
+    send(
+        &mut a,
+        1,
+        "GET",
+        "/wp-json/wc-admin/orders?_locale=user",
+        200,
+        CHROME_REDUCED,
+        1100,
+    );
+    let h = judge(&a, &ready()).unwrap();
+    assert_eq!((h.reason, h.ban, h.ttl_secs), ("rate", true, 600));
+    assert!(!h.escalate || (h.ttl_cap > 0 && h.ttl_cap <= 3600), "{h:?}");
 }
 
 #[test]

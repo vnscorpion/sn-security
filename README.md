@@ -214,7 +214,7 @@ Mỗi chu kỳ (~5 phút) agent đếm các dòng log mới theo **từng IP** (
 | `bad_ua` | UA công cụ tấn công (sqlmap, nikto, masscan, nmap, zgrab, dirbuster, wpscan, acunetix, nuclei, havij) trên **≥ 3** request, hoặc trên một request bị trả 4xx | 1 giờ, leo thang |
 | `bad_ua` | **> 50** request không có UA mà **ít nhất một nửa** bị trả 4xx (UA rỗng nhưng trả lời bình thường, như job đồng bộ gọi REST API, để luật `rate` lo) | 24 giờ, leo thang |
 | `probe` (từ trình duyệt) | **3 loại** đường dẫn dò khác nhau (`.env`, `.git`, phpMyAdmin...; nhiều file của một loại chỉ tính một), hoặc một đường dẫn dò kèm ≥ 10 lỗi 4xx trang trên ≥ 10 đường dẫn, với UA trình duyệt | 10 phút, **không** leo thang (một trang web có thể khiến trình duyệt của khách gửi đúng như vậy) |
-| `rate` | Request động của IP trên website bận nhất ≥ **ngưỡng × số người sau IP** (bên dưới) | 10 phút, leo thang (bên dưới) |
+| `rate` | Request động của IP trên website bận nhất ≥ **ngưỡng × số người sau IP** (bên dưới). IP đang **duyệt web như người thật** (UA trình duyệt, nhiều trang khác nhau) chỉ bị chặn khi gấp **≥ 3 ×** mức đó, chạm trần tuyệt đối hay flood 404 tài nguyên; dưới đó **chỉ báo** (bot giả trình duyệt thì chặn bằng [WAF](#chặn-bằng-waf-modsecurity) theo UA hay kiểu request) | 10 phút, leo thang (bên dưới) |
 | `xmlrpc_pingback` | **> 3** request `xmlrpc.php` với UA `WordPress/` | chỉ báo, **không chặn** |
 | `probe` (lẻ) | Một đường dẫn dò từ trình duyệt (hoặc từ crawler đã xác minh), IP có ≤ 20 request | chỉ báo, **không chặn** |
 
