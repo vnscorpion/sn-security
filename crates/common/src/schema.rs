@@ -162,15 +162,20 @@ pub struct WafStatus {
     pub notes: Vec<String>,
 }
 
-/// Matches of one managed rule, read from the web server's error log.
+/// Matches of one managed rule, counted by the agent from the access logs
+/// (what the rule matches whether or not ModSecurity logs it).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WafHit {
     pub id: u32,
+    /// Requests in the access logs the rule matches.
     pub count: u64,
+    /// Of those, answered 403 (blocked, by this rule or anything else).
+    #[serde(default)]
+    pub blocked: u64,
     /// Unix time of the latest match seen.
     #[serde(default)]
     pub last_at: i64,
-    /// A few `host uri` examples (no query string), to judge a rule before
+    /// A few `site path` examples (no query string), to judge a rule before
     /// letting it block.
     #[serde(default)]
     pub samples: Vec<String>,

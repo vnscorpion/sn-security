@@ -2233,7 +2233,7 @@ mod tests {
     #[test]
     fn a_flagged_pattern_shows_a_rule_and_sample_ips_but_a_normal_one_does_not() {
         let rows = [
-            stat("GET /?tss-sc&tsscat", true),
+            stat("GET /?tss-sc&tsscat&tst10_filter", true),
             stat("GET /shop?page", false),
         ];
         let html = pattern_table("t", "k", &rows, "vps-1", snsec_common::waf::WafKind::Shape)

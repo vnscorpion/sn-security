@@ -15,8 +15,15 @@
 //! cycle's sandbox cannot write to /etc. A failed test, a failed reload, a
 //! server that stops listening, or (LiteSpeed, which has no test) an error
 //! about our file in its log after the reload puts the previous file back.
-//! The watch cycle reads the outcome, and the logs for matches of our rules,
-//! and reports both to the hub.
+//!
+//! What a rule matches is counted from the access logs the watch cycle reads
+//! anyway ([`snsec_common::waf::Matcher`]), not from ModSecurity's own logs:
+//! that works whatever the engine, its log level and format, needs no audit
+//! log (which holds cookies and request bodies), and also shows whether a
+//! blocking rule really answers 403.
+//!
+//! In observe mode every rule only logs. `sn disable` takes the file out and
+//! keeps it out until `sn waf-on`.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -32,7 +39,7 @@ use sha2::{Digest, Sha256};
 use snsec_common::schema::WafStatus;
 use snsec_common::waf::{FILE_MARKER, MANAGED_ID_MAX, MANAGED_ID_MIN, WafRule, render_file};
 
-use crate::state::{Offset, State};
+use crate::state::State;
 use crate::util;
 use crate::waf_conf::{self, Tally};
 
@@ -43,6 +50,7 @@ const DA_OPTIONS: &str = "/usr/local/directadmin/custombuild/options.conf";
 /// CustomBuild copies this directory into `/etc/modsecurity.d` whenever it
 /// rebuilds the rules.
 const DA_CUSTOM_DIR: &str = "/usr/local/directadmin/custombuild/custom/modsecurity/conf";
+const DA_RULES_DIR: &str = "/etc/modsecurity.d";
 /// DirectAdmin's own ModSecurity settings: `SecRuleEngine On|Off` and
 /// `SecRuleRemoveById` lines, server-wide and per site (the panel's WAF page).
 const DA_GLOBAL_RULES: &str = "/usr/local/directadmin/data/admin/modsecurity_rules";
@@ -54,8 +62,13 @@ const DA_SITE_RULES: &[&str] = &[
 const RULES_FILE: &str = "waf-rules.json";
 /// Outcome of the last apply (written by the apply unit).
 const APPLIED_FILE: &str = "waf.json";
-/// Log offsets and matches not yet reported (written by the watch cycle).
+/// The file that was in place before an apply, kept until it finishes, so an
+/// apply cut short (a reboot, the unit's time limit) can still be undone.
+const BACKUP_FILE: &str = "waf-backup.conf";
+/// Matches not yet reported (written by the watch cycle).
 const LOCAL_FILE: &str = "waf-local.json";
+/// Present after `sn disable`: the WAF file stays out until `sn waf-on`.
+const OFF_FILE: &str = "waf-off";
 /// The hash recorded when there should be no file.
 const NO_FILE: &str = "none";
 /// A configuration that failed is tried again after this long.
@@ -71,26 +84,11 @@ const LISTEN_WAIT: Duration = Duration::from_secs(15);
 const SETTLE: Duration = Duration::from_secs(5);
 const OUTPUT_CAP: u64 = 16 * 1024;
 const ERROR_MAX: usize = 600;
-/// Log reading bounds, per cycle.
-const LOG_FILES_MAX: usize = 2000;
-const READ_PER_FILE: u64 = 4 << 20;
-const READ_TOTAL: u64 = 32 << 20;
 /// Rule files scanned for ids already taken.
 const SCAN_FILES_MAX: usize = 400;
 const SCAN_BYTES_MAX: u64 = 16 << 20;
 /// Site settings read for the notes.
 const SITES_MAX: usize = 5000;
-
-/// Where matches of our rules are written.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum LogKind {
-    /// Error-log lines with `[id "N"]` (Apache, nginx, LiteSpeed).
-    #[default]
-    ErrorLog,
-    /// JSON audit records (OpenLiteSpeed, which logs matches to its error log
-    /// only at INFO level).
-    Audit,
-}
 
 /// Where ModSecurity lives on this VPS and how to drive the web server.
 #[derive(Debug, Clone, Default)]
@@ -106,11 +104,10 @@ pub struct Layout {
     /// Configuration test (`httpd -t`); `None` when the server has none.
     pub test: Option<Vec<String>>,
     pub reload: Option<Vec<String>>,
+    /// A full restart, for when a reload leaves the server down.
+    pub restart: Option<Vec<String>>,
     /// The server's own error log, checked after a reload (LiteSpeed).
     pub server_log: Option<PathBuf>,
-    /// Logs (globs) where matches are written, and their kind.
-    pub logs: Vec<String>,
-    pub log_kind: LogKind,
     /// Ids in our range that other rule files already use.
     pub taken: HashSet<u32>,
     /// Why `live` is `None`, for the hub.
@@ -190,8 +187,8 @@ fn first_file(paths: &[&str]) -> Option<String> {
         .map(|p| (*p).to_string())
 }
 
-/// `systemctl reload <unit>` for the first of these units that is installed.
-fn reload_unit(units: &[&str]) -> Option<Vec<String>> {
+/// `systemctl <verb> <unit>` for the first of these units that is installed.
+fn unit_cmd(verb: &str, units: &[&str]) -> Option<Vec<String>> {
     let systemctl = util::find_bin("systemctl")?;
     let unit = units.iter().find(|u| {
         [
@@ -204,22 +201,20 @@ fn reload_unit(units: &[&str]) -> Option<Vec<String>> {
     })?;
     Some(vec![
         systemctl.to_string_lossy().into_owned(),
-        "reload".into(),
+        verb.into(),
         (*unit).to_string(),
     ])
 }
 
-/// Test, reload, server log, match logs.
+/// Test, reload, restart, server log.
 type Commands = (
     Option<Vec<String>>,
     Option<Vec<String>>,
+    Option<Vec<String>>,
     Option<PathBuf>,
-    Vec<String>,
-    LogKind,
 );
 
 fn commands(server: &str) -> Commands {
-    let v = |a: &[&str]| a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
     let lswsctrl =
         || first_file(&["/usr/local/lsws/bin/lswsctrl"]).map(|b| vec![b, "restart".into()]);
     match server {
@@ -230,14 +225,9 @@ fn commands(server: &str) -> Commands {
                 "/usr/sbin/apachectl",
             ])
             .map(|b| vec![b, "-t".into()]),
-            reload_unit(&["httpd", "apache2"]),
+            unit_cmd("reload", &["httpd", "apache2"]),
+            unit_cmd("restart", &["httpd", "apache2"]),
             None,
-            v(&[
-                "/var/log/httpd/error_log",
-                "/var/log/httpd/domains/*.error.log",
-                "/var/log/apache2/error.log",
-            ]),
-            LogKind::ErrorLog,
         ),
         "nginx" => {
             let test = first_file(&["/usr/sbin/nginx", "/usr/local/sbin/nginx"]).map(|b| {
@@ -249,47 +239,36 @@ fn commands(server: &str) -> Commands {
             });
             (
                 test,
-                reload_unit(&["nginx"]),
+                unit_cmd("reload", &["nginx"]),
+                unit_cmd("restart", &["nginx"]),
                 None,
-                v(&[
-                    "/var/log/nginx/error.log",
-                    "/var/log/nginx/domains/*.error.log",
-                ]),
-                LogKind::ErrorLog,
             )
         }
         // No configuration test exists for LiteSpeed Enterprise (`lshttpd -t`
         // checks the licence): its log is read after the reload instead.
         "litespeed" => (
             None,
-            reload_unit(&["litespeed", "lsws"]).or_else(lswsctrl),
+            unit_cmd("reload", &["litespeed", "lsws"]).or_else(lswsctrl),
+            unit_cmd("restart", &["litespeed", "lsws"]).or_else(lswsctrl),
             Some(PathBuf::from("/usr/local/lsws/logs/error.log")),
-            v(&[
-                "/usr/local/lsws/logs/error.log",
-                "/var/log/httpd/domains/*.error.log",
-            ]),
-            LogKind::ErrorLog,
         ),
         "openlitespeed" => (
             first_file(&["/usr/local/lsws/bin/openlitespeed"]).map(|b| vec![b, "-t".into()]),
-            reload_unit(&["openlitespeed", "lsws"]).or_else(lswsctrl),
+            unit_cmd("reload", &["openlitespeed", "lsws"]).or_else(lswsctrl),
+            unit_cmd("restart", &["openlitespeed", "lsws"]).or_else(lswsctrl),
             Some(PathBuf::from("/usr/local/lsws/logs/error.log")),
-            v(&[
-                "/var/log/openlitespeed/modsec_audit.log",
-                "/var/log/httpd/modsec_audit.log",
-                "/usr/local/lsws/logs/auditmodsec.log",
-            ]),
-            LogKind::Audit,
         ),
-        _ => (None, None, None, Vec::new(), LogKind::ErrorLog),
+        _ => (None, None, None, None),
     }
 }
 
-/// Ids in our range already used by the other rule files of a directory.
-fn taken_ids(dir: &Path) -> HashSet<u32> {
-    let mut out = HashSet::new();
+/// What the rule files of a directory hold: ids in our range already used, and
+/// any server-level `SecRuleEngine` (a `*.conf.main` setup file may set one).
+fn scan_rule_dir(dir: &Path) -> (HashSet<u32>, Vec<String>) {
+    let mut taken = HashSet::new();
+    let mut engines = Vec::new();
     let Ok(entries) = fs::read_dir(dir) else {
-        return out;
+        return (taken, engines);
     };
     let mut budget = SCAN_BYTES_MAX;
     for e in entries.filter_map(Result::ok).take(SCAN_FILES_MAX) {
@@ -306,12 +285,15 @@ fn taken_ids(dir: &Path) -> HashSet<u32> {
             continue;
         }
         budget = budget.saturating_sub(text.len() as u64);
-        out.extend(waf_conf::ids_in(&text, MANAGED_ID_MIN, MANAGED_ID_MAX));
+        taken.extend(waf_conf::ids_in(&text, MANAGED_ID_MIN, MANAGED_ID_MAX));
+        if let Some(e) = waf_conf::scan_conf(&text).engine {
+            engines.push(e);
+        }
         if budget == 0 {
             break;
         }
     }
-    out
+    (taken, engines)
 }
 
 /// DirectAdmin's WAF settings: the server-wide engine state, and notes about
@@ -388,14 +370,13 @@ fn da_sites(notes: &mut Vec<String>) -> Option<String> {
 pub fn detect() -> Layout {
     let opts = da_options();
     let server = server_kind(&opts);
-    let (test, reload, server_log, logs, log_kind) = commands(&server);
+    let (test, reload, restart, server_log) = commands(&server);
     let mut out = Layout {
         server: server.clone(),
         test,
         reload,
+        restart,
         server_log,
-        logs,
-        log_kind,
         ..Layout::default()
     };
     if server.is_empty() {
@@ -432,26 +413,20 @@ pub fn detect() -> Layout {
             scans.push(waf_conf::scan_conf(&t));
         }
     }
-    // Server-wide setting first; DirectAdmin's own settings, applied per site,
-    // win. Not set anywhere: ModSecurity's default, Off.
-    let mut engine = scans.iter().find_map(|s| s.engine.clone());
-    if directadmin {
-        if let Some(e) = da_sites(&mut out.notes) {
-            engine = Some(e);
-        }
-        engine.get_or_insert_with(|| "off".into());
-    }
-    out.engine = waf_conf::engine_label(engine.as_deref()).into();
+    let module = scans.iter().find_map(|s| s.module);
+    let mut engines: Vec<String> = scans.iter().filter_map(|s| s.engine.clone()).collect();
     let dir = scans
         .iter()
         .flat_map(|s| s.include_dirs.iter())
-        .find(|d| safe_dir(Path::new(d)));
-    match dir {
+        .find(|d| safe_dir(Path::new(d)))
+        .cloned();
+    match &dir {
         Some(d) => {
             out.live = Some(Path::new(d).join(FILE_NAME));
-            out.taken = taken_ids(Path::new(d));
-            if d.trim_end_matches('/') == "/etc/modsecurity.d" && Path::new(DA_CUSTOMBUILD).is_dir()
-            {
+            let (taken, in_dir) = scan_rule_dir(Path::new(d));
+            out.taken = taken;
+            engines.extend(in_dir);
+            if d.trim_end_matches('/') == DA_RULES_DIR && Path::new(DA_CUSTOMBUILD).is_dir() {
                 out.persist = Some(Path::new(DA_CUSTOM_DIR).join(FILE_NAME));
             }
         }
@@ -460,6 +435,13 @@ pub fn detect() -> Layout {
                 "cấu hình ModSecurity không nạp thư mục luật nào dạng <thư mục>/*.conf".into();
         }
     }
+    // DirectAdmin's own setting, applied per site, wins over the server level.
+    let panel = if directadmin {
+        da_sites(&mut out.notes)
+    } else {
+        None
+    };
+    out.engine = waf_conf::engine_state(module, &engines, panel.as_deref(), directadmin).into();
     out
 }
 
@@ -471,6 +453,10 @@ fn safe_dir(p: &Path) -> bool {
 
 fn sha(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+fn ours(bytes: &[u8]) -> bool {
+    bytes.starts_with(FILE_MARKER.as_bytes())
 }
 
 /// The outcome of the last apply, written by the apply unit.
@@ -488,12 +474,15 @@ struct Applied {
     /// What failed, so the same thing is not retried every cycle.
     failed_hash: String,
     failed_at: i64,
+    /// The file an apply was putting in place when it stopped (empty once it
+    /// finished, whichever way). Found in place later, it has not been tested.
+    #[serde(default)]
+    pending_hash: String,
 }
 
 /// The watch cycle's own bookkeeping.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct Local {
-    offsets: HashMap<String, Offset>,
     tally: Tally,
     started_hash: String,
     started_at: i64,
@@ -510,6 +499,10 @@ fn save<T: Serialize>(state: &State, name: &str, v: &T) -> Result<()> {
     state.save_file(name, &serde_json::to_vec(v)?)
 }
 
+fn switched_off(state: &State) -> bool {
+    state.dir.join(OFF_FILE).exists()
+}
+
 /// What the file should hold.
 struct Wanted {
     /// `None`: no file (no rule left to write).
@@ -521,10 +514,17 @@ struct Wanted {
 }
 
 /// The file for these rules, leaving out ids another rule file already uses
-/// (a duplicate id is a fatal error in ModSecurity 2 and 3).
-fn wanted(rules: &[WafRule], taken: &HashSet<u32>) -> Wanted {
-    let (usable, clashing): (Vec<WafRule>, Vec<WafRule>) =
-        rules.iter().cloned().partition(|r| !taken.contains(&r.id));
+/// (a duplicate id is a fatal error in ModSecurity 2 and 3). Outside enforce
+/// mode no rule blocks.
+fn wanted(rules: &[WafRule], taken: &HashSet<u32>, enforce: bool) -> Wanted {
+    let (usable, clashing): (Vec<WafRule>, Vec<WafRule>) = rules
+        .iter()
+        .cloned()
+        .map(|mut r| {
+            r.block &= enforce;
+            r
+        })
+        .partition(|r| !taken.contains(&r.id));
     let (text, skipped) = render_file(&usable);
     let skipped_ids: HashSet<u32> = skipped.iter().map(|r| r.id).collect();
     let mut refused: Vec<u32> = clashing.iter().map(|r| r.id).collect();
@@ -560,7 +560,7 @@ fn wanted(rules: &[WafRule], taken: &HashSet<u32>) -> Wanted {
 /// the file there is not ours.
 fn in_place(live: &Path) -> Option<String> {
     match fs::read(live) {
-        Ok(b) if b.starts_with(FILE_MARKER.as_bytes()) => Some(sha(&b)),
+        Ok(b) if ours(&b) => Some(sha(&b)),
         Ok(_) => None,
         Err(_) => Some(NO_FILE.into()),
     }
@@ -584,26 +584,35 @@ pub fn set_rules(state: &State, rules: &[WafRule]) {
     }
 }
 
-fn hub_rules(state: &State) -> Option<Vec<WafRule>> {
+/// The hub's rules, if it ever sent any.
+#[must_use]
+pub fn hub_rules(state: &State) -> Option<Vec<WafRule>> {
     let bytes = fs::read(state.dir.join(RULES_FILE)).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 
 /// Watch cycle (sandboxed), every cycle: start the apply unit when the hub's
-/// rules differ from what is in place (new rules, or a panel rebuild that
-/// removed the file). Bounded by `RETRY_SECS` / `RESTART_SECS`.
-pub fn ensure(state: &State) {
+/// rules differ from what is in place (new rules, a mode change, or a panel
+/// rebuild that removed the file). Bounded by `RETRY_SECS` / `RESTART_SECS`.
+pub fn ensure(state: &State, enforce: bool) {
     // The hub never sent rules: the WAF is not ours to manage.
     let Some(rules) = hub_rules(state) else {
         return;
     };
+    if switched_off(state) {
+        return;
+    }
     let now = util::now_secs();
     let layout = detect();
-    let want = wanted(&rules, &layout.taken).hash;
+    let want = wanted(&rules, &layout.taken, enforce).hash;
     let applied: Applied = load(state, APPLIED_FILE);
     let mut local: Local = load(state, LOCAL_FILE);
     let have = layout.live.as_deref().and_then(in_place);
-    if have.as_deref() == Some(want.as_str()) && applied.hash == want && applied.error.is_empty() {
+    if have.as_deref() == Some(want.as_str())
+        && applied.hash == want
+        && applied.error.is_empty()
+        && applied.pending_hash.is_empty()
+    {
         return;
     }
     if layout.live.is_none() && want == NO_FILE {
@@ -615,7 +624,10 @@ pub fn ensure(state: &State) {
     if local.started_hash == want && now - local.started_at < RESTART_SECS {
         return;
     }
-    match Command::new("systemd-run").args(apply_unit_args()).status() {
+    match Command::new("systemd-run")
+        .args(apply_unit_args(enforce))
+        .status()
+    {
         Ok(s) if s.success() => {
             eprintln!("waf: applying {} rule(s) (unit sn-waf-apply)", rules.len());
             local.started_hash = want;
@@ -632,8 +644,8 @@ pub fn ensure(state: &State) {
 /// `systemd-run` arguments for `sn waf-apply`: root outside the watch sandbox
 /// (it writes into the web server's configuration and reloads it), one at a
 /// time, bounded in time.
-fn apply_unit_args() -> Vec<String> {
-    [
+fn apply_unit_args(enforce: bool) -> Vec<String> {
+    let mut args: Vec<String> = [
         "--quiet",
         "--no-block",
         "--collect",
@@ -646,12 +658,25 @@ fn apply_unit_args() -> Vec<String> {
     ]
     .iter()
     .map(|s| (*s).to_string())
-    .collect()
+    .collect();
+    if !enforce {
+        args.push("--observe".into());
+    }
+    args
 }
 
 /// Run a command for at most `timeout`: its exit code (`None`: it could not
 /// start, was killed or ran over) and what it printed.
 fn run(argv: &[String], timeout: Duration) -> (Option<i32>, String) {
+    fn pipe<R: Read + Send + 'static>(r: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(r) = r {
+                let _ = r.take(OUTPUT_CAP).read_to_end(&mut buf);
+            }
+            buf
+        })
+    }
     let Some((prog, args)) = argv.split_first() else {
         return (None, String::new());
     };
@@ -665,15 +690,6 @@ fn run(argv: &[String], timeout: Duration) -> (Option<i32>, String) {
         Ok(c) => c,
         Err(e) => return (None, format!("{prog}: {e}")),
     };
-    fn pipe<R: Read + Send + 'static>(r: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(r) = r {
-                let _ = r.take(OUTPUT_CAP).read_to_end(&mut buf);
-            }
-            buf
-        })
-    }
     let out = pipe(child.stdout.take());
     let err = pipe(child.stderr.take());
     let deadline = Instant::now() + timeout;
@@ -792,9 +808,32 @@ fn fail(state: &State, out: &mut Applied, want: &str, now: i64, msg: &str) {
     out.error_at = now;
     out.failed_hash = want.to_string();
     out.failed_at = now;
+    out.pending_hash.clear();
     if let Err(e) = save(state, APPLIED_FILE, out) {
         eprintln!("waf: {e:#}");
     }
+}
+
+/// After putting the old file back: reload, and if the server is still down,
+/// restart it. Says how it ended.
+fn recover(layout: &Layout, was_serving: bool) -> String {
+    if let Some(reload) = &layout.reload {
+        let _ = run(reload, RELOAD_TIMEOUT);
+    }
+    if !was_serving || wait_serving() {
+        return "Đã trả lại file cũ và nạp lại.".into();
+    }
+    if let Some(restart) = &layout.restart {
+        let (code, output) = run(restart, RELOAD_TIMEOUT);
+        if wait_serving() {
+            return "Đã trả lại file cũ; máy chủ web phải khởi động lại và đã chạy lại.".into();
+        }
+        return format!(
+            "ĐÃ TRẢ LẠI FILE CŨ NHƯNG MÁY CHỦ WEB VẪN KHÔNG CHẠY ({} → {code:?}):\n{output}",
+            restart.join(" ")
+        );
+    }
+    "ĐÃ TRẢ LẠI FILE CŨ NHƯNG MÁY CHỦ WEB VẪN KHÔNG CHẠY: kiểm tra ngay.".into()
 }
 
 /// Write or remove the live file, test, reload, check; undo on any failure.
@@ -805,6 +844,14 @@ fn swap(
     old: Option<&[u8]>,
     text: Option<&str>,
 ) -> Result<(), String> {
+    // Only LiteSpeed Enterprise has no test; anywhere else an untested
+    // configuration could stop the server at its next restart.
+    if layout.test.is_none() && layout.server != "litespeed" {
+        return Err("không tìm thấy lệnh kiểm tra cấu hình của máy chủ web: không áp".into());
+    }
+    let Some(reload) = &layout.reload else {
+        return Err("không biết cách nạp lại máy chủ web này: không áp".into());
+    };
     let was_serving = serving();
     let put = match text {
         Some(t) => write_conf(live, t.as_bytes()),
@@ -824,10 +871,6 @@ fn swap(
             ));
         }
     }
-    let Some(reload) = &layout.reload else {
-        restore(live, old);
-        return Err("không biết cách nạp lại máy chủ web này; đã trả lại file cũ".into());
-    };
     let log_from = layout
         .server_log
         .as_ref()
@@ -846,7 +889,7 @@ fn swap(
         waf_conf::log_blames(&new, FILE_NAME).then(|| {
             let lines: Vec<&str> = new
                 .lines()
-                .filter(|l| l.contains(FILE_NAME))
+                .filter(|l| l.contains(FILE_NAME) && !l.contains("[id \""))
                 .take(5)
                 .collect();
             format!("máy chủ web báo lỗi với file luật:\n{}", lines.join("\n"))
@@ -856,10 +899,36 @@ fn swap(
     };
     if let Some(why) = why {
         restore(live, old);
-        let _ = run(reload, RELOAD_TIMEOUT);
-        return Err(format!("{why}\nĐã trả lại file cũ và nạp lại."));
+        let how = recover(layout, was_serving);
+        return Err(format!("{why}\n{how}"));
     }
     Ok(())
+}
+
+/// Keep the CustomBuild copy in step: written when there are rules, removed
+/// when there are none. A file of that name that is not ours is left alone.
+fn keep_persist(p: &Path, text: Option<&str>) -> Result<(), String> {
+    let existing = fs::read(p).ok();
+    if existing.as_deref().is_some_and(|b| !ours(b)) {
+        return Err(format!(
+            "{} có sẵn và không phải file của SN Secure: không ghi đè",
+            p.display()
+        ));
+    }
+    let r = match text {
+        Some(t) if existing.as_deref() == Some(t.as_bytes()) => Ok(()),
+        Some(t) => fs::create_dir_all(p.parent().unwrap_or(Path::new("/")))
+            .map_err(anyhow::Error::from)
+            .and_then(|()| write_conf(p, t.as_bytes())),
+        None if existing.is_some() => remove_if_exists(p),
+        None => Ok(()),
+    };
+    r.map_err(|e| {
+        format!(
+            "không giữ được bản sao cho DirectAdmin {}: {e:#}",
+            p.display()
+        )
+    })
 }
 
 /// `sn waf-apply` (the apply unit, unconfined root): put the rules the watch
@@ -867,31 +936,27 @@ fn swap(
 ///
 /// # Errors
 /// Only when the outcome cannot be recorded.
-pub fn apply_now(state: &State) -> Result<()> {
+pub fn apply_now(state: &State, enforce: bool) -> Result<()> {
     let Some(rules) = hub_rules(state) else {
         return Ok(());
     };
+    if switched_off(state) {
+        return Ok(());
+    }
     let now = util::now_secs();
     let layout = detect();
-    let w = wanted(&rules, &layout.taken);
+    let w = wanted(&rules, &layout.taken, enforce);
     let mut out: Applied = load(state, APPLIED_FILE);
     out.refused.clone_from(&w.refused);
     let Some(live) = layout.live.clone() else {
         if w.text.is_some() {
-            fail(
-                state,
-                &mut out,
-                &w.hash,
-                now,
-                &format!("không đặt được luật: {}", layout.why_none),
-            );
+            let msg = format!("không đặt được luật: {}", layout.why_none);
+            fail(state, &mut out, &w.hash, now, &msg);
         }
         return Ok(());
     };
-    let old = fs::read(&live).ok();
-    if let Some(o) = &old
-        && !o.starts_with(FILE_MARKER.as_bytes())
-    {
+    let mut old = fs::read(&live).ok();
+    if old.as_deref().is_some_and(|o| !ours(o)) {
         let msg = format!(
             "{} có sẵn và không phải file của SN Secure: không ghi đè",
             live.display()
@@ -899,8 +964,33 @@ pub fn apply_now(state: &State) -> Result<()> {
         fail(state, &mut out, &w.hash, now, &msg);
         return Ok(());
     }
-    let have = old.as_deref().map_or_else(|| NO_FILE.to_string(), sha);
+    let mut have = old.as_deref().map_or_else(|| NO_FILE.to_string(), sha);
+    // An earlier apply stopped between writing and testing: what is in place
+    // is untested. Start again from the file before it.
+    let interrupted = !out.pending_hash.is_empty() && out.pending_hash == have;
+    if interrupted {
+        old = fs::read(state.dir.join(BACKUP_FILE))
+            .ok()
+            .filter(|b| ours(b));
+        have = String::from("untested");
+    }
     if have != w.hash {
+        // Remember where we were, in case this run is cut short.
+        let backup = match &old {
+            Some(b) => state.save_file(BACKUP_FILE, b),
+            None => remove_if_exists(&state.dir.join(BACKUP_FILE)),
+        };
+        out.pending_hash.clone_from(&w.hash);
+        if let Err(e) = backup.and_then(|()| save(state, APPLIED_FILE, &out)) {
+            fail(
+                state,
+                &mut out,
+                &w.hash,
+                now,
+                &format!("không ghi được trạng thái: {e:#}"),
+            );
+            return Ok(());
+        }
         if let Err(msg) = swap(&layout, &live, old.as_deref(), w.text.as_deref()) {
             fail(state, &mut out, &w.hash, now, &msg);
             return Ok(());
@@ -910,24 +1000,12 @@ pub fn apply_now(state: &State) -> Result<()> {
             w.applied, w.blocking
         );
     }
-    // DirectAdmin: keep the copy CustomBuild restores after a rebuild.
-    if let Some(p) = &layout.persist {
-        let r = match &w.text {
-            Some(t) if fs::read(p).ok().as_deref() == Some(t.as_bytes()) => Ok(()),
-            Some(t) => fs::create_dir_all(p.parent().unwrap_or(Path::new("/")))
-                .map_err(anyhow::Error::from)
-                .and_then(|()| write_conf(p, t.as_bytes())),
-            None => match fs::read(p) {
-                Ok(b) if b.starts_with(FILE_MARKER.as_bytes()) => remove_if_exists(p),
-                _ => Ok(()),
-            },
-        };
-        if let Err(e) = r {
-            eprintln!(
-                "waf: could not keep the DirectAdmin copy {}: {e:#}",
-                p.display()
-            );
-        }
+    let mut note = String::new();
+    if let Some(p) = &layout.persist
+        && let Err(e) = keep_persist(p, w.text.as_deref())
+    {
+        eprintln!("waf: {e}");
+        note = e;
     }
     if have != w.hash || out.hash != w.hash {
         out.applied_at = now;
@@ -940,166 +1018,167 @@ pub fn apply_now(state: &State) -> Result<()> {
     } else {
         String::new()
     };
-    out.error.clear();
-    out.error_at = 0;
+    out.error = note;
+    out.error_at = if out.error.is_empty() { 0 } else { now };
     out.failed_hash.clear();
     out.failed_at = 0;
+    out.pending_hash.clear();
+    let _ = remove_if_exists(&state.dir.join(BACKUP_FILE));
     save(state, APPLIED_FILE, &out)
 }
 
-/// `sn disable`: take our rules out of the web server (and its DirectAdmin
-/// copy), test and reload it. Returns what it did.
-pub fn remove_all() -> String {
-    let layout = detect();
-    if let Some(p) = &layout.persist
-        && fs::read(p).is_ok_and(|b| b.starts_with(FILE_MARKER.as_bytes()))
-    {
-        let _ = fs::remove_file(p);
+/// `sn disable`: take our rules out of the web server (and the DirectAdmin
+/// copy) and keep them out until `sn waf-on`. Looks wherever a file of ours
+/// can be, even when ModSecurity is no longer found. Returns what it did.
+pub fn remove_all(state: &State) -> String {
+    // Kept out from now on, and no apply runs alongside.
+    let _ = state.save_file(OFF_FILE, b"sn disable\n");
+    if let Some(sc) = util::find_bin("systemctl") {
+        let _ = Command::new(sc)
+            .args(["stop", "sn-waf-apply.service"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
-    let Some(live) = &layout.live else {
-        return "WAF: no rules file of ours".into();
+    let layout = detect();
+    let applied: Applied = load(state, APPLIED_FILE);
+    let mut places: Vec<PathBuf> = vec![
+        Path::new(DA_CUSTOM_DIR).join(FILE_NAME),
+        Path::new(DA_RULES_DIR).join(FILE_NAME),
+    ];
+    places.extend(layout.persist.clone());
+    places.extend(layout.live.clone());
+    if !applied.rules_file.is_empty() {
+        places.push(PathBuf::from(&applied.rules_file));
+    }
+    places.sort();
+    places.dedup();
+    let mut removed: Vec<String> = Vec::new();
+    let mut live_removed = false;
+    for p in &places {
+        if p.file_name().and_then(|n| n.to_str()) != Some(FILE_NAME) {
+            continue;
+        }
+        let Ok(b) = fs::read(p) else { continue };
+        if !ours(&b) {
+            continue;
+        }
+        let is_copy = p.starts_with(DA_CUSTOMBUILD);
+        let r = if is_copy {
+            remove_if_exists(p).map_err(|e| format!("{e:#}"))
+        } else {
+            live_removed = true;
+            remove_live(&layout, p, &b)
+        };
+        match r {
+            Ok(()) => removed.push(p.display().to_string()),
+            Err(e) => return format!("WAF rules NOT removed from {}: {e}", p.display()),
+        }
+    }
+    let out = Applied {
+        hash: NO_FILE.into(),
+        ..Applied::default()
     };
-    let old = match fs::read(live) {
-        Ok(b) if b.starts_with(FILE_MARKER.as_bytes()) => b,
-        _ => return "WAF: no rules file of ours".into(),
-    };
-    match swap(&layout, live, Some(&old), None) {
-        Ok(()) => format!(
-            "WAF rules removed ({}), web server reloaded",
-            live.display()
-        ),
-        Err(e) => format!("WAF rules NOT removed: {e}"),
+    let _ = save(state, APPLIED_FILE, &out);
+    if removed.is_empty() {
+        "WAF: no rules file of ours; kept off until `sn waf-on`".into()
+    } else if live_removed {
+        format!(
+            "WAF rules removed ({}), web server reloaded; kept off until `sn waf-on`",
+            removed.join(", ")
+        )
+    } else {
+        format!(
+            "WAF rules removed ({}); kept off until `sn waf-on`",
+            removed.join(", ")
+        )
     }
 }
 
-/// Read new log lines and count matches of our rules.
-fn read_hits(layout: &Layout, local: &mut Local, now: i64) {
-    let mut files: Vec<PathBuf> = Vec::new();
-    for g in &layout.logs {
-        if let Ok(paths) = glob::glob(g) {
-            files.extend(paths.filter_map(Result::ok).take(LOG_FILES_MAX));
-        }
-        if files.len() >= LOG_FILES_MAX {
-            files.truncate(LOG_FILES_MAX);
-            break;
-        }
-    }
-    let marker: &[u8] = match layout.log_kind {
-        LogKind::ErrorLog => b"[id \"6",
-        LogKind::Audit => b"6",
+/// Take a live file of ours out and reload. Removing our own file cannot make
+/// the configuration invalid, so no test is needed (and none may be found,
+/// when ModSecurity itself is being taken away); a server that stops serving
+/// gets the file back.
+fn remove_live(layout: &Layout, p: &Path, old: &[u8]) -> Result<(), String> {
+    let Some(reload) = &layout.reload else {
+        return remove_if_exists(p).map_err(|e| format!("{e:#}")).map(|()| {
+            eprintln!(
+                "waf: {} removed; reload the web server yourself",
+                p.display()
+            )
+        });
     };
-    let mut budget = READ_TOTAL;
-    let mut seen: HashSet<String> = HashSet::new();
-    for path in files {
-        let Ok(meta) = fs::metadata(&path) else {
-            continue;
-        };
-        if !meta.is_file() {
-            continue;
-        }
-        let key = path.to_string_lossy().into_owned();
-        if !seen.insert(key.clone()) {
-            continue;
-        }
-        let len = meta.len();
-        let start = match local.offsets.get(&key) {
-            // Same file, not cut: carry on. Rotated, or truncated in place
-            // (logrotate's copytruncate): from the start.
-            Some(o) if o.dev == meta.dev() && o.inode == meta.ino() && o.pos <= len => o.pos,
-            Some(_) => 0,
-            // First sight: only what comes from now on.
-            None => len,
-        };
-        // Behind by more than one cycle reads of a file: its newest part.
-        let from = if len - start > READ_PER_FILE {
-            len - READ_PER_FILE
-        } else {
-            start
-        };
-        // The total budget only defers: the rest is read next cycle.
-        let take = (len - from).min(budget);
-        let mut end = from;
-        if take > 0
-            && let Ok(mut f) = fs::File::open(&path)
-            && f.seek(SeekFrom::Start(from)).is_ok()
-        {
-            let mut buf = Vec::with_capacity(usize::try_from(take).unwrap_or(0));
-            if f.take(take).read_to_end(&mut buf).is_ok() {
-                // Whole lines only; a partial last line is read next time.
-                let whole = buf.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
-                let mut lines = buf[..whole].split(|&b| b == b'\n');
-                if from != start {
-                    lines.next(); // a skipped-to position may be mid-line
-                }
-                for line in lines {
-                    if memchr::memmem::find(line, marker).is_none() {
-                        continue;
-                    }
-                    let text = String::from_utf8_lossy(line);
-                    match layout.log_kind {
-                        LogKind::ErrorLog => {
-                            if let Some(hit) = waf_conf::parse_hit(&text) {
-                                local.tally.add(hit, now);
-                            }
-                        }
-                        LogKind::Audit => {
-                            if memchr::memmem::find(line, b"SN Secure").is_none() {
-                                continue;
-                            }
-                            for hit in waf_conf::parse_audit_line(&text) {
-                                local.tally.add(hit, now);
-                            }
-                        }
-                    }
-                }
-                end = from + whole as u64;
-                budget = budget.saturating_sub(whole as u64);
-            }
-        }
-        local.offsets.insert(
-            key,
-            Offset {
-                dev: meta.dev(),
-                inode: meta.ino(),
-                pos: end,
-            },
-        );
+    let was_serving = serving();
+    remove_if_exists(p).map_err(|e| format!("{e:#}"))?;
+    let (code, output) = run(reload, RELOAD_TIMEOUT);
+    if code == Some(0) && (!was_serving || wait_serving()) {
+        return Ok(());
     }
-    local.offsets.retain(|k, _| seen.contains(k));
+    restore(p, Some(old));
+    let how = recover(layout, was_serving);
+    Err(format!(
+        "nạp lại ({}) lỗi:\n{output}\n{how}",
+        reload.join(" ")
+    ))
+}
+
+/// `sn waf-on`: let the hub's rules back in (the next watch cycle applies them).
+pub fn switch_on(state: &State) -> String {
+    match remove_if_exists(&state.dir.join(OFF_FILE)) {
+        Ok(()) => "WAF rules from the hub will be applied again at the next watch cycle".into(),
+        Err(e) => format!("could not switch the WAF back on: {e:#}"),
+    }
+}
+
+/// Watch cycle: matches counted from this cycle's access-log lines, kept until
+/// the next report.
+pub fn add_hits(state: &State, tally: Tally) {
+    if tally.rules.is_empty() {
+        return;
+    }
+    let mut local: Local = load(state, LOCAL_FILE);
+    local.tally.merge(tally);
+    if let Err(e) = save(state, LOCAL_FILE, &local) {
+        eprintln!("waf: {e:#}");
+    }
 }
 
 /// Watch cycle (sandboxed): the state of the WAF for the report, with the
 /// matches counted since the last report.
-pub fn status(state: &State) -> WafStatus {
-    let now = util::now_secs();
+pub fn status(state: &State, enforce: bool) -> WafStatus {
     let layout = detect();
     let applied: Applied = load(state, APPLIED_FILE);
     let mut local: Local = load(state, LOCAL_FILE);
-    if applied.applied > 0 {
-        read_hits(&layout, &mut local, now);
-    } else {
-        local.offsets.clear();
-    }
     let hits = local.tally.to_hits();
-    local.tally = Tally::default();
-    if let Err(e) = save(state, LOCAL_FILE, &local) {
-        eprintln!("waf: {e:#}");
-    }
-    let mut notes = layout.notes;
-    if !layout.taken.is_empty()
-        && let Some(rules) = hub_rules(state)
-    {
-        let clash: Vec<String> = rules
-            .iter()
-            .filter(|r| layout.taken.contains(&r.id))
-            .map(|r| format!("#{}", r.id))
-            .collect();
-        if !clash.is_empty() {
-            notes.push(format!(
-                "Bỏ qua luật {}: id đã có trong file luật khác của máy chủ web",
-                clash.join(", ")
-            ));
+    if !hits.is_empty() {
+        local.tally = Tally::default();
+        if let Err(e) = save(state, LOCAL_FILE, &local) {
+            eprintln!("waf: {e:#}");
         }
+    }
+    let rules = hub_rules(state).unwrap_or_default();
+    let mut notes = layout.notes;
+    if switched_off(state) {
+        notes.push(
+            "Đã tắt trên VPS bằng `sn disable`: luật không được đặt (bật lại: `sn waf-on`).".into(),
+        );
+    }
+    if !enforce && rules.iter().any(|r| r.block) {
+        notes.push(
+            "VPS đang ở chế độ observe: mọi luật chỉ ghi nhận, kể cả luật đã bật chặn.".into(),
+        );
+    }
+    let clash: Vec<String> = rules
+        .iter()
+        .filter(|r| layout.taken.contains(&r.id))
+        .map(|r| format!("#{}", r.id))
+        .collect();
+    if !clash.is_empty() {
+        notes.push(format!(
+            "Bỏ qua luật {}: id đã có trong file luật khác của máy chủ web",
+            clash.join(", ")
+        ));
     }
     WafStatus {
         server: layout.server,

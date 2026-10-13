@@ -140,7 +140,14 @@ enum Cmd {
     /// Put the WAF rules the hub ordered into the web server (root; started by
     /// the watch cycle with `systemd-run`).
     #[command(name = "waf-apply", hide = true)]
-    WafApply,
+    WafApply {
+        /// The VPS is in observe mode: every rule only logs.
+        #[arg(long)]
+        observe: bool,
+    },
+    /// Let the hub's WAF rules back into the web server after `sn disable`.
+    #[command(name = "waf-on")]
+    WafOn,
     /// Kill switch: remove the sn firewall table, release any jail and take
     /// the WAF rules out of the web server.
     Disable,
@@ -232,9 +239,13 @@ fn run() -> Result<()> {
             let state = State::open()?;
             remediate::run_job(&cfg, &state, &job)?;
         }
-        Cmd::WafApply => {
+        Cmd::WafApply { observe } => {
             let state = State::open()?;
-            waf::apply_now(&state)?;
+            waf::apply_now(&state, !observe)?;
+        }
+        Cmd::WafOn => {
+            let state = State::open()?;
+            println!("{}", waf::switch_on(&state));
         }
         Cmd::InstallClamav => {
             let state = State::open()?;
@@ -295,7 +306,10 @@ fn run() -> Result<()> {
             let _ = sys::fw::delete_table();
             let _ = sys::cgroup::release();
             println!("sn firewall table removed and jail released (kill switch).");
-            println!("{}", waf::remove_all());
+            match State::open() {
+                Ok(state) => println!("{}", waf::remove_all(&state)),
+                Err(e) => println!("WAF: state directory unavailable ({e:#})"),
+            }
         }
         Cmd::Env => {
             println!("sn {}", snsec_common::AGENT_VERSION);

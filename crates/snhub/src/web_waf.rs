@@ -143,6 +143,7 @@ pub(crate) fn rules_table(
                                 @match h {
                                     Some(h) if h.count > 0 => {
                                         b { (h.count) } " lần"
+                                        @if h.blocked > 0 { br; span class="badge b-bad" style="font-size:11px" { (h.blocked) " trả 403" } }
                                         br; span class="mut" style="font-size:12px" { "gần nhất " (rel_time(h.last_at)) }
                                         @if !h.samples.is_empty() {
                                             details {
@@ -250,7 +251,7 @@ pub async fn page(
         p class="sub" {
             "Chặn theo nội dung request (công cụ quét, đường dẫn dò file nhạy cảm, kiểu request của bot) thay vì chặn IP, "
             "nên khách thật dùng chung IP với bot (4G, mạng công ty) không bị chặn theo. Luật mới luôn ở chế độ "
-            b { "chỉ ghi nhận" } ": request vẫn đi qua, máy chủ web ghi một dòng log, agent đếm và báo về đây. "
+            b { "chỉ ghi nhận" } ": request vẫn đi qua; agent so access log với luật và báo về số request khớp (bao nhiêu đã nhận 403) cùng vài ví dụ. "
             "Xem số lần trúng và ví dụ, thấy đúng thì bấm " b { "Bật chặn" } " (trả 403)."
         }
         @if !q.msg.is_empty() { div class="note" { (q.msg) } }

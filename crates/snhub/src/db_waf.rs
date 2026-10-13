@@ -6,7 +6,7 @@
 //! counts and reports. An admin looks at those hits and only then lets the rule
 //! block (403). Rules apply to every VPS or to one.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Result, bail};
 use rusqlite::{OptionalExtension, params};
@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS waf_hits (
     agent_id TEXT NOT NULL,
     rule_id INTEGER NOT NULL,
     count INTEGER NOT NULL DEFAULT 0,
+    blocked INTEGER NOT NULL DEFAULT 0,
     last_at INTEGER NOT NULL DEFAULT 0,
     samples TEXT NOT NULL DEFAULT '[]',
     PRIMARY KEY (agent_id, rule_id)
@@ -112,6 +113,8 @@ impl WafRuleRow {
 #[derive(Debug, Clone, Default)]
 pub struct WafHits {
     pub count: u64,
+    /// Of those, answered 403.
+    pub blocked: u64,
     pub last_at: i64,
     pub samples: Vec<String>,
     /// VPSes (agent ids) where it matched.
@@ -215,32 +218,22 @@ impl Db {
             .conn
             .query_row("SELECT next FROM waf_seq WHERE k = 1", [], |r| r.get(0))
             .optional()?;
-        let max: Option<i64> = self
-            .conn
-            .query_row("SELECT MAX(id) FROM waf_rules", [], |r| r.get(0))?;
-        let mut next = stored
-            .unwrap_or(i64::from(MANAGED_ID_MIN))
-            .max(max.map_or(i64::from(MANAGED_ID_MIN), |m| m + 1));
-        if next > i64::from(MANAGED_ID_MAX) {
-            // Wrapped: the lowest free id.
-            let mut stmt = self.conn.prepare("SELECT id FROM waf_rules ORDER BY id")?;
-            let used: Vec<i64> = stmt
-                .query_map([], |r| r.get(0))?
-                .filter_map(Result::ok)
-                .collect();
-            let mut want = i64::from(MANAGED_ID_MIN);
-            for id in used {
-                if id == want {
-                    want += 1;
-                } else if id > want {
-                    break;
-                }
-            }
-            if want > i64::from(MANAGED_ID_MAX) {
-                bail!("no free WAF rule id");
-            }
-            next = want;
-        }
+        let (lo, hi) = (i64::from(MANAGED_ID_MIN), i64::from(MANAGED_ID_MAX));
+        let mut stmt = self.conn.prepare("SELECT id FROM waf_rules")?;
+        let used: HashSet<i64> = stmt
+            .query_map([], |r| r.get(0))?
+            .filter_map(Result::ok)
+            .collect();
+        // The first free id from where the last one was handed out, wrapping
+        // round once: an id just freed is the last to be used again.
+        let start = stored.filter(|s| (lo..=hi).contains(s)).unwrap_or(lo);
+        let span = hi - lo + 1;
+        let Some(next) = (0..span)
+            .map(|k| lo + (start - lo + k) % span)
+            .find(|id| !used.contains(id))
+        else {
+            bail!("no free WAF rule id");
+        };
         self.conn.execute(
             "INSERT INTO waf_seq (k, next) VALUES (1, ?1) ON CONFLICT(k) DO UPDATE SET next = ?1",
             params![next + 1],
@@ -273,7 +266,9 @@ impl Db {
         let existing: Option<i64> = self
             .conn
             .query_row(
-                "SELECT id FROM waf_rules WHERE kind = ?1 AND value = ?2 AND agent_id = ?3",
+                // The same rule for every VPS already covers this one.
+                "SELECT id FROM waf_rules WHERE kind = ?1 AND value = ?2 \
+                 AND (agent_id = ?3 OR agent_id = '') ORDER BY agent_id = '' DESC LIMIT 1",
                 params![kind.as_str(), value, agent_id],
                 |r| r.get(0),
             )
@@ -464,16 +459,21 @@ impl Db {
             }
             samples.truncate(SAMPLES_KEPT);
             let count = i64::try_from(h.count).unwrap_or(i64::MAX);
+            let blocked = i64::try_from(h.blocked.min(h.count)).unwrap_or(i64::MAX);
             self.conn.execute(
-                "INSERT INTO waf_hits (agent_id, rule_id, count, last_at, samples) VALUES (?1, ?2, ?3, ?4, ?5) \
+                "INSERT INTO waf_hits (agent_id, rule_id, count, blocked, last_at, samples) \
+                 VALUES (?1, ?2, ?3, ?6, ?4, ?5) \
                  ON CONFLICT(agent_id, rule_id) DO UPDATE SET \
-                 count = MIN(count + ?3, 9000000000000000000), last_at = MAX(last_at, ?4), samples = ?5",
+                 count = MIN(count + ?3, 9000000000000000000), \
+                 blocked = MIN(blocked + ?6, 9000000000000000000), \
+                 last_at = MAX(last_at, ?4), samples = ?5",
                 params![
                     agent_id,
                     i64::from(h.id),
                     count,
                     h.last_at,
-                    serde_json::to_string(&samples)?
+                    serde_json::to_string(&samples)?,
+                    blocked
                 ],
             )?;
         }
@@ -484,7 +484,7 @@ impl Db {
     /// Hits per rule id, summed over the VPSes, or for one VPS.
     pub fn waf_hits(&self, agent_id: Option<&str>) -> Result<HashMap<u32, WafHits>> {
         let mut stmt = self.conn.prepare(
-            "SELECT agent_id, rule_id, count, last_at, samples FROM waf_hits \
+            "SELECT agent_id, rule_id, count, last_at, samples, blocked FROM waf_hits \
              WHERE ?1 IS NULL OR agent_id = ?1",
         )?;
         let rows = stmt.query_map(params![agent_id], |r| {
@@ -494,13 +494,17 @@ impl Db {
                 r.get::<_, i64>(2)?,
                 r.get::<_, i64>(3)?,
                 r.get::<_, String>(4)?,
+                r.get::<_, i64>(5)?,
             ))
         })?;
         let mut out: HashMap<u32, WafHits> = HashMap::new();
-        for (agent, id, count, last_at, samples) in rows.filter_map(Result::ok) {
+        for (agent, id, count, last_at, samples, blocked) in rows.filter_map(Result::ok) {
             let Ok(id) = u32::try_from(id) else { continue };
             let e = out.entry(id).or_default();
             e.count = e.count.saturating_add(u64::try_from(count).unwrap_or(0));
+            e.blocked = e
+                .blocked
+                .saturating_add(u64::try_from(blocked).unwrap_or(0));
             e.last_at = e.last_at.max(last_at);
             e.agents.push(agent);
             let s: Vec<String> = serde_json::from_str(&samples).unwrap_or_default();
@@ -643,12 +647,14 @@ mod tests {
             &[WafHit {
                 id,
                 count: 3,
+                blocked: 1,
                 last_at: 5,
                 samples: vec!["a.example /.git/config".into()],
             }],
         )
         .unwrap();
         assert_eq!(db.waf_hits(None).unwrap()[&id].count, 3);
+        assert_eq!(db.waf_hits(None).unwrap()[&id].blocked, 1);
 
         assert!(db.remove_waf_rule(id, "admin", 4).unwrap());
         assert_eq!(desired_waf(&db, "a").unwrap(), Vec::<WafRule>::new());
@@ -676,6 +682,7 @@ mod tests {
         let hit = |count, last_at, s: &str| WafHit {
             id,
             count,
+            blocked: 0,
             last_at,
             samples: vec![s.into()],
         };
@@ -687,6 +694,7 @@ mod tests {
             &[WafHit {
                 id: id + 1000,
                 count: 99,
+                blocked: 0,
                 last_at: 30,
                 samples: vec![],
             }],
@@ -700,6 +708,49 @@ mod tests {
         let a = db.waf_hits(Some("a")).unwrap();
         assert_eq!(a[&id].count, 5);
         assert_eq!(a[&id].samples[0], "x /b");
+    }
+
+    #[test]
+    fn a_rule_every_vps_has_is_not_added_again_for_one() {
+        let db = db_with(&["a"]);
+        let AddOutcome::Added(id) = db
+            .add_waf_rule(WafKind::Path, "/.env", "", "", "admin", 1)
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(
+            db.add_waf_rule(WafKind::Path, "/.env", "a", "", "admin", 2)
+                .unwrap(),
+            AddOutcome::Exists(id)
+        );
+        assert_eq!(db.list_waf_rules().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn after_the_last_id_a_just_freed_id_is_the_last_to_come_back() {
+        let db = db_with(&["a"]);
+        // Pretend the counter is at the top of the range.
+        db.conn
+            .execute(
+                "INSERT INTO waf_seq (k, next) VALUES (1, ?1)",
+                params![i64::from(MANAGED_ID_MAX)],
+            )
+            .unwrap();
+        let add = |v: &str| match db
+            .add_waf_rule(WafKind::Path, v, "", "", "admin", 1)
+            .unwrap()
+        {
+            AddOutcome::Added(id) => id,
+            AddOutcome::Exists(_) => panic!(),
+        };
+        let top = add("/.one");
+        assert_eq!(top, MANAGED_ID_MAX);
+        let first = add("/.two");
+        assert_eq!(first, MANAGED_ID_MIN);
+        assert!(db.remove_waf_rule(first, "admin", 2).unwrap());
+        // Not handed out again at once.
+        assert_eq!(add("/.three"), MANAGED_ID_MIN + 1);
     }
 
     #[test]

@@ -386,6 +386,14 @@ fn collect(state: &State, trusted: &[Cidr], sources: &[LogSource]) -> Result<Cyc
     // Each log file is a site of its own (panels write one per vhost), unless
     // the format names the vhost.
     let mut file_no: u64 = 0;
+    // The hub's WAF rules, applied to each request: what they match is
+    // counted here, whatever ModSecurity logs.
+    let matcher = crate::waf::hub_rules(state)
+        .map(|r| snsec_common::waf::Matcher::new(&r))
+        .filter(|m| !m.is_empty());
+    let mut waf_hits = crate::waf_conf::Tally::default();
+    let mut matched: Vec<u32> = Vec::new();
+    let now = crate::util::now_secs();
 
     'outer: for src in sources {
         let fmt = LogFormat::from_str_opt(&src.format).unwrap_or(LogFormat::Combined);
@@ -426,6 +434,12 @@ fn collect(state: &State, trusted: &[Cidr], sources: &[LogSource]) -> Result<Cyc
                 data.catch_up = true;
             }
             offsets.insert(key, read.new_offset);
+            // The site a WAF example names: the vhost when the format has it,
+            // else the log file (one per site on a panel).
+            let file_site = path
+                .file_name()
+                .map(|n| n.to_string_lossy().trim_end_matches(".log").to_string())
+                .unwrap_or_default();
             for line in &read.lines {
                 data.lines_read += 1;
                 match logfmt::parse_line(fmt, line, trusted) {
@@ -443,6 +457,24 @@ fn collect(state: &State, trusted: &[Cidr], sources: &[LogSource]) -> Result<Cyc
                                 bots::hash64(bankey.as_bytes()),
                                 parsed.client,
                             );
+                        }
+                        if let Some(m) = &matcher {
+                            m.check(
+                                &parsed.method,
+                                &parsed.path,
+                                &parsed.user_agent,
+                                &mut matched,
+                            );
+                            for id in &matched {
+                                waf_hits.add(*id, parsed.status == 403, now, || {
+                                    let site = if parsed.host.is_empty() {
+                                        file_site.as_str()
+                                    } else {
+                                        parsed.host.as_str()
+                                    };
+                                    crate::waf_conf::sample_of(site, &parsed.path)
+                                });
+                            }
                         }
                         let site = site_of(&parsed, file_no);
                         if let Some(agg) = data.track(bankey) {
@@ -474,6 +506,7 @@ fn collect(state: &State, trusted: &[Cidr], sources: &[LogSource]) -> Result<Cyc
     if !cut_short {
         offsets.retain(|k, _| seen.contains(k));
     }
+    crate::waf::add_hits(state, waf_hits);
     state.save_offsets(&offsets)?;
     Ok(data)
 }
@@ -1143,6 +1176,63 @@ mod tests {
         };
         assert_eq!(site_of(&named, 7), site_of(&other, 9));
         assert_ne!(site_of(&named, 7), 7);
+    }
+
+    #[test]
+    fn waf_rules_are_counted_from_the_access_logs() {
+        use snsec_common::waf::{WafKind, WafRule};
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        std::fs::create_dir(&logs).unwrap();
+        let state = State::at(dir.path().join("state"));
+        let src = [LogSource::new(
+            format!("{}/*.log", logs.display()),
+            "combined".into(),
+        )];
+        let log = logs.join("shop.example.log");
+        std::fs::write(&log, "").unwrap();
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
+        crate::waf::set_rules(
+            &state,
+            &[
+                WafRule {
+                    id: 60_001,
+                    kind: WafKind::Path,
+                    value: "/.env".into(),
+                    block: false,
+                },
+                WafRule {
+                    id: 60_002,
+                    kind: WafKind::UaToken,
+                    value: "sqlmap".into(),
+                    block: true,
+                },
+            ],
+        );
+        collect(&state, &[], &src).unwrap();
+        let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        for line in [
+            r#"198.51.100.7 - - [x] "GET /.env HTTP/1.1" 404 1 "-" "curl/8""#,
+            r#"198.51.100.7 - - [x] "GET //./.env?a=1 HTTP/1.1" 404 1 "-" "curl/8""#,
+            r#"198.51.100.8 - - [x] "GET /?id=1 HTTP/1.1" 403 1 "-" "sqlmap/1.8""#,
+            r#"198.51.100.9 - - [x] "GET /shop HTTP/1.1" 200 1 "-" "Mozilla/5.0""#,
+        ] {
+            writeln!(f, "{line}").unwrap();
+        }
+        collect(&state, &[], &src).unwrap();
+        let st = crate::waf::status(&state, true);
+        let by_id = |id| st.hits.iter().find(|h| h.id == id).unwrap();
+        assert_eq!(by_id(60_001).count, 2);
+        assert_eq!(by_id(60_001).blocked, 0);
+        assert_eq!(
+            by_id(60_001).samples,
+            vec!["shop.example /.env".to_string()]
+        );
+        assert_eq!((by_id(60_002).count, by_id(60_002).blocked), (1, 1));
+        // Taken by that report: the next one starts from zero.
+        assert!(crate::waf::status(&state, true).hits.is_empty());
     }
 
     #[test]

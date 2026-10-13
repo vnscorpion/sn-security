@@ -324,21 +324,22 @@ Chặn theo **nội dung request** thay vì theo IP: công cụ quét (`sqlmap`,
 
 **Cách dùng (menu WAF trên hub):**
 1. Thêm luật: gõ tay, bấm **Thêm gói luật cơ bản**, hoặc bấm **Thêm vào WAF** cạnh một User-Agent / kiểu request bị gắn "Bất thường" trên trang VPS. Luật áp cho mọi VPS hoặc một VPS.
-2. Luật mới luôn **chỉ ghi nhận**: request vẫn đi qua, máy chủ web ghi một dòng log, agent đếm và báo về. Hub hiện số lần trúng, lần gần nhất và vài ví dụ (`host /đường-dẫn`, không có query string).
-3. Thấy đúng là bot/dò quét thì bấm **Bật chặn** (trả 403). Muốn thôi thì **Chỉ ghi nhận** hoặc **Xoá**. VPS áp ở lần lấy lệnh kế tiếp (≤ 15 phút).
+2. Luật mới luôn **chỉ ghi nhận**: request vẫn đi qua. Agent so từng request trong access log với luật và báo về số request khớp, bao nhiêu trong đó đã nhận 403, lần gần nhất và vài ví dụ (`tên-miền /đường-dẫn`, không có query string).
+3. Thấy đúng là bot/dò quét thì bấm **Bật chặn** (trả 403). Muốn thôi thì **Chỉ ghi nhận** hoặc **Xoá**. VPS áp ở lần lấy lệnh kế tiếp (≤ 15 phút). Sau khi bật chặn, cột "trả 403" cho biết luật có thật sự chặn không.
 
 **Trên VPS agent làm gì:**
-- Tìm ModSecurity theo máy chủ web (DirectAdmin: `webserver` trong `options.conf`; Apache dùng ModSecurity 2, nginx và OpenLiteSpeed dùng libmodsecurity 3, LiteSpeed Enterprise dùng engine riêng đọc cấu hình Apache). Ghi **một file của riêng nó**, `zz-sn-secure.conf`, vào thư mục luật mà cấu hình đã nạp sẵn (`/etc/modsecurity.d/` trên DirectAdmin), kèm một bản ở `custombuild/custom/modsecurity/conf/` để `da build modsecurity` không xoá mất. Không sửa file nào khác của máy chủ web hay của DirectAdmin.
-- Hub chỉ gửi **dữ liệu** (loại luật + giá trị); agent tự dựng câu `SecRule` từ mẫu cố định, escape mọi giá trị, từ chối `%{…}`, ký tự lạ và từ mà trình duyệt thật cũng gửi. Hub bị chiếm cũng không chèn được `SecRuleEngine Off`, `exec:` hay `Include` vào cấu hình.
-- Ghi file xong thì kiểm tra cấu hình (`httpd -t`, `nginx -t`, `openlitespeed -t`), nạp lại nhẹ (`systemctl reload …`), xem máy chủ còn nghe cổng 80/443 không; LiteSpeed (không có lệnh kiểm tra) thì đọc log của nó sau khi nạp lại. Lỗi ở bất kỳ bước nào: **trả lại file cũ**, nạp lại, báo lỗi lên hub, một giờ sau mới thử lại.
+- Tìm ModSecurity theo máy chủ web (DirectAdmin: `webserver` trong `options.conf`; Apache dùng ModSecurity 2, nginx và OpenLiteSpeed dùng libmodsecurity 3, LiteSpeed Enterprise dùng engine riêng đọc cấu hình Apache). Ghi **một file của riêng nó**, `zz-sn-secure.conf`, vào thư mục luật mà cấu hình đã nạp sẵn (`/etc/modsecurity.d/` trên DirectAdmin), kèm một bản ở `custombuild/custom/modsecurity/conf/` để `da build modsecurity` không xoá mất. Không sửa file nào khác của máy chủ web hay của DirectAdmin; file trùng tên mà không phải của SN Secure thì không ghi đè.
+- Hub chỉ gửi **dữ liệu** (loại luật + giá trị); agent tự dựng câu `SecRule` từ mẫu cố định. Giá trị chỉ được chứa ký tự an toàn (không `"`, `\`, `%{…}`, ký tự điều khiển), có giới hạn độ dài, và không được là thứ khách thật cũng gửi: User-Agent nguyên bản của trình duyệt, từ như `chrome`, `x86_64`, `15e148`, tên crawler, thư mục như `/wp-content/` (chỉ thư mục ẩn như `/.git/` mới được chặn cả thư mục), `/?s` (tìm kiếm WordPress). Hub bị chiếm cũng không chèn được `SecRuleEngine Off`, `exec:` hay `Include` vào cấu hình.
+- Ghi file xong thì kiểm tra cấu hình (`httpd -t`, `nginx -t`, `openlitespeed -t`; thiếu lệnh kiểm tra thì không áp), nạp lại nhẹ (`systemctl reload …`), xem máy chủ còn nghe cổng 80/443 không; LiteSpeed Enterprise (không có lệnh kiểm tra) thì đọc log của nó sau khi nạp lại. Lỗi ở bất kỳ bước nào: **trả lại file cũ** và nạp lại (máy chủ vẫn không chạy thì khởi động lại), báo lỗi lên hub, một giờ sau mới thử lại. Lần áp bị cắt ngang (khởi động lại máy giữa chừng) được kiểm tra lại từ đầu.
 - Bỏ qua luật có id trùng với file luật khác (id trùng làm máy chủ web không khởi động được). Id luật của hub: 60000–69999.
 - Mỗi chu kỳ kiểm tra file còn đúng chỗ (sau `da build` chẳng hạn) và đặt lại nếu mất.
-- Đọc số lần trúng từ log lỗi theo tên miền (`/var/log/httpd/domains/*.error.log`, nginx tương tự); OpenLiteSpeed thì từ audit log JSON (nó chỉ ghi vào log lỗi ở mức INFO). Chỉ lấy id luật, host và đường dẫn.
-- `sn disable` (và `deploy/uninstall.sh`) gỡ file luật rồi nạp lại máy chủ web. `sn env` in máy chủ web, trạng thái ModSecurity và đường dẫn file luật mà agent dò được.
+- Luật chỉ ghi nhận **không** ghi vào audit log của ModSecurity (audit log chứa cookie và nội dung request, ví dụ mật khẩu khi đăng nhập). Luật đã bật chặn thì có, nên chủ site thấy lần chặn ở trang WAF của DirectAdmin.
+- VPS ở chế độ **observe**: mọi luật chỉ ghi nhận, kể cả luật đã bật chặn.
+- `sn disable` (và `deploy/uninstall.sh`) gỡ file luật (cả bản trong `custombuild`) rồi nạp lại máy chủ web, và **giữ tắt** cho tới khi chạy `sn waf-on`. `sn env` in máy chủ web, trạng thái ModSecurity và đường dẫn file luật mà agent dò được.
 
 **Đọc trước khi bật chặn:**
-- Trên DirectAdmin, ModSecurity **mặc định tắt** cho tới khi bạn bật trong mục WAF của panel; từng tên miền còn có thể tắt nó hoặc loại trừ id luật (SecRuleRemoveById). Hub ghi rõ trạng thái (Đang bật / Tắt / Chưa cài) và liệt kê tên miền tắt hoặc loại trừ luật của SN Secure. Ở nơi ModSecurity tắt, luật không chạy, kể cả luật đã bật chặn.
-- Luật trúng cả khi chỉ ghi nhận lẫn khi chặn đều vào audit log, nên chủ site thấy chúng ở trang WAF của DirectAdmin.
+- Trên DirectAdmin, ModSecurity **mặc định tắt** cho tới khi bạn bật trong mục WAF của panel; từng tên miền còn có thể tắt nó hoặc loại trừ id luật (SecRuleRemoveById). Hub ghi rõ trạng thái (Đang bật / Tắt / Chưa cài) và liệt kê tên miền tắt hoặc loại trừ luật của SN Secure. Ở nơi ModSecurity tắt, luật không chạy, kể cả luật đã bật chặn; số lần khớp vẫn đếm được vì lấy từ access log.
+- Số lần khớp là agent tự so access log với luật (giải mã và chuẩn hoá đường dẫn giống ModSecurity), nên có thể lệch chút ít so với ModSecurity thật.
 - Chưa chặn được: file tĩnh trên LiteSpeed Enterprise và trang trả từ LSCache trên OpenLiteSpeed (ModSecurity bỏ qua), request bị nginx chuyển hướng trước khi ModSecurity chạy.
 - Đường đặt file qua `custombuild/custom/modsecurity/conf/` lấy từ diễn đàn và hướng dẫn của DirectAdmin, chưa có trong tài liệu chính thức; agent không dựa hẳn vào nó vì vẫn tự kiểm tra mỗi chu kỳ.
 - Chưa chạy thử trên VPS DirectAdmin thật. Nên thêm gói cơ bản, để chỉ ghi nhận một hai ngày, xem ví dụ rồi mới bật chặn.
@@ -401,7 +402,8 @@ Mọi thay đổi đều hoàn tác được (`sn undo`) và ghi vào `/var/lib/
 | `enroll --url --name` | Đăng ký với hub (token lấy từ biến môi trường `SN_ENROLL_TOKEN`; `--token` vẫn nhận nhưng lộ trên danh sách tiến trình) |
 | `report` | In báo cáo gần nhất (JSON) |
 | `env` | Phiên bản, cgroup, nftables, whitelist, **log đang theo dõi và web server đã dò ra**, ModSecurity và file luật WAF |
-| `disable` | Kill switch: gỡ table `inet sn`, thả jail, gỡ file luật WAF của SN Secure và nạp lại máy chủ web |
+| `disable` | Kill switch: gỡ table `inet sn`, thả jail, gỡ file luật WAF của SN Secure và nạp lại máy chủ web (luật WAF giữ tắt tới `waf-on`) |
+| `waf-on` | Cho luật WAF từ hub vào lại máy chủ web sau `disable` |
 
 ## An toàn (những bất biến đã cài trong code)
 

@@ -727,7 +727,14 @@ fn call_tool(
         return Some(fail("lỗi hệ thống (database)"));
     };
     if !def.read_only {
-        let all = arg_str(args, "vps").is_some_and(|v| v.trim().eq_ignore_ascii_case("all"));
+        // A change to a rule for every VPS reaches every VPS, like "all".
+        let fleet_rule = matches!(name, "set_waf_rule" | "remove_waf_rule")
+            && arg_waf_id(args)
+                .ok()
+                .and_then(|id| db.waf_rule(id).ok().flatten())
+                .is_some_and(|r| r.agent_id.is_empty());
+        let all = fleet_rule
+            || arg_str(args, "vps").is_some_and(|v| v.trim().eq_ignore_ascii_case("all"));
         let cost = if all {
             db.list_agents().map_or(1, |a| a.len().max(1))
         } else {
@@ -860,6 +867,7 @@ fn get_waf(db: &Db) -> Value {
                 "changed_by": r.updated_by,
                 "changed_at": r.updated_at,
                 "hits": h.map_or(0, |h| h.count),
+                "answered_403": h.map_or(0, |h| h.blocked),
                 "last_hit_at": h.map(|h| h.last_at),
                 "examples": h.map(|h| h.samples.clone()).unwrap_or_default(),
             })

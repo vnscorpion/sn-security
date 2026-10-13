@@ -14,10 +14,14 @@
 //!   log). The hub never sends rule text: the agent renders every rule here,
 //!   from a fixed template, so a compromised hub cannot slip `SecRuleEngine Off`,
 //!   an `exec:` action or an `Include` into the web server's configuration.
+//!   [`Matcher`] applies the same rules to access-log lines, which is how the
+//!   agent counts what a rule matches (whatever the engine logs).
 //!
-//! Every value that came from a log (attacker-controlled) is escaped, and
-//! anything that cannot be expressed safely yields `None` rather than a rule
-//! that might block something else.
+//! Every value that came from a log (attacker-controlled) is checked against a
+//! narrow character set; anything that cannot be expressed safely, or that
+//! would also match ordinary visitors, yields `None`.
+
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -31,6 +35,8 @@ pub const MANAGED_ID_MIN: u32 = 60_000;
 pub const MANAGED_ID_MAX: u32 = 69_999;
 /// At most this many managed rules on one VPS.
 pub const MAX_WAF_RULES: usize = 300;
+/// No value of any kind is longer.
+pub const VALUE_MAX: usize = 250;
 
 /// A stable rule id for a key, so re-generating the same rule gives the same id.
 #[must_use]
@@ -49,25 +55,43 @@ pub fn rule_id(key: &str) -> u32 {
 const UA_MAX: usize = 199;
 const NAME_MAX: usize = 39;
 const PATH_MAX: usize = 119;
-/// A rule whose only anchor is a path placeholder needs this many parameter
-/// names, or it would block every request that merely carries `?p` or `?s`.
-const MIN_NAMES_WITHOUT_PATH: usize = 3;
+/// Parameter names one shape rule may require.
+const NAMES_MAX: usize = 16;
+/// A shape whose path is a placeholder, `/` or `/index.php` needs this many
+/// parameter names, or it would match every request that merely carries `?p`,
+/// `?s` (WordPress search) or `?fbclid`.
+const MIN_NAMES_LOOSE_PATH: usize = 3;
 /// Scanner words: long enough not to occur by chance, short enough to be a word.
 const TOKEN_MIN: usize = 4;
 const TOKEN_MAX: usize = 32;
+const TOKEN_MIN_LETTERS: usize = 3;
 
-/// Printable ASCII only. Control characters or non-ASCII bytes in a log value
-/// are not something to put into a rule. `%{...}` is refused too: ModSecurity
-/// expands it inside operands, so a User-Agent of `%{REQUEST_HEADERS.User-Agent}`
+/// Printable ASCII only, without `"` or `\` (so no operand ever needs escaping,
+/// whatever the engine's quoting rules) and without `%{...}`, which ModSecurity
+/// expands inside operands: a User-Agent of `%{REQUEST_HEADERS.User-Agent}`
 /// would turn the rule into "match every request".
 fn is_safe(s: &str) -> bool {
-    !s.is_empty() && s.bytes().all(|b| (0x20..=0x7e).contains(&b)) && !s.contains("%{")
+    !s.is_empty()
+        && s.len() <= VALUE_MAX
+        && s.bytes()
+            .all(|b| (0x20..=0x7e).contains(&b) && b != b'"' && b != b'\\')
+        && !s.contains("%{")
 }
 
-/// Parameter names and paths are matched by ModSecurity after URL-decoding, but
-/// the log holds them encoded, so anything with a `%` would not match.
+/// Parameter names are matched by ModSecurity after URL-decoding, but the log
+/// holds them encoded, so anything with a `%` would not match.
 fn is_plain(s: &str) -> bool {
     is_safe(s) && !s.contains('%')
+}
+
+/// Characters a path in a rule may hold: nothing URL-decoding changes (no `%`,
+/// no `+`), nothing a regular expression treats specially except `.`.
+fn is_path_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'/' | b'.' | b'_' | b'~' | b',' | b':' | b'@' | b'!' | b'-'
+        )
 }
 
 /// User-Agent substrings of well-known crawlers. They legitimately arrive from
@@ -93,9 +117,10 @@ pub fn claims_crawler(s: &str) -> bool {
     CRAWLER_TOKENS.iter().any(|t| lower.contains(t))
 }
 
-/// Words every browser sends. A scanner-word rule on one of these would block
-/// real visitors, so it is refused outright.
-const BROWSER_WORDS: &[&str] = &[
+/// Words real browsers, apps and crawlers send. A scanner-word rule that is
+/// one of these, or part of one, would block ordinary visitors or search
+/// engines, so it is refused.
+const COMMON_UA_WORDS: &[&str] = &[
     "mozilla",
     "applewebkit",
     "webkit",
@@ -115,6 +140,7 @@ const BROWSER_WORDS: &[&str] = &[
     "android",
     "iphone",
     "ipad",
+    "ipod",
     "macintosh",
     "windows",
     "linux",
@@ -124,24 +150,71 @@ const BROWSER_WORDS: &[&str] = &[
     "win64",
     "wow64",
     "x64",
+    "x86_64",
+    "aarch64",
+    "arm64",
+    "armv7l",
+    "armv8l",
+    "cros",
     "ubuntu",
+    "fedora",
     "samsungbrowser",
     "crios",
     "fxios",
     "build",
+    "15e148",
+    "trident",
+    "msie",
+    "yabrowser",
+    "ucbrowser",
+    "miuibrowser",
+    "huaweibrowser",
+    "vivaldi",
+    "brave",
+    "silk",
+    "kindle",
+    "tablet",
+    "http",
+    "https",
+    "www.",
+    "google",
+    "bing",
+    "yahoo",
+    "facebook",
+    "twitter",
+    "whatsapp",
+    "telegram",
+    "slack",
+    "discord",
+    "skype",
+    "spider",
+    "crawl",
+    "robot",
+    "preview",
 ];
 
-/// Escape for a double-quoted ModSecurity operand.
-fn esc(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    for c in s.chars() {
-        if c == '\\' || c == '"' {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
+/// A User-Agent exactly as a stock browser sends it. Since Chrome reduced its
+/// User-Agent (`Chrome/148.0.0.0`), one such string is shared by every user of
+/// that browser version on that system: an exact-match rule on it would block
+/// all of them.
+fn is_stock_browser(ua: &str) -> bool {
+    ua.starts_with("Mozilla/5.0 (")
+        && (ua.contains("AppleWebKit/537.36 (KHTML, like Gecko)")
+            || ua.contains("AppleWebKit/605.1.15 (KHTML, like Gecko)")
+            || ua.contains("Gecko/20100101 Firefox/"))
 }
+
+/// Exact paths every site serves to everyone.
+const COMMON_PATHS: &[&str] = &[
+    "/index.php",
+    "/index.html",
+    "/wp-admin/admin-ajax.php",
+    "/wp-cron.php",
+    "/robots.txt",
+    "/favicon.ico",
+    "/sitemap.xml",
+    "/wp-json",
+];
 
 /// What a rule does on a match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,14 +226,15 @@ enum Verdict {
 }
 
 impl Verdict {
-    /// Both write an error-log line and an audit record: OpenLiteSpeed logs
-    /// matches to its error log only at INFO level, so the agent counts them
-    /// from the audit log there, and the site owner sees the match in the
-    /// panel's WAF page (DirectAdmin reads the audit log, which it rotates at
-    /// 10 MB) and can exclude the rule for their site.
+    /// A log-only rule stays out of the audit log: the request goes on to
+    /// phase 2, so its record would hold the cookies and the request body (a
+    /// rule on `/wp-login.php` would collect passwords). The agent counts
+    /// matches from the access log, not from ModSecurity's logs. A blocking
+    /// rule stops in phase 1, before the body is read, and its audit record is
+    /// how the site owner sees the 403 in the panel's WAF page.
     fn actions(self) -> &'static str {
         match self {
-            Verdict::Log => "pass,log,auditlog",
+            Verdict::Log => "pass,log,noauditlog",
             Verdict::Block => "deny,status:403,log,auditlog",
         }
     }
@@ -175,7 +249,7 @@ pub enum WafKind {
     /// A request shape, `METHOD /path?name1&name2` (see [`rule_for_shape`]).
     Shape,
     /// A path no site should serve, such as `/.env`. A value ending in `/`
-    /// covers everything below it (`/.git/`).
+    /// covers everything below it, for a hidden directory only (`/.git/`).
     Path,
     /// A word in the User-Agent of a vulnerability scanner (`sqlmap`, `nikto`),
     /// matched case-insensitively.
@@ -229,7 +303,7 @@ pub struct WafRule {
 
 impl WafRule {
     /// The ModSecurity text for this rule, or `None` when the id is outside the
-    /// managed range or the value cannot be expressed safely.
+    /// managed range or the value is not acceptable.
     #[must_use]
     pub fn render(&self) -> Option<String> {
         if !(MANAGED_ID_MIN..=MANAGED_ID_MAX).contains(&self.id) {
@@ -256,7 +330,39 @@ pub fn valid_value(kind: WafKind, value: &str) -> bool {
     render(kind, value, MANAGED_ID_MIN, Verdict::Log).is_some()
 }
 
+fn valid_token(value: &str) -> bool {
+    (TOKEN_MIN..=TOKEN_MAX).contains(&value.len())
+        && value.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_' | b'.')
+        })
+        && value.bytes().filter(u8::is_ascii_lowercase).count() >= TOKEN_MIN_LETTERS
+        && !COMMON_UA_WORDS
+            .iter()
+            .chain(CRAWLER_TOKENS)
+            .any(|w| w.contains(value) || value.contains(w))
+}
+
+/// A probe path: absolute, already normal (`normalizePath` leaves it as it is),
+/// not one every site serves. A prefix (`/x/`) only for a hidden directory.
+fn valid_path(value: &str) -> bool {
+    let normal = value.starts_with('/')
+        && (3..=PATH_MAX).contains(&value.len())
+        && value.bytes().all(is_path_char)
+        && !value.contains("//")
+        && !value.contains("/./")
+        && !value.contains("/../")
+        && !value.ends_with("/.")
+        && !value.ends_with("/..");
+    if !normal || COMMON_PATHS.contains(&value.trim_end_matches('/')) {
+        return false;
+    }
+    !value.ends_with('/') || value[1..].starts_with('.')
+}
+
 fn render(kind: WafKind, value: &str, id: u32, verdict: Verdict) -> Option<String> {
+    if !is_safe(value) {
+        return None;
+    }
     let head = format!(
         "id:{id},phase:1,{},msg:'{}',tag:'sn-secure'",
         verdict.actions(),
@@ -264,42 +370,20 @@ fn render(kind: WafKind, value: &str, id: u32, verdict: Verdict) -> Option<Strin
     );
     match kind {
         WafKind::UserAgent => {
-            if !is_safe(value) || value.len() > UA_MAX {
+            if value.len() > UA_MAX || is_stock_browser(value) {
                 return None;
             }
             Some(format!(
-                "SecRule REQUEST_HEADERS:User-Agent \"@streq {}\" \"{head},t:none\"",
-                esc(value)
+                "SecRule REQUEST_HEADERS:User-Agent \"@streq {value}\" \"{head},t:none\""
             ))
         }
-        WafKind::UaToken => {
-            let ok = (TOKEN_MIN..=TOKEN_MAX).contains(&value.len())
-                && value.bytes().all(|b| {
-                    b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_' | b'.')
-                })
-                && value.bytes().any(|b| b.is_ascii_lowercase())
-                && !BROWSER_WORDS
-                    .iter()
-                    .any(|w| w.contains(value) || value.contains(w));
-            if !ok {
-                return None;
-            }
-            Some(format!(
+        WafKind::UaToken => valid_token(value).then(|| {
+            format!(
                 "SecRule REQUEST_HEADERS:User-Agent \"@contains {value}\" \"{head},t:none,t:lowercase\""
-            ))
-        }
+            )
+        }),
         WafKind::Path => {
-            let ok = value.starts_with('/')
-                && value.len() >= 3
-                && value.len() <= PATH_MAX
-                && is_plain(value)
-                && !value.contains(['?', '#', ' ', '{', '}', '*'])
-                && !value.contains("//")
-                && !value.contains("/./")
-                && !value.contains("/../")
-                && !value.ends_with("/.")
-                && !value.ends_with("/..");
-            if !ok {
+            if !valid_path(value) {
                 return None;
             }
             let op = if value.ends_with('/') {
@@ -309,53 +393,101 @@ fn render(kind: WafKind, value: &str, id: u32, verdict: Verdict) -> Option<Strin
             };
             // Decoded and normalised, so `/%2eenv` and `//./.env` cannot walk round it.
             Some(format!(
-                "SecRule REQUEST_FILENAME \"{op} {}\" \"{head},t:none,t:urlDecodeUni,t:normalizePath\"",
-                esc(value)
+                "SecRule REQUEST_FILENAME \"{op} {value}\" \"{head},t:none,t:urlDecodeUni,t:normalizePath\""
             ))
         }
-        WafKind::Shape => render_shape(value, &head),
+        WafKind::Shape => {
+            let s = Shape::parse(value)?;
+            Some(s.render(&head))
+        }
     }
 }
 
-/// `METHOD /path?name1&name2`: that method, that path (when it is concrete)
-/// and every one of those parameter names, chained.
-fn render_shape(shape: &str, head: &str) -> Option<String> {
-    let (method, rest) = shape.split_once(' ')?;
-    if method.len() < 3 || method.len() > 8 || !method.bytes().all(|b| b.is_ascii_uppercase()) {
-        return None;
-    }
-    let (path, params) = rest.split_once('?')?;
-    let names: Vec<&str> = params.split('&').filter(|n| !n.is_empty()).collect();
-    if names.is_empty()
-        || !names.iter().all(|n| is_plain(n) && n.len() <= NAME_MAX)
-        || !is_plain(path)
-        || path.len() > PATH_MAX
-    {
-        return None;
-    }
-    if path.contains('{') && names.len() < MIN_NAMES_WITHOUT_PATH {
-        return None;
+/// A request shape, as the agent writes it (`METHOD /path?name1&name2`, path
+/// segments that vary written as `{id}`, `{long}`...; no trailing `/`).
+struct Shape<'a> {
+    method: &'a str,
+    /// `None` when the path varies (a placeholder in it): the rule leaves it out.
+    path: Option<&'a str>,
+    names: Vec<&'a str>,
+}
+
+impl<'a> Shape<'a> {
+    fn parse(shape: &'a str) -> Option<Shape<'a>> {
+        let (method, rest) = shape.split_once(' ')?;
+        if method.len() < 3 || method.len() > 8 || !method.bytes().all(|b| b.is_ascii_uppercase()) {
+            return None;
+        }
+        let (path, params) = rest.split_once('?')?;
+        let names: Vec<&str> = params.split('&').filter(|n| !n.is_empty()).collect();
+        let names_ok = !names.is_empty()
+            && names.len() <= NAMES_MAX
+            && names
+                .iter()
+                .all(|n| is_plain(n) && n.len() <= NAME_MAX && !n.contains(['{', '}', ' ']));
+        if !names_ok || !path.starts_with('/') || path.len() > PATH_MAX {
+            return None;
+        }
+        let varies = path.contains('{');
+        if varies {
+            // Placeholders are `{word}` segments; the rest is plain path.
+            let plain = path.split('/').all(|seg| {
+                (seg.starts_with('{')
+                    && seg.ends_with('}')
+                    && seg[1..seg.len() - 1]
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase()))
+                    || seg.bytes().all(is_path_char)
+            });
+            if !plain {
+                return None;
+            }
+        } else if !path.bytes().all(is_path_char) || path.contains("//") {
+            return None;
+        }
+        let loose = varies || path == "/" || COMMON_PATHS.contains(&path);
+        if loose && names.len() < MIN_NAMES_LOOSE_PATH {
+            return None;
+        }
+        Some(Shape {
+            method,
+            path: (!varies).then_some(path),
+            names,
+        })
     }
 
-    let mut lines = vec![format!(
-        "SecRule REQUEST_METHOD \"@streq {method}\" \"{head},t:none,chain\""
-    )];
-    // `{id}` / `{long}` placeholders mean the real path varies: leave it out.
-    if !path.contains('{') {
-        lines.push(format!(
-            "    SecRule REQUEST_FILENAME \"@streq {}\" \"t:none,t:urlDecodeUni,t:normalizePath,chain\"",
-            esc(path)
-        ));
+    fn render(&self, head: &str) -> String {
+        let mut lines = vec![format!(
+            "SecRule REQUEST_METHOD \"@streq {}\" \"{head},t:none,chain\"",
+            self.method
+        )];
+        if let Some(path) = self.path {
+            // The agent drops a trailing `/` when it writes a shape, so the rule
+            // takes the path with or without one.
+            let op = if path == "/" {
+                "@streq /".to_string()
+            } else {
+                format!("@rx ^{}/?$", path_regex(path.trim_end_matches('/')))
+            };
+            lines.push(format!(
+                "    SecRule REQUEST_FILENAME \"{op}\" \"t:none,t:urlDecodeUni,t:normalizePath,chain\""
+            ));
+        }
+        for (i, name) in self.names.iter().enumerate() {
+            let last = i + 1 == self.names.len();
+            lines.push(format!(
+                "    SecRule ARGS_GET_NAMES \"@streq {name}\" \"t:none{}\"",
+                if last { "" } else { ",chain" }
+            ));
+        }
+        lines.join("\n")
     }
-    for (i, name) in names.iter().enumerate() {
-        let last = i + 1 == names.len();
-        lines.push(format!(
-            "    SecRule ARGS_GET_NAMES \"@streq {}\" \"t:none{}\"",
-            esc(name),
-            if last { "" } else { ",chain" }
-        ));
-    }
-    Some(lines.join("\n"))
+}
+
+/// A path as a regular expression: `.` is the only character in the allowed
+/// set that means something there, and a class (`[.]`) needs no backslash.
+fn path_regex(path: &str) -> String {
+    path.replace('.', "[.]")
 }
 
 /// The first line of the file the agent manages.
@@ -410,22 +542,181 @@ pub fn rule_for_shape(shape: &str) -> Option<String> {
     render(WafKind::Shape, shape, rule_id(shape), Verdict::Block)
 }
 
-/// The rule id in a ModSecurity log line (`[id "60012"]`), when it is one of
-/// ours. Apache/LiteSpeed write `[id "N"]`; libmodsecurity writes the same.
-#[must_use]
-pub fn managed_id_in_log_line(line: &str) -> Option<u32> {
-    let mut rest = line;
-    while let Some(at) = rest.find("[id \"") {
-        rest = &rest[at + 5..];
-        let end = rest.find('"')?;
-        if let Ok(id) = rest[..end].parse::<u32>()
-            && (MANAGED_ID_MIN..=MANAGED_ID_MAX).contains(&id)
-        {
-            return Some(id);
-        }
-        rest = &rest[end..];
+// ---------------------------------------------------------------------------
+// The same rules, applied to access-log lines
+// ---------------------------------------------------------------------------
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
     }
-    None
+}
+
+/// `%XX`-decode (as ModSecurity's `urlDecodeUni` does for these, `+` too).
+#[must_use]
+pub fn url_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' if i + 2 < b.len() => match (hex_val(b[i + 1]), hex_val(b[i + 2])) {
+                (Some(h), Some(l)) => {
+                    out.push(h * 16 + l);
+                    i += 3;
+                    continue;
+                }
+                _ => out.push(b'%'),
+            },
+            b'+' => out.push(b' '),
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The path ModSecurity's `REQUEST_FILENAME` with `t:urlDecodeUni,
+/// t:normalizePath` holds for a request target from a log line: no query
+/// string, decoded, no empty or `.` segments, `..` resolved.
+#[must_use]
+pub fn normal_path(target: &str) -> String {
+    let raw = target.split(['?', '#']).next().unwrap_or("");
+    let decoded = url_decode(raw);
+    let mut segs: Vec<&str> = Vec::new();
+    for seg in decoded.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                segs.pop();
+            }
+            s => segs.push(s),
+        }
+    }
+    let mut out = String::from("/");
+    out.push_str(&segs.join("/"));
+    if decoded.ends_with('/') && !segs.is_empty() {
+        out.push('/');
+    }
+    out
+}
+
+/// The decoded parameter names of a request target's query string.
+fn query_names(target: &str) -> Vec<String> {
+    let Some((_, q)) = target.split_once('?') else {
+        return Vec::new();
+    };
+    let q = q.split('#').next().unwrap_or("");
+    q.split('&')
+        .filter(|p| !p.is_empty())
+        .map(|p| url_decode(p.split('=').next().unwrap_or("")))
+        .collect()
+}
+
+struct ShapeRule {
+    id: u32,
+    method: String,
+    path: Option<String>,
+    names: Vec<String>,
+}
+
+/// The hub's rules as checks on access-log lines: what a rule matches is
+/// counted from the requests the web server logged, whatever ModSecurity
+/// writes (or does not write) to its own logs.
+#[derive(Default)]
+pub struct Matcher {
+    exact_paths: HashMap<String, Vec<u32>>,
+    prefixes: Vec<(String, u32)>,
+    exact_uas: HashMap<String, Vec<u32>>,
+    tokens: Vec<(String, u32)>,
+    shapes: Vec<ShapeRule>,
+}
+
+impl Matcher {
+    /// Only the rules the agent would write (valid id and value).
+    #[must_use]
+    pub fn new(rules: &[WafRule]) -> Matcher {
+        let mut m = Matcher::default();
+        for r in rules.iter().filter(|r| r.is_valid()) {
+            match r.kind {
+                WafKind::Path if r.value.ends_with('/') => m.prefixes.push((r.value.clone(), r.id)),
+                WafKind::Path => m.exact_paths.entry(r.value.clone()).or_default().push(r.id),
+                WafKind::UserAgent => m.exact_uas.entry(r.value.clone()).or_default().push(r.id),
+                WafKind::UaToken => m.tokens.push((r.value.clone(), r.id)),
+                WafKind::Shape => {
+                    if let Some(s) = Shape::parse(&r.value) {
+                        m.shapes.push(ShapeRule {
+                            id: r.id,
+                            method: s.method.to_string(),
+                            path: s.path.map(|p| p.trim_end_matches('/').to_string()),
+                            names: s.names.iter().map(|n| (*n).to_string()).collect(),
+                        });
+                    }
+                }
+            }
+        }
+        m
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.exact_paths.is_empty()
+            && self.prefixes.is_empty()
+            && self.exact_uas.is_empty()
+            && self.tokens.is_empty()
+            && self.shapes.is_empty()
+    }
+
+    /// Ids of the rules a request matches, into `out` (cleared first).
+    pub fn check(&self, method: &str, target: &str, ua: &str, out: &mut Vec<u32>) {
+        out.clear();
+        if let Some(ids) = self.exact_uas.get(ua) {
+            out.extend(ids);
+        }
+        if !self.tokens.is_empty() {
+            let lower = ua.to_ascii_lowercase();
+            out.extend(
+                self.tokens
+                    .iter()
+                    .filter(|(t, _)| lower.contains(t.as_str()))
+                    .map(|(_, id)| *id),
+            );
+        }
+        if self.exact_paths.is_empty() && self.prefixes.is_empty() && self.shapes.is_empty() {
+            return;
+        }
+        let path = normal_path(target);
+        if let Some(ids) = self.exact_paths.get(&path) {
+            out.extend(ids);
+        }
+        out.extend(
+            self.prefixes
+                .iter()
+                .filter(|(p, _)| path.starts_with(p.as_str()))
+                .map(|(_, id)| *id),
+        );
+        if self.shapes.is_empty() {
+            return;
+        }
+        let names = query_names(target);
+        let bare = if path.len() > 1 {
+            path.trim_end_matches('/')
+        } else {
+            path.as_str()
+        };
+        for s in &self.shapes {
+            let path_ok = s
+                .path
+                .as_deref()
+                .is_none_or(|p| p == bare || (p.is_empty() && bare == "/"));
+            if s.method == method && path_ok && s.names.iter().all(|n| names.contains(n)) {
+                out.push(s.id);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -443,6 +734,7 @@ mod tests {
 
     #[test]
     fn user_agent_rule_is_an_exact_match_with_a_local_id() {
+        // The botnet's UA from the incident: Chrome-like, but no AppleWebKit.
         let ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/148.0.0.0 Safari/537.36";
         let rule = rule_for_user_agent(ua).unwrap();
         assert!(rule.starts_with("SecRule REQUEST_HEADERS:User-Agent \"@streq Mozilla/5.0"));
@@ -455,10 +747,22 @@ mod tests {
     }
 
     #[test]
-    fn quotes_and_backslashes_in_a_user_agent_cannot_break_out_of_the_rule() {
-        let rule = rule_for_user_agent(r#"evil" "id:1,pass" \"#).unwrap();
-        // Every quote inside the operand is escaped; the operand is one string.
-        assert!(rule.contains(r#"@streq evil\" \"id:1,pass\" \\""#));
+    fn quotes_and_backslashes_are_refused_rather_than_escaped() {
+        assert!(rule_for_user_agent(r#"evil" "id:1,pass""#).is_none());
+        assert!(rule_for_user_agent(r"evil\").is_none());
+        assert!(!valid_value(WafKind::Shape, "GET /?a\"b&c&d"));
+    }
+
+    #[test]
+    fn a_stock_browser_user_agent_is_never_a_rule() {
+        for ua in [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1",
+            "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
+        ] {
+            assert!(!valid_value(WafKind::UserAgent, ua), "{ua}");
+        }
+        assert!(valid_value(WafKind::UserAgent, "python-requests/2.32.3"));
     }
 
     #[test]
@@ -484,23 +788,37 @@ mod tests {
     }
 
     #[test]
-    fn values_the_agent_had_to_cut_or_that_are_encoded_give_no_rule() {
+    fn values_the_agent_had_to_cut_or_that_are_encoded_or_huge_give_no_rule() {
         assert!(rule_for_user_agent(&"a".repeat(UA_MAX)).is_some());
         assert!(rule_for_user_agent(&"a".repeat(UA_MAX + 1)).is_none());
-        assert!(rule_for_shape(&format!("GET /?{}&b", "n".repeat(NAME_MAX + 1))).is_none());
-        assert!(rule_for_shape("GET /?cat%5B%5D&b").is_none());
+        assert!(rule_for_shape(&format!("GET /x?{}&b", "n".repeat(NAME_MAX + 1))).is_none());
+        assert!(rule_for_shape("GET /x?cat%5B%5D&b").is_none());
         assert!(rule_for_shape("GET /a%20b?x&y").is_none());
         assert!(rule_for_shape(&format!("GET /{}?x&y", "p".repeat(PATH_MAX))).is_none());
+        // Many names, or a long value: a single rule must stay small.
+        let many: Vec<String> = (0..=NAMES_MAX).map(|i| format!("n{i}")).collect();
+        assert!(rule_for_shape(&format!("GET /x?{}", many.join("&"))).is_none());
+        assert!(!valid_value(
+            WafKind::Shape,
+            &format!("GET /x?{}", "a&".repeat(200))
+        ));
     }
 
     #[test]
-    fn a_rule_anchored_only_by_a_placeholder_needs_enough_parameters() {
+    fn a_loosely_anchored_shape_needs_enough_parameters() {
         // "any GET with ?p" would block every WordPress non-permalink request.
         assert!(rule_for_shape("GET /{id}?p").is_none());
         assert!(rule_for_shape("GET /{id}?a&b").is_none());
         assert!(rule_for_shape("GET /{id}?a&b&c").is_some());
-        // A concrete path anchors the rule well enough on its own.
-        assert!(rule_for_shape("GET /?tss-sc").is_some());
+        // `/` and `/index.php` anchor nothing either: WordPress search is `/?s`.
+        assert!(rule_for_shape("GET /?s").is_none());
+        assert!(rule_for_shape("GET /?fbclid").is_none());
+        assert!(rule_for_shape("GET /index.php?p").is_none());
+        assert!(rule_for_shape("GET /?tss-sc&tsscat&tst10_filter").is_some());
+        // A concrete page is anchor enough.
+        assert!(rule_for_shape("GET /shop?tss-sc").is_some());
+        // A placeholder as a parameter name never matches a real request.
+        assert!(rule_for_shape("GET /shop?{k}&a").is_none());
     }
 
     #[test]
@@ -535,19 +853,29 @@ mod tests {
     }
 
     #[test]
+    fn a_page_path_matches_with_or_without_its_trailing_slash() {
+        let rule = rule_for_shape("GET /shop/item.php?a&b").unwrap();
+        assert!(
+            rule.contains("REQUEST_FILENAME \"@rx ^/shop/item[.]php/?$\""),
+            "{rule}"
+        );
+        assert!(!rule.contains('\\'));
+    }
+
+    #[test]
     fn a_varying_path_is_left_out_of_the_rule() {
-        let rule = rule_for_shape("GET /product/{id}/?filter&sort&view").unwrap();
+        let rule = rule_for_shape("GET /product/{id}?filter&sort&view").unwrap();
         assert!(!rule.contains("REQUEST_FILENAME"));
         assert!(rule.contains("ARGS_GET_NAMES \"@streq filter\""));
         assert!(rule.contains("ARGS_GET_NAMES \"@streq sort\""));
     }
 
     #[test]
-    fn a_log_only_rule_passes_and_a_blocking_one_denies() {
+    fn a_log_only_rule_passes_without_an_audit_record_and_a_blocking_one_denies() {
         let log = managed(60_001, WafKind::UserAgent, "BadBot/1.0", false)
             .render()
             .unwrap();
-        assert!(log.contains("id:60001,phase:1,pass,log,auditlog"));
+        assert!(log.contains("id:60001,phase:1,pass,log,noauditlog"));
         assert!(!log.contains("deny"));
         let block = managed(60_001, WafKind::UserAgent, "BadBot/1.0", true)
             .render()
@@ -560,39 +888,37 @@ mod tests {
 
     #[test]
     fn managed_ids_must_be_in_their_own_range() {
-        assert!(
-            managed(59_999, WafKind::UaToken, "sqlmap", true)
-                .render()
-                .is_none()
-        );
-        assert!(
-            managed(70_000, WafKind::UaToken, "sqlmap", true)
-                .render()
-                .is_none()
-        );
-        assert!(
-            managed(60_000, WafKind::UaToken, "sqlmap", true)
-                .render()
-                .is_some()
-        );
-        assert!(
-            managed(69_999, WafKind::UaToken, "sqlmap", true)
-                .render()
-                .is_some()
-        );
+        let r = |id| managed(id, WafKind::UaToken, "sqlmap", true).render();
+        assert!(r(59_999).is_none());
+        assert!(r(70_000).is_none());
+        assert!(r(60_000).is_some());
+        assert!(r(69_999).is_some());
     }
 
     #[test]
-    fn scanner_words_are_plain_and_never_a_browser_word() {
-        assert!(valid_value(WafKind::UaToken, "sqlmap"));
-        assert!(valid_value(WafKind::UaToken, "nikto"));
-        assert!(valid_value(WafKind::UaToken, "nuclei"));
-        assert!(valid_value(WafKind::UaToken, "masscan"));
+    fn scanner_words_are_plain_and_never_something_visitors_send() {
+        for good in ["sqlmap", "nikto", "nuclei", "masscan", "zgrab", "headless"] {
+            assert!(valid_value(WafKind::UaToken, good), "{good}");
+        }
         for bad in [
             "bot", // too short
-            "Sqlmap", "sql map", "mozilla", "chrome", "safari", "afar", // inside "safari"
+            "Sqlmap",
+            "sql map",
+            "mozilla",
+            "chrome",
+            "safari",
+            "afar", // inside "safari"
             "appl", // inside "applewebkit"
-            "1234", "x\"y\"z", "%{tx.a}",
+            "1234",
+            "15e148",
+            "x86_64",
+            "cros",
+            "http",
+            "google",
+            "googlebot",
+            "spider",
+            "x\"y\"z",
+            "%{tx.a}",
         ] {
             assert!(!valid_value(WafKind::UaToken, bad), "{bad}");
         }
@@ -604,7 +930,7 @@ mod tests {
     }
 
     #[test]
-    fn probe_paths_are_normalised_and_a_trailing_slash_means_below() {
+    fn probe_paths_are_normalised_and_only_hidden_directories_take_a_prefix() {
         let file = managed(60_003, WafKind::Path, "/.env", true)
             .render()
             .unwrap();
@@ -614,9 +940,25 @@ mod tests {
             .render()
             .unwrap();
         assert!(dir.contains("REQUEST_FILENAME \"@beginsWith /.git/\""));
+        assert!(valid_value(WafKind::Path, "/xmlrpc.php"));
         for bad in [
-            "/", "/a", ".env", "/.env?x", "/a b", "//.env", "/./.env", "/../x", "/x/..", "/%2eenv",
-            "/{id}", "/*.php",
+            "/",
+            "/a",
+            ".env",
+            "/.env?x",
+            "/a b",
+            "//.env",
+            "/./.env",
+            "/../x",
+            "/x/..",
+            "/%2eenv",
+            "/{id}",
+            "/*.php",
+            "/a+b",
+            "/wp-content/",
+            "/wp-admin/",
+            "/index.php",
+            "/wp-admin/admin-ajax.php",
         ] {
             assert!(!valid_value(WafKind::Path, bad), "{bad}");
         }
@@ -654,24 +996,6 @@ mod tests {
     }
 
     #[test]
-    fn hits_are_read_from_the_id_in_a_log_line() {
-        let apache = r#"[Tue Oct 14 01:02:03.456789 2026] [:error] [pid 1] [client 1.2.3.4] ModSecurity: Warning. String match "/.env" at REQUEST_FILENAME. [file "/etc/modsecurity.d/sn-secure.conf"] [line "5"] [id "60003"] [msg "SN Secure: probe for a file no site serves"] [hostname "a.example"] [uri "/.env"]"#;
-        assert_eq!(managed_id_in_log_line(apache), Some(60_003));
-        // Someone else's rule.
-        assert_eq!(
-            managed_id_in_log_line(r#"[id "949110"] [msg "Inbound Anomaly"]"#),
-            None
-        );
-        // Ours after someone else's in the same line.
-        assert_eq!(
-            managed_id_in_log_line(r#"[id "949110"] [id "60001"]"#),
-            Some(60_001)
-        );
-        assert_eq!(managed_id_in_log_line("[id \"6000"), None);
-        assert_eq!(managed_id_in_log_line("nothing"), None);
-    }
-
-    #[test]
     fn rules_travel_as_data() {
         let r = managed(60_005, WafKind::UaToken, "nikto", true);
         let json = serde_json::to_string(&r).unwrap();
@@ -683,5 +1007,63 @@ mod tests {
             serde_json::from_str(r#"{"id":60005,"kind":"path","value":"/.env"}"#).unwrap();
         assert!(!back.block);
         assert!(serde_json::from_str::<WafRule>(r#"{"id":1,"kind":"raw","value":"x"}"#).is_err());
+    }
+
+    #[test]
+    fn log_paths_are_normalised_like_modsecurity_does() {
+        assert_eq!(normal_path("/.env?x=1"), "/.env");
+        assert_eq!(normal_path("//./.env"), "/.env");
+        assert_eq!(normal_path("/%2eenv"), "/.env");
+        assert_eq!(normal_path("/a/../.git/config"), "/.git/config");
+        assert_eq!(normal_path("/shop/"), "/shop/");
+        assert_eq!(normal_path("/"), "/");
+        assert_eq!(normal_path("/a%zz"), "/a%zz");
+        assert_eq!(url_decode("a+b%20c%"), "a b c%");
+    }
+
+    #[test]
+    fn the_matcher_applies_each_kind_to_log_lines() {
+        let rules = vec![
+            managed(60_001, WafKind::Path, "/.env", false),
+            managed(60_002, WafKind::Path, "/.git/", false),
+            managed(60_003, WafKind::UaToken, "sqlmap", false),
+            managed(60_004, WafKind::UserAgent, "BadBot/1.0", false),
+            managed(60_005, WafKind::Shape, "GET /shop?tss-sc&tsscat", false),
+            managed(60_006, WafKind::Shape, "GET /product/{id}?a&b&c", true),
+            managed(60_007, WafKind::UaToken, "chrome", true), // invalid: ignored
+        ];
+        let m = Matcher::new(&rules);
+        let mut out = Vec::new();
+        let mut ids = |method: &str, target: &str, ua: &str| {
+            m.check(method, target, ua, &mut out);
+            let mut v = out.clone();
+            v.sort_unstable();
+            v
+        };
+        let browser = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36";
+        assert_eq!(ids("GET", "//.env?debug", browser), vec![60_001]);
+        assert_eq!(ids("GET", "/.git/config", browser), vec![60_002]);
+        assert!(ids("GET", "/.github/x", browser).is_empty());
+        assert_eq!(
+            ids("GET", "/", "sqlmap/1.8 (https://sqlmap.org)"),
+            vec![60_003]
+        );
+        assert_eq!(ids("GET", "/", "BadBot/1.0"), vec![60_004]);
+        assert!(ids("GET", "/", "BadBot/1.0 x").is_empty());
+        // Shape: method, path with or without `/`, every name (more is fine).
+        assert_eq!(
+            ids("GET", "/shop/?tsscat=1&tss-sc=2&x=3", browser),
+            vec![60_005]
+        );
+        assert!(ids("POST", "/shop?tsscat=1&tss-sc=2", browser).is_empty());
+        assert!(ids("GET", "/shop?tsscat=1", browser).is_empty());
+        assert!(ids("GET", "/shopping?tsscat=1&tss-sc=2", browser).is_empty());
+        assert_eq!(
+            ids("GET", "/anything/here?a=1&b&c=%20", browser),
+            vec![60_006]
+        );
+        assert!(ids("GET", "/", browser).is_empty());
+        assert!(!m.is_empty());
+        assert!(Matcher::new(&[]).is_empty());
     }
 }

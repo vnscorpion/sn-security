@@ -141,11 +141,14 @@ pub fn sync(
         .and_then(|b| serde_json::from_slice(&b).ok());
 
     // The hub's WAF rules in place (a transient unit does the writing), then
-    // their state and matches for this report.
+    // their state and matches for this report. Outside enforce mode no rule
+    // blocks.
+    let enforce =
+        meta.mode_override.unwrap_or(cfg.watch.mode) == snsec_common::schema::Mode::Enforce;
     if cfg.remote.hub_orders {
-        crate::waf::ensure(state);
+        crate::waf::ensure(state, enforce);
     }
-    let waf = Some(crate::waf::status(state));
+    let waf = Some(crate::waf::status(state, enforce));
 
     let (active_list, active_total) = active_bans(state);
     let body = ReportBody {

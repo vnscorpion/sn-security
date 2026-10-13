@@ -83,7 +83,7 @@ format = "combined"
 
 ## Kill switch (ban nhầm hàng loạt / nghi hub bị chiếm)
 
-- Trên VPS: `sn disable` — gỡ table `inet sn`, thả jail ngay. (Hoặc đổi mode→observe từ hub, nhưng đó là chu kỳ sau; `sn disable` là tức thì, tại chỗ.)
+- Trên VPS: `sn disable` — gỡ table `inet sn`, thả jail, gỡ file luật WAF ngay (luật WAF giữ tắt tới khi chạy `sn waf-on`). (Hoặc đổi mode→observe từ hub, nhưng đó là chu kỳ sau; `sn disable` là tức thì, tại chỗ.)
 - Gỡ một IP: trên hub, trang VPS → "Gỡ ban".
 
 ## VPS mất liên lạc
