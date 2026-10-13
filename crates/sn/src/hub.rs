@@ -212,7 +212,7 @@ fn refused_alert(refused: &[String]) -> Option<snsec_common::schema::Alert> {
     Some(snsec_common::schema::Alert {
         kind: "hub_ban_refused".into(),
         message: format!(
-            "{} ban order(s) from the hub not applied: the address is protected on this VPS (whitelist, admin session, the VPS's own address, a trusted proxy or Cloudflare): {}{}",
+            "{} ban order(s) from the hub not applied: the address is protected on this VPS ([fw] whitelist, the VPS's own address, the hub, a trusted proxy, Cloudflare, or a private range): {}{}",
             refused.len(),
             shown.join(", "),
             if refused.len() > shown.len() {
@@ -681,6 +681,27 @@ fn http_agent() -> ureq::Agent {
         .build()
 }
 
+/// The hub's addresses with IPv4 first: the desired-state pull goes over IPv4
+/// where it can, the reports the system's usual way (IPv6 first on most
+/// dual-stack hosts). The hub notes the address each signed request came from
+/// as this VPS's own, so it learns the public IPv4 too, which on a cloud that
+/// NATs the VPS (Lightsail, EC2...) is on no interface and is where the VPS's
+/// own requests to its IPv4-only sites come from.
+fn ipv4_first(netloc: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+    use std::net::ToSocketAddrs;
+    let mut addrs: Vec<std::net::SocketAddr> = netloc.to_socket_addrs()?.collect();
+    addrs.sort_by_key(std::net::SocketAddr::is_ipv6);
+    Ok(addrs)
+}
+
+fn http_agent_ipv4_first() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(CONNECT_TIMEOUT)
+        .timeout(TOTAL_TIMEOUT)
+        .resolver(ipv4_first)
+        .build()
+}
+
 fn flush_reports(cfg: &Config, state: &State, sk: &SigningKey, epoch: u64) -> Result<()> {
     let agent = http_agent();
     let url = format!("{}/v1/report", cfg.hub.url.trim_end_matches('/'));
@@ -814,7 +835,7 @@ fn fetch_and_apply_desired_unlocked(cfg: &Config, state: &State) -> Result<Vec<S
     }
     let sk =
         crypto::parse_secret(&cfg.hub.agent_key).context("parsing agent_key (hub.agent_key)")?;
-    let agent = http_agent();
+    let agent = http_agent_ipv4_first();
     // Under desired.lock: nothing else writes `last_desired` meanwhile.
     let meta = state.meta();
     let url = format!(
@@ -918,20 +939,34 @@ fn checked_self_ips(list: &[String]) -> Vec<String> {
     out
 }
 
-/// May a hub ban of `key` go ahead here? Not for an address this VPS protects
-/// (whitelist, admin sessions, its own addresses, trusted proxies,
-/// Cloudflare), nor for one no hub should ever ban (private, carrier-grade NAT,
-/// unique-local, link-local: an older hub did not refuse those).
+/// May a hub ban of `key` go ahead here? Not for the admin ranges configured
+/// here, this VPS's own addresses or the hub's, the trusted proxies or
+/// Cloudflare, nor for an address no hub should ever ban (private,
+/// carrier-grade NAT, unique-local, link-local: an older hub did not refuse
+/// those). An SSH or panel session is no reason to refuse the operator.
 fn hub_ban_allowed(key: &str, wl: &crate::whitelist::Whitelist, never_ban: &[net::Cidr]) -> bool {
-    let reserved = net::Cidr::parse(key)
-        .and_then(|c| snsec_common::ranges::never_ban_reason(c.addr))
-        .is_some();
-    !reserved && !crate::whitelist::key_protected(key, wl, never_ban)
+    let Some(net) = net::Cidr::parse(key) else {
+        return false;
+    };
+    snsec_common::ranges::never_ban_reason(net.addr).is_none()
+        && !wl.refuses_hub_ban(net)
+        && !never_ban.iter().any(|c| c.overlaps(&net))
 }
 
 /// Apply a desired state from the hub. Returns the bans it ordered that were
 /// refused because the address is protected here.
 fn apply_desired(cfg: &Config, state: &State, d: &DesiredBody) -> Result<Vec<String>> {
+    // This VPS's own public address(es) as the hub saw its signed requests
+    // arrive: on a cloud that NATs it, its own cron, loopback and cache-preload
+    // requests come from there, and must never get it banned. Taken even on a
+    // VPS that ignores the hub's orders: it only narrows what is banned.
+    let self_ips = checked_self_ips(&d.self_ips);
+    state.update_meta(|m| {
+        if m.self_ips != self_ips {
+            m.self_ips = self_ips;
+        }
+    })?;
+
     // The one local switch: a VPS with `[remote] hub_orders = false` only reports.
     // Otherwise the hub decides (bans, mode, scans, undo, evidence, ClamAV, orders).
     if !cfg.remote.hub_orders {
@@ -940,16 +975,6 @@ fn apply_desired(cfg: &Config, state: &State, d: &DesiredBody) -> Result<Vec<Str
     }
     // Hard local bounds (SEC-2): the hub can never exceed these.
     let _timer = d.timer_interval_secs.clamp(300, 900);
-
-    // This VPS's own public address as the hub saw its reports arrive: on a
-    // cloud that NATs it, its own cron, loopback and cache-preload requests
-    // come from there, and must never get it banned.
-    let self_ips = checked_self_ips(&d.self_ips);
-    state.update_meta(|m| {
-        if m.self_ips != self_ips {
-            m.self_ips = self_ips;
-        }
-    })?;
 
     // "Lift every ban" from the admin (too many wrong bans): before the operator
     // bans below, so a ban ordered after it still applies. Once per marker.
@@ -1003,9 +1028,21 @@ fn apply_desired(cfg: &Config, state: &State, d: &DesiredBody) -> Result<Vec<Str
         })
         .collect();
 
-    // The hub's bans pass the same protections as the agent's own: a ban from
-    // the UI, MCP or an AI must not lock out an admin, this VPS's own address or
-    // a Cloudflare edge (every visitor behind it would get errors).
+    // Addresses this VPS had banned that the admin now lifts: for a while the
+    // volume rules only report them (an old unban the hub sends again with a
+    // later, unrelated change lifts nothing and starts no new grace).
+    let lifted: Vec<String> = {
+        let banned = state.bans();
+        dels.iter()
+            .filter(|k| banned.contains_key(k.as_str()))
+            .cloned()
+            .collect()
+    };
+
+    // The hub's bans pass the protections an operator cannot mean to override:
+    // a ban from the UI, MCP or an AI must not lock out the configured admin
+    // ranges, this VPS's own address or a Cloudflare edge (every visitor
+    // behind it would get errors).
     let mut refused = Vec::new();
     let firewall = (!adds.is_empty() || !dels.is_empty()) && crate::sys::fw::available();
     if !adds.is_empty() || firewall {
@@ -1024,9 +1061,10 @@ fn apply_desired(cfg: &Config, state: &State, d: &DesiredBody) -> Result<Vec<Str
             // to return the error, so the desired-state was never marked
             // applied, the same order was retried and failed every cycle, and a
             // job in it (install ClamAV, a scan, an incident order) never ran.
-            let mut white = wl.keys();
-            white.extend(crate::whitelist::cidr_keys(&never_ban));
-            let applied = crate::sys::fw::prepare(&cfg.fw.web_ports, &white)
+            // Nor may a whitelist that cannot be refreshed stop the bans and
+            // unbans: `prepare` only logs that.
+            let white = wl.keys(&cfg.trusted_cidrs());
+            let applied = crate::sys::fw::prepare(&cfg.fw.web_ports, cfg.fw.block_quic, &white)
                 .and_then(|()| crate::sys::fw::apply_bans(&adds, &dels));
             match applied {
                 Err(e) => eprintln!(
@@ -1065,6 +1103,16 @@ fn apply_desired(cfg: &Config, state: &State, d: &DesiredBody) -> Result<Vec<Str
         if strikes.len() != before {
             let _ = state.save_strikes(&strikes);
         }
+    }
+    // ...nor be banned again for its volume right away: the next cycles may
+    // read the same traffic the wrong ban was for.
+    if !lifted.is_empty() {
+        let mut unbanned = state.unbanned();
+        for key in lifted {
+            unbanned.insert(key, now);
+        }
+        crate::watch::decide::prune_unbanned(&mut unbanned, now);
+        let _ = state.save_unbanned(&unbanned);
     }
 
     // Policy tier (trusted_proxies / patterns / mode->observe) must be root
@@ -1553,20 +1601,46 @@ mod tests {
                 "198.51.100.22"
             ]
         );
-        // A VPS that only reports ignores the hub entirely.
+        // A VPS that only reports ignores the hub's orders, but still learns
+        // its own address: that only narrows what it bans.
         let dir = tempfile::tempdir().unwrap();
         let state = State::at(dir.path().to_path_buf());
         let mut cfg = default_config();
         cfg.remote.hub_orders = false;
-        apply_desired(&cfg, &state, &d).unwrap();
-        assert!(state.meta().self_ips.is_empty());
+        let ordered = DesiredBody {
+            mode: snsec_common::schema::Mode::Enforce,
+            ..d.clone()
+        };
+        apply_desired(&cfg, &state, &ordered).unwrap();
+        assert_eq!(state.meta().self_ips.len(), 4);
+        assert_eq!(state.meta().mode_override, None);
+    }
+
+    #[test]
+    fn an_unban_from_the_hub_gives_the_lifted_address_a_grace_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::at(dir.path().to_path_buf());
+        let now = util::now_secs();
+        let mut bans = HashMap::new();
+        bans.insert("203.0.113.7".to_string(), ban(now + 3600));
+        state.save_bans(&bans).unwrap();
+        let d = DesiredBody {
+            unbans: vec!["203.0.113.7".into(), "198.51.100.9".into()],
+            ..DesiredBody::default()
+        };
+        apply_desired(&default_config(), &state, &d).unwrap();
+        // Only the address that was banned here: an old unban sent again
+        // with a later change lifts nothing and starts no grace.
+        let u = state.unbanned();
+        assert_eq!(u.keys().collect::<Vec<_>>(), ["203.0.113.7"]);
+        assert!(crate::watch::decide::unban_grace(&u, "203.0.113.7", now));
     }
 
     #[test]
     fn a_hub_ban_of_a_protected_address_is_refused() {
         use crate::whitelist::Whitelist;
         let cidr = |s| net::Cidr::parse(s).unwrap();
-        // The admin's SSH session, inside the /64 the hub wants banned.
+        // A configured admin address, inside the /64 the hub wants banned.
         let wl = Whitelist::of(vec![cidr("2402:800:6310:12a::5"), cidr("203.0.113.7")]);
         let never_ban = vec![cidr("104.16.0.0/13")];
         for key in [

@@ -331,7 +331,7 @@ fn run() -> Result<()> {
             println!("tcp connections: {}", conns.len());
             let state = State::open().ok();
             let wl = whitelist::build(&cfg, &conns, state.as_ref());
-            println!("whitelist entries: {}", wl.keys().len());
+            println!("whitelist entries: {}", wl.keys(&cfg.trusted_cidrs()).len());
             if let Some(s) = &state {
                 let own = s.meta().self_ips;
                 if !own.is_empty() {
@@ -345,10 +345,26 @@ fn run() -> Result<()> {
             println!("trusted proxies: {}", cfg.watch.trusted_proxies.join(", "));
             println!(
                 "cloudflare never banned: {}",
-                if cfg.watch.protect_cloudflare {
-                    "yes"
-                } else {
+                if !cfg.watch.protect_cloudflare {
                     "no"
+                } else if cfg
+                    .watch
+                    .trusted_proxies
+                    .iter()
+                    .any(|p| p.trim().eq_ignore_ascii_case("cloudflare"))
+                {
+                    "yes (a trusted proxy)"
+                } else {
+                    "while it carries visitors"
+                }
+            );
+            println!(
+                "a ban drops: TCP {:?}{}",
+                cfg.fw.web_ports,
+                if cfg.fw.block_quic && cfg.fw.web_ports.contains(&443) {
+                    ", UDP 443 (HTTP/3)"
+                } else {
+                    ""
                 }
             );
             let misplaced = cfg.misplaced_keys();

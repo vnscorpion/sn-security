@@ -3,8 +3,10 @@
 //!
 //! * Cloudflare: a proxy, never a client. Banning one of its edges never stops
 //!   an attacker behind it; it only cuts off every visitor routed through it.
-//! * Googlebot, Bingbot, Applebot: what a crawler is, decided by the address it
-//!   comes from. A User-Agent that claims to be one gains nothing by itself.
+//! * Googlebot, Google's special-case crawlers (AdsBot, Mediapartners...) and
+//!   user-triggered fetchers, Bingbot, Applebot: what a crawler is, decided by
+//!   the address it comes from. A User-Agent that claims to be one gains
+//!   nothing by itself.
 //! * Jetpack: Automattic's servers, which call `xmlrpc.php` on every Jetpack
 //!   site of a VPS.
 //! * QUIC.cloud: LiteSpeed's CDN nodes, for the `quic.cloud` alias of
@@ -604,10 +606,30 @@ pub const QUIC_CLOUD: &[&str] = &[
     "95.216.116.209",
 ];
 
+/// Google's special-case crawlers (AdsBot-Google, Mediapartners-Google,
+/// APIs-Google...): see the header of the file for its source and date.
+const GOOGLE_SPECIAL: &str = include_str!("ranges/google-special-crawlers.txt");
+/// Google's user-triggered fetchers (Site Verifier, Feedfetcher, Read Aloud...),
+/// both lists Google publishes for them: see each file's header.
+const GOOGLE_FETCHERS: &str = include_str!("ranges/google-user-triggered-fetchers.txt");
+const GOOGLE_FETCHERS_GOOGLE: &str =
+    include_str!("ranges/google-user-triggered-fetchers-google.txt");
+
+/// The prefixes in one of the embedded list files (`#` starts a comment).
+fn file_entries(text: &str) -> impl Iterator<Item = &str> {
+    text.lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim())
+        .filter(|l| !l.is_empty())
+}
+
 /// A crawler that publishes the addresses it crawls from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Crawler {
     Googlebot,
+    /// Google's special-case crawlers (AdsBot, Mediapartners...).
+    GoogleSpecial,
+    /// Fetches Google makes because a user asked for them.
+    GoogleFetcher,
     Bingbot,
     Applebot,
 }
@@ -617,6 +639,8 @@ impl Crawler {
     pub fn name(self) -> &'static str {
         match self {
             Crawler::Googlebot => "googlebot",
+            Crawler::GoogleSpecial => "google-special",
+            Crawler::GoogleFetcher => "google-fetcher",
             Crawler::Bingbot => "bingbot",
             Crawler::Applebot => "applebot",
         }
@@ -633,16 +657,72 @@ static CLOUDFLARE: LazyLock<Vec<Cidr>> = LazyLock::new(|| {
     v
 });
 
-static CRAWLERS: LazyLock<Vec<(Crawler, Cidr)>> = LazyLock::new(|| {
-    let mut v = Vec::new();
-    for (who, list) in [
-        (Crawler::Googlebot, GOOGLEBOT),
-        (Crawler::Bingbot, BINGBOT),
-        (Crawler::Applebot, APPLEBOT),
-    ] {
-        v.extend(parse_all(list).into_iter().map(|c| (who, c)));
+/// Every crawler range, grouped by family and prefix length, each group a map
+/// from the masked network to its crawler: a lookup costs one probe per
+/// distinct length (a handful), not one per range (a few thousand).
+struct CrawlerIndex {
+    groups: Vec<(bool, u8, std::collections::HashMap<u128, Crawler>)>,
+}
+
+/// An address as a number of its family's width, and whether it is IPv6.
+fn bits(ip: IpAddr) -> (bool, u128) {
+    match net::normalize(ip) {
+        IpAddr::V4(v4) => (false, u128::from(u32::from(v4))),
+        IpAddr::V6(v6) => (true, u128::from(v6)),
     }
-    v
+}
+
+/// `x` (an address of `width` bits) with only its first `len` bits kept.
+fn masked(x: u128, width: u8, len: u8) -> u128 {
+    if len == 0 {
+        return 0;
+    }
+    let keep = u128::MAX << (128 - u32::from(len));
+    (x << (128 - u32::from(width))) & keep
+}
+
+impl CrawlerIndex {
+    fn build(lists: &[(Crawler, Vec<Cidr>)]) -> CrawlerIndex {
+        let mut groups: Vec<(bool, u8, std::collections::HashMap<u128, Crawler>)> = Vec::new();
+        for (who, cidrs) in lists {
+            for c in cidrs {
+                let (v6, x) = bits(c.addr);
+                let width = if v6 { 128 } else { 32 };
+                let key = masked(x, width, c.prefix);
+                match groups.iter_mut().find(|g| g.0 == v6 && g.1 == c.prefix) {
+                    Some(g) => {
+                        g.2.entry(key).or_insert(*who);
+                    }
+                    None => groups.push((v6, c.prefix, [(key, *who)].into_iter().collect())),
+                }
+            }
+        }
+        // Longest prefixes first: the most specific list names the crawler.
+        groups.sort_by_key(|g| std::cmp::Reverse(g.1));
+        CrawlerIndex { groups }
+    }
+
+    fn find(&self, ip: IpAddr) -> Option<Crawler> {
+        let (v6, x) = bits(ip);
+        let width = if v6 { 128 } else { 32 };
+        self.groups
+            .iter()
+            .filter(|g| g.0 == v6)
+            .find_map(|g| g.2.get(&masked(x, width, g.1)).copied())
+    }
+}
+
+static CRAWLERS: LazyLock<CrawlerIndex> = LazyLock::new(|| {
+    let google = |text: &str| -> Vec<Cidr> { file_entries(text).filter_map(Cidr::parse).collect() };
+    let mut fetchers = google(GOOGLE_FETCHERS);
+    fetchers.extend(google(GOOGLE_FETCHERS_GOOGLE));
+    CrawlerIndex::build(&[
+        (Crawler::Googlebot, parse_all(GOOGLEBOT)),
+        (Crawler::GoogleSpecial, google(GOOGLE_SPECIAL)),
+        (Crawler::GoogleFetcher, fetchers),
+        (Crawler::Bingbot, parse_all(BINGBOT)),
+        (Crawler::Applebot, parse_all(APPLEBOT)),
+    ])
 });
 
 static JETPACK_NETS: LazyLock<Vec<Cidr>> = LazyLock::new(|| parse_all(JETPACK));
@@ -675,10 +755,7 @@ pub fn is_jetpack(ip: IpAddr) -> bool {
 /// counts here: the User-Agent of a request is whatever its sender chose.
 #[must_use]
 pub fn verified_crawler(ip: IpAddr) -> Option<Crawler> {
-    CRAWLERS
-        .iter()
-        .find(|(_, c)| c.contains(ip))
-        .map(|(who, _)| *who)
+    CRAWLERS.find(ip)
 }
 
 /// Why an address (or the /64 it starts) must never be banned on an order from
@@ -741,6 +818,61 @@ mod tests {
             for c in list {
                 assert!(Cidr::parse(c).is_some(), "{c}");
             }
+        }
+        for (text, at_least) in [
+            (GOOGLE_SPECIAL, 200),
+            (GOOGLE_FETCHERS, 1000),
+            (GOOGLE_FETCHERS_GOOGLE, 400),
+        ] {
+            let entries: Vec<&str> = file_entries(text).collect();
+            assert!(entries.len() >= at_least, "{}", entries.len());
+            for c in entries {
+                assert!(Cidr::parse(c).is_some(), "{c}");
+            }
+            // Each file says where it came from and when.
+            assert!(text.starts_with("# Google ") && text.contains("fetched 2026-10-14"));
+        }
+    }
+
+    #[test]
+    fn googles_other_crawlers_and_fetchers_are_known_too() {
+        assert_eq!(
+            verified_crawler(ip("108.177.2.5")),
+            Some(Crawler::GoogleSpecial)
+        );
+        assert_eq!(
+            verified_crawler(ip("2001:4860:4801:2008::7")),
+            Some(Crawler::GoogleSpecial)
+        );
+        assert_eq!(
+            verified_crawler(ip("107.178.192.9")),
+            Some(Crawler::GoogleFetcher)
+        );
+        assert_eq!(
+            verified_crawler(ip("142.250.32.130")),
+            Some(Crawler::GoogleFetcher)
+        );
+        assert_eq!(
+            verified_crawler(ip("2404:f340:10:4000::1")),
+            Some(Crawler::GoogleFetcher)
+        );
+        // The next /24 is not.
+        assert_eq!(verified_crawler(ip("108.177.3.1")), None);
+        assert_eq!(
+            verified_crawler(ip("::ffff:66.249.66.1")),
+            Some(Crawler::Googlebot)
+        );
+        // The index finds exactly what a scan of every range would.
+        let all: Vec<(Crawler, Cidr)> = [
+            (Crawler::Googlebot, parse_all(GOOGLEBOT)),
+            (Crawler::Bingbot, parse_all(BINGBOT)),
+            (Crawler::Applebot, parse_all(APPLEBOT)),
+        ]
+        .into_iter()
+        .flat_map(|(w, v)| v.into_iter().map(move |c| (w, c)))
+        .collect();
+        for (who, c) in &all {
+            assert_eq!(verified_crawler(c.addr), Some(*who), "{c:?}");
         }
     }
 

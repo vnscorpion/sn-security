@@ -14,7 +14,7 @@ SN Secure chạy trên máy mà, theo giả định, **có thể đã bị chi�
 ## Những bất biến đã cài trong code
 
 - **Ban web chỉ ở cổng 80/443** (`[fw] web_ports`). Table `inet sn` kiểm `sn_white4/6` và `ct state established` **trước** khi drop, nên phiên admin đang mở không bị rớt.
-- **Chống tự khoá** (`whitelist.rs`): loopback; mọi IP interface; hub; phiên established trên cổng sshd **thật** (lấy từ inode socket của sshd, kể cả socket-activation và IPv6-mapped) và trên cổng panel đang listen; IP có dòng `Accepted` trong `auth.log`/`secure`.
+- **Chống tự khoá** (`whitelist.rs`): loopback; `[fw] whitelist`; mọi IP interface và IP công khai của VPS mà hub thấy (đúng từng địa chỉ, request của chính VPS không được đếm); hub; phiên SSH **đã đăng nhập** trên cổng sshd **thật** (lấy từ inode socket của sshd, kể cả socket-activation và IPv6-mapped), nhớ 30 phút, IPv6 cả /64; IP có dòng `Accepted` trong journal/`auth.log`/`secure`. Phiên panel/FTP (mở được mà không cần đăng nhập) chỉ được miễn luật `rate`/`scanner` khi đang mở, không vào whitelist tường lửa.
 - **Contain không kill** (`cgroup.rs`): chỉ `cpu.max`/`cfs_quota` 5% và freeze tùy chọn. Danh sách loại trừ xét **tên dịch vụ + exe nằm trong `/usr/`, `/sbin`...**, nên binary ở `/tmp` tự xưng `nginx` không được miễn (`contain.rs::protected_reason`).
 - **Envelope ký** (`common/crypto.rs`): ký trên đúng bytes JSON đã truyền (không canonicalize). Kiểm `schema_version`, `expires_at`, và `(epoch,seq)` đơn điệu để chống replay. Trường mới dùng `#[serde(default)]` → agent cũ/hub mới nói chuyện được.
 - **Phân tầng desired**: ban/unban/hunt nhận bằng key hub (TTL ≤ 24h); đổi `mode→observe`, `patterns`, `trusted_proxies` nằm ở `SignedPolicy` cần chữ ký **root**. Key hub lộ không hạ được chính sách.
@@ -28,9 +28,9 @@ SN Secure chạy trên máy mà, theo giả định, **có thể đã bị chi�
 2. **Cổng Docker publish** đi qua DNAT nên hook `input` có thể không chặn; cần chain `prerouting`/`DOCKER-USER` (v2).
 3. **cgroup v2 dưới systemd delegation**: bật controller `cpu` cho jail có thể thất bại; khi đó `--freeze` vẫn dừng được miner nhưng throttle CPU mềm có thể không áp. cgroup v1 dùng backend riêng.
 4. **UI admin**: một mật khẩu + session trong RAM; **chưa có TOTP/vai trò** (v1.1). Phải đặt sau VPN/allowlist.
-5. **Baseline** là EWMA xấp xỉ theo 96 khung 15 phút (cộng một EWMA chung cho khung còn lạnh), chưa phải histogram p99 (v1.1). Khi chưa học xong, luật `rate` chỉ báo, trừ ≥ 3000 request động/chu kỳ.
+5. **Baseline** là EWMA xấp xỉ theo 96 khung 15 phút (cộng một EWMA chung cho khung còn lạnh), học từ IP bận thứ ba trong các IP bình thường, chưa phải histogram p99 (v1.1). Khi chưa học xong, luật `rate` chỉ báo; trần 3000 request động/website/chu kỳ luôn chặn, dù ngưỡng đã học là bao nhiêu.
 6. **Chưa có self-update do hub điều khiển**: nâng cấp agent bằng SSH/ansible theo đợt.
-7. **CGNAT/di động VN**: chỉ ước lượng số người sau một IP theo số User-Agent trình duyệt (tối đa ×4 ngưỡng, ban ngắn không leo thang); máy cùng loại sau một IP đếm là một. Crawler được nhận theo dải IP công bố của Google, Microsoft, Apple (nhúng theo bản phát hành), chưa có reverse DNS hay ASN — một lý do nữa để observe đủ lâu.
+7. **CGNAT/di động VN**: số người sau một IP chỉ ước lượng theo số User-Agent trình duyệt có tải tài nguyên trang (tối đa ×4 ngưỡng), và IP đang hiển thị trang (nhiều tài nguyên mỗi request động) tính ít nhất hai người, ban ngắn không leo thang; máy cùng loại, cùng bản trình duyệt sau một IP vẫn có thể bị tính là một. Crawler được nhận theo dải IP công bố của Google (Googlebot, crawler đặc biệt, fetcher do người dùng kích hoạt), Microsoft, Apple (nhúng theo bản phát hành), chưa có reverse DNS hay ASN; crawler chỉ tự xưng (facebookexternalhit, Cốc Cốc, Yandex...) bị ban ngắn không leo thang khi vượt ngưỡng — một lý do nữa để observe đủ lâu.
 
 ## Trước production
 

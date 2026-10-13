@@ -87,8 +87,12 @@ pub struct WatchCfg {
     /// with this key under a `[[watch.sources]]` table, where it never counted.
     #[serde(default = "default_trusted_proxies")]
     pub trusted_proxies: Vec<String>,
-    /// Never ban a Cloudflare address, whatever `trusted_proxies` says: an edge
-    /// carries many visitors, and banning it never stops an attacker behind it.
+    /// Never ban a Cloudflare address that carries visitors, whatever
+    /// `trusted_proxies` says: an edge carries many, and banning it never stops
+    /// an attacker behind it. With `cloudflare` in `trusted_proxies` (the
+    /// default) every Cloudflare address is a proxy and never banned; without
+    /// it, one that shows a single client (a Worker, a lone attacker) can be.
+    /// Attack-rule hits from protected Cloudflare addresses are reported.
     #[serde(default = "default_true")]
     pub protect_cloudflare: bool,
     /// Raise a `cpu_high` alert when the machine's average CPU since the last
@@ -166,6 +170,11 @@ pub struct FwCfg {
     /// Ports a HTTP-derived ban is allowed to block. All-port bans need admin.
     #[serde(default = "default_web_ports")]
     pub web_ports: Vec<u16>,
+    /// A ban also drops new UDP flows to port 443 (HTTP/3), when 443 is a web
+    /// port. Set to false on a VPS that runs a VPN (OpenVPN, WireGuard) on
+    /// UDP 443: a banned address would lose it too.
+    #[serde(default = "default_true")]
+    pub block_quic: bool,
 }
 
 impl Default for FwCfg {
@@ -174,6 +183,7 @@ impl Default for FwCfg {
             whitelist: Vec::new(),
             max_bans_per_cycle: default_max_bans(),
             web_ports: default_web_ports(),
+            block_quic: true,
         }
     }
 }
@@ -323,8 +333,10 @@ impl Config {
         expand_proxies(&self.watch.trusted_proxies)
     }
 
-    /// Ranges never banned whatever the traffic from them: the trusted proxies
-    /// (they are not clients) and, unless switched off, every Cloudflare range.
+    /// Ranges never banned on an order from the hub or by `contain`: the
+    /// trusted proxies (they are not clients) and, unless switched off, every
+    /// Cloudflare range. (A watch cycle looks closer at a Cloudflare address
+    /// that is not a trusted proxy: see `protect_cloudflare`.)
     #[must_use]
     pub fn never_ban_cidrs(&self) -> Vec<Cidr> {
         let mut v = self.trusted_cidrs();
@@ -469,6 +481,7 @@ trusted_proxies = ["cloudflare"]
             assert_eq!(cfg.watch.min_requests, default_min_requests());
             assert_eq!(cfg.watch.trusted_proxies, ["cloudflare"]);
             assert!(cfg.watch.protect_cloudflare);
+            assert!(cfg.fw.block_quic);
             assert!(
                 cfg.misplaced_keys().is_empty(),
                 "{:?}",
@@ -498,6 +511,28 @@ trusted_proxies = ["cloudflare"]
             &Config::standalone_default().trusted_cidrs(),
             "198.51.100.7".parse().unwrap()
         ));
+    }
+
+    #[test]
+    fn the_upgrade_raises_only_the_old_default_floor() {
+        // What `install.sh --upgrade` runs on /etc/sn/agent.toml: every
+        // installer before this one wrote `min_requests = 120`, which kept
+        // the old floor on every upgraded VPS.
+        let script = include_str!("../../../deploy/install.sh").replace("\r\n", "\n");
+        let sed = script
+            .lines()
+            .find(|l| l.contains("sed -i -E") && l.contains("min_requests"))
+            .expect("install.sh --upgrade rewrites the old min_requests");
+        assert!(
+            sed.contains(
+                r"s/^(min_requests[[:space:]]*=[[:space:]]*)120([[:space:]]*(#.*)?)$/\1300\2/"
+            ),
+            "{sed}"
+        );
+        // Only inside the --upgrade block.
+        let upgrade = &script[script.find("if [ \"$UPGRADE\" -eq 1 ]").unwrap()..];
+        let end = upgrade.find("\nfi\n").unwrap();
+        assert!(upgrade[..end].contains(sed.trim()));
     }
 
     #[test]

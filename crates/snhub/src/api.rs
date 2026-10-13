@@ -174,6 +174,16 @@ pub async fn get_desired(
         if !record_pull(&db, &q.agent_id, pull) {
             return StatusCode::NOT_FOUND.into_response();
         }
+        // A signed pull (verified, and later than any before it) comes from
+        // the VPS itself: its address is the VPS's own too. The agent pulls
+        // over IPv4 where it can and reports the system's usual way, so a
+        // dual-stack VPS gets both its addresses known (best effort; a
+        // change is in the desired state this very answer carries).
+        if matches!(pull, Pull::Signed(_))
+            && let Err(e) = db.note_self_ip(&q.agent_id, &crate::auth::client_ip(&headers), at)
+        {
+            tracing::warn!("note_self_ip: {e:#}");
+        }
         db.get_desired(&q.agent_id)
     };
     let (epoch, version, body) = match found {

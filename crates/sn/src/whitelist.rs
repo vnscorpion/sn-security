@@ -1,15 +1,20 @@
 //! Self-lockout protection: the set of addresses `sn` must never ban.
 //!
 //! This is the agent's single most important safety property (plan §7, review
-//! LNX-1/SEC-6). It covers: loopback, every local interface address, the
-//! VPS's own public address as the hub sees it (on a cloud that NATs it, that
-//! one is on no interface), the hub, the admin ranges from config, SSH/panel
-//! sessions that are open or were in the last half hour (resolved from the real
-//! listening ports, including IPv6-mapped sessions on dual-stack sockets; on
-//! sshd's ports only sessions that have logged in), and any IP that logged in
-//! over SSH successfully in the recent past. An admin's and the VPS's own IPv6
-//! entries cover their whole /64: the other devices of that LAN (the admin's
-//! browser with a privacy address) share its ban key.
+//! LNX-1/SEC-6). It covers: loopback, the admin ranges from config, this
+//! VPS's own addresses (every interface, and its public address as the hub
+//! sees it: on a cloud that NATs it, that one is on no interface), the hub,
+//! SSH sessions that logged in (open now or in the last half hour, resolved
+//! from sshd's real listening ports, IPv6-mapped sessions on dual-stack
+//! sockets included) and recent successful SSH logins from the auth logs.
+//!
+//! An SSH admin's IPv6 entry covers its whole /64: the other devices of that
+//! LAN (the admin's browser with a privacy address) share its ban key. The
+//! VPS's and the hub's own addresses stay exact, and their own requests are
+//! not counted at all: on clouds that carve one /64 into many servers, the
+//! rest of that /64 is other customers. Panel and FTP connections prove
+//! nothing about who holds them (no login is needed to open one), so their
+//! peers are only spared the volume rules, never whitelisted.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
@@ -25,8 +30,9 @@ use crate::state::State;
 use crate::sys::{netstat, proc};
 use crate::util;
 
-/// Ports on which an established peer is treated as an admin and whitelisted,
-/// when the port is actually listening locally.
+/// Ports on which an established peer is an admin session, when the port is
+/// actually listening locally: SSH once sshd has let the user in, the others
+/// (panels, FTP) only as session peers (see [`Whitelist`]).
 const ADMIN_PORTS: &[u16] = &[
     22, 2222, 22022, // ssh (common alternates)
     21, 989, 990, // ftp/ftps
@@ -39,58 +45,140 @@ const ADMIN_PORTS: &[u16] = &[
 
 #[derive(Debug, Clone, Default)]
 pub struct Whitelist {
-    cidrs: Vec<Cidr>,
+    /// Loopback and the admin ranges from config: a ban key inside or around
+    /// one is never banned, and the hub's bans of it are refused.
+    ranges: Vec<Cidr>,
+    /// SSH admins: IPv4 exactly, IPv6 as its /64. Never banned by this VPS's
+    /// own rules; the firewall accepts them before any ban.
+    admins: Vec<Cidr>,
+    /// This VPS's own addresses and the hub's, exactly. Never banned, their
+    /// requests not counted, and accepted by the firewall.
+    own: Vec<IpAddr>,
+    /// Peers of panel and FTP sessions open now, exactly. Only spared `rate`
+    /// and `scanner`; not remembered, not in the firewall's whitelist.
+    peers: Vec<IpAddr>,
 }
 
 impl Whitelist {
-    /// Would banning `ip` lock out something we must protect? (Ban keys go
-    /// through [`key_protected`].)
+    /// Is `ip` itself whitelisted (as the firewall would accept it)?
     #[cfg(test)]
     #[must_use]
     pub fn protects(&self, ip: IpAddr) -> bool {
-        net::in_any(&self.cidrs, ip)
+        net::in_any(&self.ranges, ip)
+            || net::in_any(&self.admins, ip)
+            || self.own.contains(&net::normalize(ip))
     }
 
-    /// Would banning the range `net` (an IPv6 /64 ban key) lock out something
-    /// we must protect? Any whitelisted range or address inside it, or around
-    /// it, does: checking only the first address the logs showed in a /64
-    /// would miss the admin's session two addresses further on.
+    /// Must the ban key `net` (one address, or an IPv6 /64) never be banned by
+    /// this VPS's own rules? When a configured range or an SSH admin's entry
+    /// lies inside it or around it (checking only the first address the logs
+    /// showed in a /64 would miss the admin's session two addresses further
+    /// on), or when it is exactly one of the VPS's own addresses.
     #[must_use]
     pub fn protects_net(&self, net: Cidr) -> bool {
-        self.cidrs.iter().any(|c| c.overlaps(&net))
+        self.ranges
+            .iter()
+            .chain(&self.admins)
+            .any(|c| c.overlaps(&net))
+            || self.own_key(net)
     }
 
-    /// nft-ready keys (CIDR or plain address) for the `sn_white*` sets.
+    /// The key is one of the VPS's or the hub's own addresses. A /64 that
+    /// merely holds one is not: the firewall accepts the address itself before
+    /// any ban, and the rest of the /64 may be other customers' servers.
+    fn own_key(&self, net: Cidr) -> bool {
+        let max = if net.addr.is_ipv4() { 32 } else { 128 };
+        net.prefix == max && self.own.iter().any(|ip| net.contains(*ip))
+    }
+
+    /// Must a ban the hub ordered for this key be refused here? For the
+    /// configured ranges and the VPS's own addresses. An SSH session is no
+    /// reason to refuse the operator (the firewall accepts it while it lasts
+    /// anyway), and a panel or FTP connection proves nothing.
     #[must_use]
-    pub fn keys(&self) -> Vec<String> {
-        cidr_keys(&self.cidrs)
+    pub fn refuses_hub_ban(&self, net: Cidr) -> bool {
+        self.ranges.iter().any(|c| c.overlaps(&net)) || self.own_key(net)
     }
 
-    /// A whitelist of exactly these ranges (tests elsewhere in the agent).
+    /// Is the ban key a panel or FTP session's peer (that address, or the /64
+    /// that holds it)?
+    #[must_use]
+    pub fn session_peer(&self, key: &str) -> bool {
+        Cidr::parse(key).is_some_and(|net| self.peers.iter().any(|ip| net.contains(*ip)))
+    }
+
+    /// The VPS's and the hub's own addresses: their requests are not counted.
+    #[must_use]
+    pub fn own_addrs(&self) -> &[IpAddr] {
+        &self.own
+    }
+
+    /// nft-ready keys for the `sn_white*` sets: the configured ranges, the SSH
+    /// admins and the own addresses, plus `extra` (the trusted proxies),
+    /// written so that no element holds another (an interval set refuses
+    /// overlapping elements, and with them the whole update).
+    #[must_use]
+    pub fn keys(&self, extra: &[Cidr]) -> Vec<String> {
+        let mut all: Vec<Cidr> = self.ranges.clone();
+        all.extend_from_slice(&self.admins);
+        all.extend(self.own.iter().map(|ip| exact(*ip)));
+        all.extend_from_slice(extra);
+        cidr_keys(&net::minimal_cover(&all))
+    }
+
+    /// A whitelist of exactly these configured ranges (tests elsewhere in the
+    /// agent).
     #[cfg(test)]
     #[must_use]
-    pub fn of(cidrs: Vec<Cidr>) -> Whitelist {
-        Whitelist { cidrs }
-    }
-
-    /// One address exactly (/32 or /128).
-    fn push_ip(&mut self, ip: IpAddr) {
-        let ip = net::normalize(ip);
-        let prefix = if ip.is_ipv4() { 32 } else { 128 };
-        self.cidrs.push(Cidr { addr: ip, prefix });
-    }
-
-    /// An admin's or the VPS's own address: IPv4 exactly, IPv6 as its /64,
-    /// which is the unit the agent bans IPv6 by.
-    fn push_host(&mut self, ip: IpAddr) {
-        match net::normalize(ip) {
-            IpAddr::V6(v6) => self.cidrs.push(Cidr {
-                addr: IpAddr::V6(net64(v6)),
-                prefix: 64,
-            }),
-            v4 => self.push_ip(v4),
+    pub fn of(ranges: Vec<Cidr>) -> Whitelist {
+        Whitelist {
+            ranges,
+            ..Whitelist::default()
         }
     }
+
+    /// This VPS's (or the hub's) own address.
+    fn push_own(&mut self, ip: IpAddr) {
+        let ip = net::normalize(ip);
+        if !self.own.contains(&ip) {
+            self.own.push(ip);
+        }
+    }
+
+    /// An SSH admin's address: IPv4 exactly, IPv6 as its /64, which is the
+    /// unit the agent bans IPv6 by. Loopback and link-local addresses stay
+    /// exact (`::1` must never become `::/64`).
+    fn push_admin(&mut self, ip: IpAddr) {
+        let ip = net::normalize(ip);
+        let c = match ip {
+            IpAddr::V6(v6) if !special_v6(v6) => Cidr {
+                addr: IpAddr::V6(net64(v6)),
+                prefix: 64,
+            },
+            _ => exact(ip),
+        };
+        self.admins.push(c);
+    }
+
+    /// A panel or FTP session's peer.
+    fn push_peer(&mut self, ip: IpAddr) {
+        let ip = net::normalize(ip);
+        if !self.peers.contains(&ip) {
+            self.peers.push(ip);
+        }
+    }
+}
+
+/// One address as a range of one (/32 or /128).
+fn exact(ip: IpAddr) -> Cidr {
+    let ip = net::normalize(ip);
+    let prefix = if ip.is_ipv4() { 32 } else { 128 };
+    Cidr { addr: ip, prefix }
+}
+
+/// Loopback, unspecified or link-local: never widened to a /64.
+fn special_v6(v6: Ipv6Addr) -> bool {
+    v6.is_loopback() || v6.is_unspecified() || (v6.segments()[0] & 0xffc0) == 0xfe80
 }
 
 /// The network address of the /64 that holds `v6`.
@@ -118,9 +206,10 @@ pub fn cidr_keys(cidrs: &[Cidr]) -> Vec<String> {
 }
 
 /// Must the ban key (`203.0.113.7`, or an IPv6 `2001:db8:1:2::/64`) never be
-/// banned? It is when it holds or lies in a whitelisted range, or a range of
-/// `never_ban` (the trusted proxies, Cloudflare). A key that is not an address
-/// is not protected (and never reaches the firewall either).
+/// banned? It is when the whitelist protects it (see
+/// [`Whitelist::protects_net`]), or it holds or lies in a range of `never_ban`
+/// (the trusted proxies, Cloudflare). A key that is not an address is not
+/// protected (and never reaches the firewall either).
 #[must_use]
 pub fn key_protected(key: &str, wl: &Whitelist, never_ban: &[Cidr]) -> bool {
     let Some(net) = Cidr::parse(key) else {
@@ -129,9 +218,9 @@ pub fn key_protected(key: &str, wl: &Whitelist, never_ban: &[Cidr]) -> bool {
     wl.protects_net(net) || never_ban.iter().any(|c| c.overlaps(&net))
 }
 
-/// How long an SSH or panel session's peer stays whitelisted after it was last
-/// seen open. A panel user's browser opens and closes connections all the time;
-/// between two of them the agent's cycle must not treat the admin as a visitor.
+/// How long an SSH session's peer stays whitelisted after it was last seen
+/// open: an admin who reconnects, or whose browser keeps working on the sites
+/// after the shell closed, must not be treated as a visitor in between.
 const ADMIN_MEMORY_SECS: i64 = 30 * 60;
 /// Most remembered admin peers.
 const MAX_REMEMBERED_ADMINS: usize = 256;
@@ -155,7 +244,7 @@ fn remember_admins(known: &mut HashMap<String, i64>, seen_now: &[IpAddr], now: i
 }
 
 /// Build the whitelist from config, the live socket table and the auth logs,
-/// plus, with the agent's `state`, the admin sessions of the last half hour
+/// plus, with the agent's `state`, the SSH sessions of the last half hour
 /// (remembered there) and the VPS's own public address as the hub saw it.
 #[must_use]
 pub fn build(cfg: &Config, conns: &[netstat::Conn], state: Option<&State>) -> Whitelist {
@@ -164,53 +253,58 @@ pub fn build(cfg: &Config, conns: &[netstat::Conn], state: Option<&State>) -> Wh
     // 1) loopback
     for c in ["127.0.0.0/8", "::1/128"] {
         if let Some(cidr) = Cidr::parse(c) {
-            wl.cidrs.push(cidr);
+            wl.ranges.push(cidr);
         }
     }
 
     // 2) config admin ranges (local-only; never settable remotely)
     for c in &cfg.fw.whitelist {
         if let Some(cidr) = Cidr::parse(c) {
-            wl.cidrs.push(cidr);
+            wl.ranges.push(cidr);
         }
     }
 
-    // 3) every local interface address
+    // 3) every local interface address (loopback is in 1)
     for ip in local_ips() {
-        wl.push_host(ip);
+        if !net::normalize(ip).is_loopback() {
+            wl.push_own(ip);
+        }
     }
 
     // 4) the hub
     for ip in resolve_hub(&cfg.hub.url) {
-        wl.push_ip(ip);
+        wl.push_own(ip);
     }
 
-    // 5) SSH/panel sessions open now, and (with state) those of the last half
-    // hour
-    let peers = admin_session_peers(conns);
-    for ip in &peers {
-        wl.push_host(*ip);
+    // 5) SSH sessions open now and (with state) those of the last half hour;
+    // panel and FTP sessions open now
+    let live = admin_session_peers(conns);
+    for ip in &live.ssh {
+        wl.push_admin(*ip);
+    }
+    for ip in &live.other {
+        wl.push_peer(*ip);
     }
     if let Some(state) = state {
         let mut known = state.recent_admins();
         let before = known.clone();
-        for ip in remember_admins(&mut known, &peers, util::now_secs()) {
-            wl.push_host(ip);
+        for ip in remember_admins(&mut known, &live.ssh, util::now_secs()) {
+            wl.push_admin(ip);
         }
         if known != before
             && let Err(e) = state.save_recent_admins(&known)
         {
             eprintln!("whitelist: could not remember admin sessions: {e:#}");
         }
-        // 7) the VPS's own public address(es), as the hub saw its reports come
+        // 7) the VPS's own public address(es), as the hub saw it reach it
         for ip in state.meta().self_ips.iter().filter_map(|s| s.parse().ok()) {
-            wl.push_host(ip);
+            wl.push_own(ip);
         }
     }
 
     // 6) recent successful SSH logins
     for ip in recent_ssh_logins() {
-        wl.push_host(ip);
+        wl.push_admin(ip);
     }
 
     wl
@@ -294,26 +388,33 @@ fn logged_in_title(title: &str) -> bool {
     !who.is_empty() && !who.contains([' ', '[', ']'])
 }
 
-/// Peers of live admin sessions. On sshd's ports a connection counts only once
-/// sshd has let a user in on it: one kept open before login (reconnecting
-/// within LoginGraceTime) must not buy immunity from bans. Panel ports are taken
-/// as they are: their sessions cannot be told apart from here.
-fn session_peers(conns: &[netstat::Conn], s: &Sessions) -> Vec<IpAddr> {
-    conns
-        .iter()
-        .filter(|c| c.state == netstat::ST_ESTABLISHED)
-        .filter(|c| {
-            if s.sshd_ports.contains(&c.local_port) {
-                s.logged_in.contains(&c.inode)
-            } else {
-                s.other_ports.contains(&c.local_port)
-            }
-        })
-        .map(|c| net::normalize(c.remote))
-        .collect()
+/// Peers of live admin sessions.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Live {
+    /// On sshd's ports, connections sshd has let a user in on: one kept open
+    /// before login (reconnecting within LoginGraceTime) buys nothing.
+    ssh: Vec<IpAddr>,
+    /// On the panel and FTP ports: anyone can open one without logging in
+    /// (FTP greets first), so these are only session peers.
+    other: Vec<IpAddr>,
 }
 
-fn admin_session_peers(conns: &[netstat::Conn]) -> Vec<IpAddr> {
+fn session_peers(conns: &[netstat::Conn], s: &Sessions) -> Live {
+    let mut live = Live::default();
+    for c in conns.iter().filter(|c| c.state == netstat::ST_ESTABLISHED) {
+        let peer = net::normalize(c.remote);
+        if s.sshd_ports.contains(&c.local_port) {
+            if s.logged_in.contains(&c.inode) {
+                live.ssh.push(peer);
+            }
+        } else if s.other_ports.contains(&c.local_port) {
+            live.other.push(peer);
+        }
+    }
+    live
+}
+
+fn admin_session_peers(conns: &[netstat::Conn]) -> Live {
     session_peers(conns, &sessions(conns))
 }
 
@@ -497,33 +598,120 @@ mod tests {
         s.parse().unwrap()
     }
 
+    fn cidr(s: &str) -> Cidr {
+        Cidr::parse(s).unwrap()
+    }
+
     #[test]
-    fn a_64_is_protected_when_any_whitelisted_address_is_inside_it() {
+    fn an_admins_64_is_protected_but_the_vps_own_64_is_not() {
         // The admin is in over SSH from ::5; a colleague's device (or the
         // admin's own browser with a privacy address) in the same /64 showed up
         // in the log first.
         let mut wl = Whitelist::default();
-        wl.push_ip(ip("2402:800:6310:12a::5"));
-        assert!(!wl.protects(ip("2402:800:6310:12a:aaaa::1")));
+        wl.push_admin(ip("2402:800:6310:12a::5"));
+        assert!(wl.protects(ip("2402:800:6310:12a:aaaa::1")));
         assert!(key_protected("2402:800:6310:12a::/64", &wl, &[]));
         assert!(!key_protected("2402:800:6310:12b::/64", &wl, &[]));
-        // An admin's IPv6 session whitelists its /64 on the firewall too.
-        let mut wl = Whitelist::default();
-        wl.push_host(ip("2402:800:6310:12a::5"));
-        assert!(wl.protects(ip("2402:800:6310:12a:aaaa::1")));
-        assert_eq!(wl.keys(), ["2402:800:6310:12a::/64"]);
+        // The admin's /64 is whitelisted on the firewall too.
+        assert_eq!(wl.keys(&[]), ["2402:800:6310:12a::/64"]);
         // IPv4 stays one address.
-        wl.push_host(ip("::ffff:198.51.100.4"));
+        wl.push_admin(ip("::ffff:198.51.100.4"));
         assert!(key_protected("198.51.100.4", &wl, &[]));
         assert!(!key_protected("198.51.100.5", &wl, &[]));
-        // A wide configured range, and ranges that must never be banned.
-        let cf = [Cidr::parse("2606:4700::/32").unwrap()];
+        // The VPS's own IPv6 address (or the hub's) protects itself only: on
+        // a cloud that carves one /64 into many servers, the rest of it is
+        // other customers, who may be banned like anyone.
+        let mut wl = Whitelist::default();
+        wl.push_own(ip("2604:a880:400:d1::7a3:e001"));
+        wl.push_own(ip("198.51.100.20"));
+        assert!(!key_protected("2604:a880:400:d1::/64", &wl, &[]));
+        assert!(key_protected("198.51.100.20", &wl, &[]));
+        assert!(wl.protects(ip("2604:a880:400:d1::7a3:e001")));
+        assert!(!wl.protects(ip("2604:a880:400:d1::7a3:e002")));
+        assert_eq!(wl.own_addrs().len(), 2);
+        // A configured range, however narrow, and ranges never banned.
+        let wl = Whitelist::of(vec![cidr("2001:db8:7:8::9")]);
+        assert!(key_protected("2001:db8:7:8::/64", &wl, &[]));
+        let cf = [cidr("2606:4700::/32")];
         assert!(key_protected(
             "2606:4700:10::/64",
             &Whitelist::default(),
             &cf
         ));
         assert!(!key_protected("x", &wl, &cf));
+    }
+
+    #[test]
+    fn loopback_and_link_local_are_never_widened_to_a_64() {
+        let mut wl = Whitelist::default();
+        for s in ["fe80::1c2:3ff:fe4:5", "::1"] {
+            wl.push_admin(ip(s));
+        }
+        assert_eq!(wl.keys(&[]), ["::1", "fe80::1c2:3ff:fe4:5"]);
+        assert!(!key_protected("2001:db8::/64", &wl, &[]));
+    }
+
+    #[test]
+    fn the_firewall_whitelist_never_holds_one_element_inside_another() {
+        // What every host has: loopback plus `lo`'s 127.0.0.1, ::1, Cloudflare
+        // both trusted and protected, an office range with an admin inside
+        // it, an admin /64 inside a configured /48, a trusted load balancer
+        // range holding the VPS's own interface address.
+        let mut wl = Whitelist::of(vec![
+            cidr("127.0.0.0/8"),
+            cidr("::1/128"),
+            cidr("203.0.113.0/24"),
+            cidr("2001:db8::/48"),
+        ]);
+        wl.push_own(ip("127.0.0.1"));
+        wl.push_own(ip("10.0.0.5"));
+        wl.push_own(ip("::1"));
+        wl.push_admin(ip("203.0.113.9"));
+        wl.push_admin(ip("2001:db8:0:5::9"));
+        wl.push_admin(ip("2001:db8:0:5::a"));
+        let mut extra = snsec_common::ranges::cloudflare().to_vec();
+        extra.extend_from_slice(snsec_common::ranges::cloudflare());
+        extra.push(cidr("10.0.0.0/16"));
+        let keys = wl.keys(&extra);
+        let parsed: Vec<Cidr> = keys.iter().map(|k| cidr(k)).collect();
+        for (i, a) in parsed.iter().enumerate() {
+            for b in &parsed[i + 1..] {
+                assert!(!a.overlaps(b), "{a:?} and {b:?} in {keys:?}");
+            }
+        }
+        for want in [
+            "127.0.0.0/8",
+            "10.0.0.0/16",
+            "203.0.113.0/24",
+            "2001:db8::/48",
+            "::1",
+        ] {
+            assert!(keys.iter().any(|k| k == want), "{want} in {keys:?}");
+        }
+        assert!(!keys.iter().any(|k| k == "::/64"));
+    }
+
+    #[test]
+    fn the_hub_is_refused_only_for_configured_ranges_and_the_vps_own_addresses() {
+        let mut wl = Whitelist::of(vec![cidr("203.0.113.0/24")]);
+        wl.push_own(ip("198.51.100.20"));
+        wl.push_admin(ip("192.0.2.44"));
+        wl.push_peer(ip("192.0.2.45"));
+        assert!(wl.refuses_hub_ban(cidr("203.0.113.7")));
+        assert!(wl.refuses_hub_ban(cidr("198.51.100.20")));
+        // An SSH session, and a panel or FTP connection, do not stop the
+        // operator's ban.
+        assert!(!wl.refuses_hub_ban(cidr("192.0.2.44")));
+        assert!(!wl.refuses_hub_ban(cidr("192.0.2.45")));
+        // A panel or FTP peer is only a session peer: never protected, never
+        // on the firewall's whitelist.
+        assert!(wl.session_peer("192.0.2.45"));
+        assert!(!wl.session_peer("192.0.2.46"));
+        assert!(!key_protected("192.0.2.45", &wl, &[]));
+        assert!(!wl.keys(&[]).iter().any(|k| k == "192.0.2.45"));
+        let mut wl = Whitelist::default();
+        wl.push_peer(ip("2001:db8:9:9::5"));
+        assert!(wl.session_peer("2001:db8:9:9::/64"));
     }
 
     #[test]
@@ -666,7 +854,11 @@ mod tests {
         ];
         assert_eq!(
             session_peers(&conns, &s),
-            [ip("203.0.113.7"), ip("203.0.113.8"), ip("192.0.2.4")]
+            Live {
+                ssh: vec![ip("203.0.113.7"), ip("203.0.113.8")],
+                // A panel session: only a session peer.
+                other: vec![ip("192.0.2.4")],
+            }
         );
     }
 

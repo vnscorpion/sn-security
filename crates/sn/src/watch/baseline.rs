@@ -78,8 +78,18 @@ impl Baseline {
         }
     }
 
-    /// Fold one representative cycle's busiest-address count into the slot's
-    /// EWMA and the all-slot one. The caller skips idle and backlog cycles.
+    /// Learn from one representative cycle: `value` (see
+    /// `decide::robust_busiest`), clamped to twice what the slot's current
+    /// threshold allows for one address (`threshold / k`), so even addresses
+    /// that stay just under the bar for hours raise it only step by step. The
+    /// caller skips idle and backlog cycles, and caps the threshold itself.
+    pub fn learn(&mut self, slot: usize, value: u64, k: f64, min_requests: u32) {
+        let per_address = self.threshold(slot, k, min_requests) as f64 / k.max(1.0);
+        let cap = (2.0 * per_address).ceil() as u64;
+        self.observe(slot, value.min(cap));
+    }
+
+    /// Fold one cycle's count into the slot's EWMA and the all-slot one.
     pub fn observe(&mut self, slot: usize, busiest_dynamic: u64) {
         let x = busiest_dynamic as f64;
         self.rate[slot] = ewma(self.rate[slot], self.n[slot], x);
@@ -149,6 +159,36 @@ mod tests {
             b.observe((i % 8) as usize, 200);
         }
         assert!(b.ready(50), "a quiet slot does not stay cold for ever");
+    }
+
+    #[test]
+    fn an_address_staying_just_under_the_bar_raises_it_only_step_by_step() {
+        // The old baseline learned the busiest address as it was: a scraper
+        // at 2999 dynamic requests per cycle for a day made the threshold
+        // 5 x 2999. Each lesson is now at most twice what the bar allows one
+        // address.
+        let mut b = Baseline::default();
+        for _ in 0..GLOBAL_MIN_OBS {
+            b.learn(7, 2999, 5.0, 300);
+        }
+        // 300 / 5 = 60 per address, so at most 120 learned: still the floor.
+        assert_eq!(b.threshold(7, 5.0, 300), 600);
+        let mut b = Baseline::default();
+        let mut last = b.threshold(7, 5.0, 300);
+        for _ in 0..50 {
+            b.learn(7, 1_000_000, 5.0, 300);
+            let t = b.threshold(7, 5.0, 300);
+            // At most +15% per cycle (ALPHA x doubling).
+            assert!(t as f64 <= (last as f64 * 1.16).max(600.0), "{last} -> {t}");
+            last = t;
+        }
+        // Ordinary traffic below the cap is learned as it is.
+        let mut b = Baseline::default();
+        for _ in 0..MIN_OBS {
+            b.learn(10, 50, 5.0, 300);
+        }
+        assert_eq!(b.threshold(10, 5.0, 300), 300);
+        assert!((b.rate[10] - 50.0).abs() < 1e-9);
     }
 
     #[test]

@@ -76,6 +76,28 @@ impl Cidr {
     }
 }
 
+/// The same addresses as `cidrs`, written without overlap: each range in its
+/// canonical form, once, and none that another one already holds. An nftables
+/// interval set without `auto-merge` refuses an element that overlaps another
+/// (and with it the whole transaction), so a set is written from this. Two
+/// prefixes either nest or are apart, so dropping the held ones leaves ranges
+/// that are pairwise apart. Widest first, IPv4 before IPv6.
+#[must_use]
+pub fn minimal_cover(cidrs: &[Cidr]) -> Vec<Cidr> {
+    let mut all: Vec<Cidr> = cidrs.iter().map(Cidr::canonical).collect();
+    all.sort_by_key(|c| (c.addr.is_ipv6(), c.prefix, c.addr));
+    let mut out: Vec<Cidr> = Vec::with_capacity(all.len());
+    for c in all {
+        let held = out.iter().any(|k| {
+            k.addr.is_ipv6() == c.addr.is_ipv6() && k.prefix <= c.prefix && k.contains(c.addr)
+        });
+        if !held {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Normalize `::ffff:a.b.c.d` to the plain IPv4 address.
 #[must_use]
 pub fn normalize(ip: IpAddr) -> IpAddr {
@@ -197,6 +219,57 @@ mod tests {
         assert!(!c("2001:db8:1:3::/64").overlaps(&c("2001:db8:1:2::5")));
         assert!(!c("10.1.2.0/24").overlaps(&c("10.1.3.0/24")));
         assert!(!c("10.0.0.0/8").overlaps(&c("2001:db8::/32")));
+    }
+
+    #[test]
+    fn a_cover_has_no_range_inside_another() {
+        let c = |s| Cidr::parse(s).unwrap();
+        let input = [
+            // Loopback, and an interface address inside it.
+            c("127.0.0.0/8"),
+            c("127.0.0.1"),
+            // The same Cloudflare range twice (trusted and protected).
+            c("104.16.0.0/13"),
+            c("104.16.0.0/13"),
+            // An office range with an admin session inside it.
+            c("203.0.113.0/24"),
+            c("203.0.113.9"),
+            // ::1 and an admin /64; a /64 inside a configured /48.
+            c("::1"),
+            c("2001:db8:1:2::/64"),
+            c("2001:db8::/32"),
+            c("2402:800:6310:12a::5"),
+            c("2402:800:6310:12a::/64"),
+            // Apart from everything.
+            c("198.51.100.4"),
+        ];
+        let out = minimal_cover(&input);
+        let shown: Vec<String> = out
+            .iter()
+            .map(|c| format!("{}/{}", c.addr, c.prefix))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                "127.0.0.0/8",
+                "104.16.0.0/13",
+                "203.0.113.0/24",
+                "198.51.100.4/32",
+                "2001:db8::/32",
+                "2402:800:6310:12a::/64",
+                "::1/128",
+            ]
+        );
+        for (i, a) in out.iter().enumerate() {
+            for b in &out[i + 1..] {
+                assert!(!a.overlaps(b), "{a:?} {b:?}");
+            }
+        }
+        // Every input address is still covered.
+        for c in &input {
+            assert!(in_any(&out, c.addr), "{c:?}");
+        }
+        assert!(minimal_cover(&[]).is_empty());
     }
 
     #[test]

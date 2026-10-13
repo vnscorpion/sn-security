@@ -100,11 +100,16 @@ fn is_path_char(b: u8) -> bool {
 /// anything.
 const CRAWLER_TOKENS: &[&str] = &[
     "googlebot",
+    "adsbot-google",
+    "mediapartners-google",
+    "google-inspectiontool",
+    "googleother",
     "bingbot",
     "applebot",
     "yandex",
     "baiduspider",
     "duckduckbot",
+    "coccocbot",
     "facebookexternalhit",
     "semrushbot",
     "ahrefsbot",

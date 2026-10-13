@@ -93,6 +93,18 @@ pub(crate) fn open_log(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+/// The offset of the end of `path` now, without reading it: for a log that is
+/// followed again later, so that it starts from here rather than from where
+/// it was left long ago (or from its end, losing what came between).
+pub fn offset_at_end(path: &Path) -> io::Result<Offset> {
+    let meta = open_log(path)?.metadata()?;
+    Ok(Offset {
+        dev: meta.dev(),
+        inode: meta.ino(),
+        pos: meta.len(),
+    })
+}
+
 /// Read new complete lines from `path` given the previous offset (if any).
 /// Caps total bytes read to `max_bytes` to bound a single cycle under a flood;
 /// when capped, the offset still advances so the next cycle continues.
