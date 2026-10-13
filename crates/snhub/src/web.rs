@@ -1306,6 +1306,23 @@ pub async fn agent_detail(
         } @else {
             div class="card" { div class="empty" { "Chưa nhận được báo cáo nào từ VPS này. Sau khi cài agent, VPS sẽ báo về sau vài phút." } }
         }
+
+        div class="card" id="remove" style="border-color:var(--bad)" {
+            h2 { "Xoá VPS khỏi hub" }
+            p class="help" {
+                "Hub thu hồi khoá của agent (VPS không gửi báo cáo, không nhận lệnh được nữa) và xoá báo cáo, lệnh, bằng chứng, đề xuất AI của VPS này; nhật ký thao tác được giữ. "
+                "Không hoàn tác được: muốn quản lý lại thì cài agent lại bằng lệnh mới ở “Thêm VPS”. "
+                "Nên gỡ agent trên VPS trước (" code { "deploy/uninstall.sh" } "), vì xoá ở hub không gỡ được gì trên VPS: các lệnh chặn đang có vẫn còn tới khi hết hạn."
+            }
+            form method="post" action={"/agent/" (agent.id) "/delete"} style="margin:0"
+                onsubmit="return confirm('Xoá VPS này khỏi hub? Không hoàn tác được.')" {
+                div class="ctrls" {
+                    label class="f" { span class="t" { "Gõ tên VPS để xác nhận" } input type="text" name="confirm" required autocomplete="off"; }
+                    label class="f" { span class="t" { "Mật khẩu hiện tại" } input type="password" name="password" required autocomplete="current-password"; }
+                    button class="bad" type="submit" { "Xoá VPS" }
+                }
+            }
+        }
     };
     Html(shell(&agent.name, body).into_string()).into_response()
 }
@@ -1354,6 +1371,52 @@ pub async fn ban_post(
     });
     drop(db);
     Redirect::to(&format!("/agent/{id}")).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct RemoveForm {
+    confirm: String,
+    password: String,
+}
+
+/// Remove a VPS from the hub (its key, reports, orders, evidence, proposals).
+/// Asks for the VPS's name and the password: it cannot be undone.
+pub async fn remove_post(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(f): Form<RemoveForm>,
+) -> Response {
+    use crate::web_auth::{Recheck, recheck_password};
+    if let Some(r) = guard(&st, &headers) {
+        return r;
+    }
+    let Some(agent) = st.db.lock().expect("db").agent(&id).ok().flatten() else {
+        return Redirect::to("/").into_response();
+    };
+    let back = |msg: &str| {
+        Redirect::to(&format!("/agent/{id}?msg={}&at=ctl#remove", urlenc(msg))).into_response()
+    };
+    if f.confirm.trim() != agent.name {
+        return back("Tên gõ vào không khớp tên VPS: chưa xoá gì.");
+    }
+    match recheck_password(&st, &headers, f.password).await {
+        Recheck::Right => {}
+        Recheck::Wrong => return back("Mật khẩu hiện tại không đúng: chưa xoá gì."),
+        Recheck::Wait(w) => return back(&format!("Thử quá nhiều lần, chờ {w} giây.")),
+    }
+    let removed = st.db.lock().expect("db").remove_agent(&id, "admin", now());
+    match removed {
+        Ok(Some(name)) => Redirect::to(&format!(
+            "/?msg={}",
+            urlenc(&format!(
+                "Đã xoá VPS “{name}” khỏi hub. Nếu agent vẫn còn trên VPS, hãy gỡ bằng deploy/uninstall.sh."
+            ))
+        ))
+        .into_response(),
+        Ok(None) => Redirect::to("/").into_response(),
+        Err(e) => back(&format!("Không xoá được: {e:#}")),
+    }
 }
 
 #[derive(Deserialize, Default)]

@@ -99,6 +99,12 @@ enum Cmd {
     TotpNow,
     /// Revoke every Hermes (MCP) token at once (a token may have leaked).
     McpRevokeAll,
+    /// Remove a VPS from the hub (its key, reports, orders, evidence, proposals).
+    RemoveVps {
+        /// The VPS id, or its name when that is unique.
+        #[arg(long)]
+        vps: String,
+    },
     /// Lift every ban on every VPS (or one, with --vps): the hub's orders are
     /// dropped and each VPS empties its ban sets at its next sync.
     UnbanAll {
@@ -141,6 +147,7 @@ fn real_main() -> Result<()> {
         Cmd::SetAdminPassword { password } => cmd_set_password(&cli.config, password),
         Cmd::Reset2fa => cmd_reset_2fa(&cli.config),
         Cmd::TotpNow => cmd_totp_now(&cli.config),
+        Cmd::RemoveVps { vps } => cmd_remove_vps(&cli.config, &vps),
         Cmd::UnbanAll { vps, observe } => cmd_unban_all(&cli.config, vps.as_deref(), observe),
         Cmd::McpRevokeAll => {
             let cfg = HubConfig::load(&cli.config)?;
@@ -304,6 +311,29 @@ fn cmd_reset_2fa(config_path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn cmd_remove_vps(config_path: &Path, want: &str) -> Result<()> {
+    let cfg = HubConfig::load(config_path)?;
+    let db = Db::open(&cfg.data_path().join("snhub.sqlite"))?;
+    let agents = db.list_agents()?;
+    let matches: Vec<_> = agents
+        .iter()
+        .filter(|a| a.id == want || a.name.eq_ignore_ascii_case(want))
+        .collect();
+    let a = match matches.as_slice() {
+        [one] => *one,
+        [] => anyhow::bail!("no such VPS: {want}"),
+        _ => anyhow::bail!("several VPSes are called {want}: give the id (see the hub's overview)"),
+    };
+    match db.remove_agent(&a.id, "console", now())? {
+        Some(name) => println!(
+            "Removed {name} ({}) from the hub. If the agent still runs on that VPS, remove it there with deploy/uninstall.sh.",
+            a.id
+        ),
+        None => println!("no such VPS"),
+    }
+    Ok(())
+}
+
 fn cmd_unban_all(config_path: &Path, vps: Option<&str>, observe: bool) -> Result<()> {
     let cfg = HubConfig::load(config_path)?;
     let db = Db::open(&cfg.data_path().join("snhub.sqlite"))?;
@@ -464,6 +494,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/agent/{id}/ban", post(web::ban_post))
         .route("/agent/{id}/unban", post(web::unban_post))
         .route("/agent/{id}/unban-all", post(web::unban_all_post))
+        .route("/agent/{id}/delete", post(web::remove_post))
         .route("/unban-all", post(web::unban_all_fleet_post))
         .route("/agent/{id}/mode", post(web::mode_post))
         .route("/agent/{id}/job", post(web::job_post))

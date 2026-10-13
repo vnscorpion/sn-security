@@ -299,6 +299,45 @@ impl Db {
         Ok(rows.filter_map(Result::ok).collect())
     }
 
+    /// Remove a VPS from the hub: its key (so it can neither report nor pull
+    /// orders any more), its reports, orders, evidence and AI proposals. The
+    /// decisions log keeps its lines, with a last one saying who removed it.
+    /// Returns the removed VPS's name, or `None` if there was no such VPS.
+    ///
+    /// # Errors
+    /// A database error (nothing is removed then).
+    pub fn remove_agent(&self, agent_id: &str, who: &str, now: i64) -> Result<Option<String>> {
+        let Some(a) = self.agent(agent_id)? else {
+            return Ok(None);
+        };
+        let tx = self.conn.unchecked_transaction()?;
+        for table in ["reports", "desired", "evidence", "ai_state", "proposals"] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE agent_id = ?1"),
+                params![agent_id],
+            )?;
+        }
+        // Created by the desired-pull handler the first time it is needed.
+        let _ = tx.execute(
+            "DELETE FROM desired_pulls WHERE agent_id = ?1",
+            params![agent_id],
+        );
+        tx.execute("DELETE FROM agents WHERE id = ?1", params![agent_id])?;
+        tx.execute(
+            "INSERT INTO decisions (agent_id, who, action, detail, ts) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                agent_id,
+                who,
+                "remove_vps",
+                format!("xoá VPS {} khỏi hub", a.name),
+                now
+            ],
+        )?;
+        tx.commit()?;
+        self.report_budget.borrow_mut().remove(agent_id);
+        Ok(Some(a.name))
+    }
+
     pub fn agent(&self, agent_id: &str) -> Result<Option<AgentRow>> {
         Ok(self
             .conn

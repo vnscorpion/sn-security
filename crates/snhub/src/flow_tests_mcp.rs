@@ -634,3 +634,41 @@ async fn an_agent_too_old_for_the_marker_gets_its_listed_bans_as_unbans() {
     let (_, _, d) = h.st.db.lock().unwrap().get_desired(&id).unwrap().unwrap();
     assert_eq!(d.unbans, vec!["91.92.93.94".to_string()]);
 }
+
+#[tokio::test]
+async fn a_vps_is_removed_only_with_its_name_and_the_password() {
+    let h = hub();
+    let cookie = h.sign_in().await;
+    let id = h.vps(&["evidence", "remediate"]);
+    let page = h.get(&format!("/agent/{id}"), &cookie).await;
+    assert!(page.body.contains("Xoá VPS khỏi hub"));
+    let url = format!("/agent/{id}/delete");
+    // Wrong name, wrong password: nothing happens.
+    let r = h
+        .post(&url, &cookie, &format!("confirm=web-02&{}", pw_form()))
+        .await;
+    assert!(r.location().contains("msg="));
+    let r = h.post(&url, &cookie, "confirm=web-01&password=wrong").await;
+    assert!(r.location().contains("msg="));
+    assert!(h.st.db.lock().unwrap().agent(&id).unwrap().is_some());
+    // Name and password: gone, with everything the hub held for it.
+    let r = h
+        .post(&url, &cookie, &format!("confirm=web-01&{}", pw_form()))
+        .await;
+    assert!(r.location().starts_with("/?msg="), "{}", r.location());
+    let db = h.st.db.lock().unwrap();
+    assert!(db.agent(&id).unwrap().is_none());
+    assert!(
+        db.agent_pubkey(&id).unwrap().is_none(),
+        "its key no longer works"
+    );
+    assert!(db.latest_report(&id).unwrap().is_none());
+    assert!(db.get_desired(&id).unwrap().is_none());
+    assert!(db.latest_evidence(&id).unwrap().is_none());
+    // The log keeps a line saying who removed it.
+    let log = db.recent_decisions(5).unwrap();
+    assert!(
+        log.iter()
+            .any(|(a, who, action, ..)| a == &id && who == "admin" && action == "remove_vps")
+    );
+}
