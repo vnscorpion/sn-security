@@ -22,6 +22,8 @@ mod sys;
 mod triage;
 mod undo;
 mod util;
+mod waf;
+mod waf_conf;
 mod watch;
 mod whitelist;
 
@@ -135,7 +137,12 @@ enum Cmd {
         #[arg(long)]
         token: Option<String>,
     },
-    /// Kill switch: remove the sn firewall table and release any jail.
+    /// Put the WAF rules the hub ordered into the web server (root; started by
+    /// the watch cycle with `systemd-run`).
+    #[command(name = "waf-apply", hide = true)]
+    WafApply,
+    /// Kill switch: remove the sn firewall table, release any jail and take
+    /// the WAF rules out of the web server.
     Disable,
     /// Print detected environment facts.
     Env,
@@ -225,6 +232,10 @@ fn run() -> Result<()> {
             let state = State::open()?;
             remediate::run_job(&cfg, &state, &job)?;
         }
+        Cmd::WafApply => {
+            let state = State::open()?;
+            waf::apply_now(&state)?;
+        }
         Cmd::InstallClamav => {
             let state = State::open()?;
             // System packages: their install scripts and the update timer's unit
@@ -284,6 +295,7 @@ fn run() -> Result<()> {
             let _ = sys::fw::delete_table();
             let _ = sys::cgroup::release();
             println!("sn firewall table removed and jail released (kill switch).");
+            println!("{}", waf::remove_all());
         }
         Cmd::Env => {
             println!("sn {}", snsec_common::AGENT_VERSION);
@@ -294,6 +306,7 @@ fn run() -> Result<()> {
                 println!("contained pids: {jailed:?}");
             }
             println!("nftables: {}", sys::fw::available());
+            println!("{}", waf::describe());
             if sys::fw::available() {
                 match sys::fw::list_ban_keys() {
                     Ok(keys) => println!("active bans: {}", keys.len()),

@@ -137,6 +137,8 @@ impl Db {
         conn.execute_batch(crate::db_auth::SCHEMA_AUTH)
             .context("applying auth schema")?;
         crate::db_auth::migrate_auth(&conn).context("migrating auth schema")?;
+        conn.execute_batch(crate::db_waf::SCHEMA_WAF)
+            .context("applying WAF schema")?;
         conn.execute_batch(crate::db_mcp::SCHEMA_MCP)
             .context("applying MCP schema")?;
         // Not fatal: `get_desired` leaves such entries out anyway.
@@ -195,6 +197,11 @@ impl Db {
              VALUES (?1, 1, 1, ?2, ?3, 'system')",
             params![id, body, now],
         )?;
+        // The WAF rules every VPS carries. Not fatal: the next rule change
+        // sends them anyway.
+        if let Err(e) = self.sync_waf(&id, now, "system") {
+            tracing::error!("WAF rules for a new VPS: {e:#}");
+        }
         Ok(id)
     }
 
@@ -322,6 +329,7 @@ impl Db {
             "DELETE FROM desired_pulls WHERE agent_id = ?1",
             params![agent_id],
         );
+        Db::forget_waf_agent(&tx, agent_id)?;
         tx.execute("DELETE FROM agents WHERE id = ?1", params![agent_id])?;
         tx.execute(
             "INSERT INTO decisions (agent_id, who, action, detail, ts) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -390,6 +398,20 @@ impl Db {
         detail: &str,
         edit: impl FnOnce(&mut DesiredBody),
     ) -> Result<()> {
+        self.update_desired_quiet(agent_id, now, who, edit)?;
+        self.record_decision(agent_id, who, action, detail, now)?;
+        Ok(())
+    }
+
+    /// [`Db::update_desired`] without a line in the decisions log, for a change
+    /// the caller logs once for many VPSes (a WAF rule for every VPS).
+    pub(crate) fn update_desired_quiet(
+        &self,
+        agent_id: &str,
+        now: i64,
+        who: &str,
+        edit: impl FnOnce(&mut DesiredBody),
+    ) -> Result<()> {
         let (epoch, version, mut body) =
             self.get_desired(agent_id)?
                 .unwrap_or((1, 0, DesiredBody::default()));
@@ -422,12 +444,9 @@ impl Db {
             "UPDATE agents SET mode = ?1 WHERE id = ?2",
             params![body.mode.as_str(), agent_id],
         )?;
-        self.record_decision(agent_id, who, action, detail, now)?;
         Ok(())
     }
 
-    /// Queue a single one-shot job for the agent. Replaces any pending job and
-    /// stamps `jobs_seq` with the new version so the agent runs it exactly once.
     /// Lift every ban on a VPS: the hub's own orders are dropped and the VPS is
     /// told (by `unban_all_seq`) to empty its ban sets and forget its offence
     /// counts. An agent too old to know the marker gets the addresses its last
@@ -467,6 +486,8 @@ impl Db {
         })
     }
 
+    /// Queue a single one-shot job for the agent. Replaces any pending job and
+    /// stamps `jobs_seq` with the new version so the agent runs it exactly once.
     pub fn queue_job(
         &self,
         agent_id: &str,

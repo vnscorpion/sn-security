@@ -806,6 +806,7 @@ mod tests {
             clamav: None,
             evidence: None,
             remediation: None,
+            waf: None,
         }
     }
 

@@ -44,6 +44,8 @@ fn capabilities(cfg: &Config) -> Vec<String> {
         caps.push("remediate".into());
         // Lifts every ban on the hub's `unban_all_seq`.
         caps.push("unban_all".into());
+        // Puts the hub's ModSecurity rules into the web server (`DesiredBody::waf`).
+        caps.push("waf".into());
     }
     caps
 }
@@ -135,6 +137,13 @@ pub fn sync(
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok());
 
+    // The hub's WAF rules in place (a transient unit does the writing), then
+    // their state and matches for this report.
+    if cfg.remote.hub_orders {
+        crate::waf::ensure(state);
+    }
+    let waf = Some(crate::waf::status(state));
+
     let (active_list, active_total) = active_bans(state);
     let body = ReportBody {
         agent_version: AGENT_VERSION.to_string(),
@@ -153,6 +162,7 @@ pub fn sync(
         clamav: Some(crate::clamav_run::info(cfg, state)),
         evidence: fresh_evidence(state, &meta),
         remediation: fresh_remediation(state, &meta),
+        waf,
     };
 
     let body_json = serde_json::to_vec(&body)?;
@@ -888,6 +898,11 @@ fn apply_desired(cfg: &Config, state: &State, d: &DesiredBody) -> Result<()> {
             // that was banned wrongly would start at a longer ban.
             let _ = state.save_strikes(&Default::default());
         }
+    }
+
+    // ModSecurity rules: kept here, put in place by `waf::ensure` each cycle.
+    if let Some(rules) = &d.waf {
+        crate::waf::set_rules(state, rules);
     }
 
     // Operator bans / unbans (web-port only, like every other ban). Only a key

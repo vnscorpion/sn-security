@@ -115,6 +115,65 @@ pub struct ReportBody {
     /// Outcome of the last `remediate` job.
     #[serde(default)]
     pub remediation: Option<RemediationReport>,
+    /// The web server's ModSecurity and the rules the hub ordered into it.
+    /// `None` from agents that predate it.
+    #[serde(default)]
+    pub waf: Option<WafStatus>,
+}
+
+/// Where the agent's managed ModSecurity rules stand on this VPS.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WafStatus {
+    /// The web server found: `apache`, `litespeed`, `openlitespeed`, `nginx`,
+    /// or empty when none was recognised.
+    #[serde(default)]
+    pub server: String,
+    /// What the configuration says about ModSecurity: `on`, `detection_only`,
+    /// `off`, `missing` (module not loaded) or `unknown`.
+    #[serde(default)]
+    pub engine: String,
+    /// The file the agent writes its rules into (empty when it has none).
+    #[serde(default)]
+    pub rules_file: String,
+    /// Rules in force in that file.
+    #[serde(default)]
+    pub applied: u32,
+    /// Of those, how many answer 403 (the rest only log).
+    #[serde(default)]
+    pub blocking: u32,
+    /// Ids the agent refused (bad value, repeated id, over the cap).
+    #[serde(default)]
+    pub refused: Vec<u32>,
+    /// The last time applying the rules failed, and why (config test output,
+    /// cut short). Cleared by the next success.
+    #[serde(default)]
+    pub error: String,
+    #[serde(default)]
+    pub error_at: i64,
+    /// Unix time of the last successful apply.
+    #[serde(default)]
+    pub applied_at: i64,
+    /// Matches of each managed rule since the previous report.
+    #[serde(default)]
+    pub hits: Vec<WafHit>,
+    /// Things the admin should know, in Vietnamese (sites where the panel
+    /// turned ModSecurity off or excluded our rules, ids already taken).
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
+/// Matches of one managed rule, read from the web server's error log.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WafHit {
+    pub id: u32,
+    pub count: u64,
+    /// Unix time of the latest match seen.
+    #[serde(default)]
+    pub last_at: i64,
+    /// A few `host uri` examples (no query string), to judge a rule before
+    /// letting it block.
+    #[serde(default)]
+    pub samples: Vec<String>,
 }
 
 /// What the hub needs to know about ClamAV on a VPS, to show its state and to
@@ -397,6 +456,11 @@ pub struct DesiredBody {
     /// carry a second, root/admin signature. `None` leaves policy unchanged.
     #[serde(default)]
     pub policy: Option<SignedPolicy>,
+    /// ModSecurity rules for the web server, as data (the agent renders them,
+    /// see [`crate::waf::WafRule`]). `None`: the hub does not manage the WAF and
+    /// the agent leaves it alone; an empty list empties the agent's rules file.
+    #[serde(default)]
+    pub waf: Option<Vec<crate::waf::WafRule>>,
 }
 
 fn default_k() -> f64 {

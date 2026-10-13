@@ -14,6 +14,7 @@ mod db;
 mod db_ai;
 mod db_auth;
 mod db_mcp;
+mod db_waf;
 mod desired;
 mod keys;
 mod mcp;
@@ -22,6 +23,7 @@ mod web;
 mod web_ai;
 mod web_auth;
 mod web_mcp;
+mod web_waf;
 mod webauthn;
 
 use std::path::{Path, PathBuf};
@@ -536,6 +538,11 @@ fn router(state: Arc<AppState>) -> Router {
         )
         .route("/add-vps", get(web::add_vps_page).post(web::add_vps_post))
         .route("/log", get(web::log_page))
+        .route("/waf", get(web_waf::page))
+        .route("/waf/add", post(web_waf::add_post))
+        .route("/waf/starter", post(web_waf::starter_post))
+        .route("/waf/{id}/block", post(web_waf::block_post))
+        .route("/waf/{id}/delete", post(web_waf::delete_post))
         .route("/check-ip", get(web::check_ip))
         // static distribution of the installer + agent binary
         .route("/install.sh", get(serve_install))

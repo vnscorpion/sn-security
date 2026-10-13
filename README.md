@@ -33,7 +33,8 @@ Một binary Rust tĩnh (`sn`, ~3 MB) cấp cứu VPS Linux đang bị mã độ
 - Enroll token dùng một lần; nhận báo cáo (kiểm chữ ký); giữ & ký desired-state.
 - Giao diện web tiếng Việt: tổng quan fleet (trạng thái, CPU, **RAM**, IP chặn, cảnh báo), chi tiết từng VPS (traffic, top IP, **danh sách IP đang bị chặn có lọc, 10 IP mỗi trang**, triage, kết quả quét mã độc), nhật ký thao tác.
 - **Quét mã độc trên hub**: kết quả lần quét cuối (số file đã quét, độc hại/nghi ngờ), danh sách file **10 mỗi trang**, **tải CSV** (tất cả) hoặc **`.txt`** (đường dẫn file độc hại) — xem [Quét mã độc](#quét-mã-độc).
-- **Bot phân tán và CPU**: bảng User-Agent / kiểu request nhiều nhất (số lượt, số IP khác nhau), cảnh báo khi một mục tăng vọt từ nhiều IP, **luật ModSecurity gợi ý** để dán (hub không tự ghi), bảng "Ai đang dùng CPU" — xem [Bot phân tán và CPU cao](#bot-phân-tán-và-cpu-cao).
+- **Bot phân tán và CPU**: bảng User-Agent / kiểu request nhiều nhất (số lượt, số IP khác nhau), cảnh báo khi một mục tăng vọt từ nhiều IP, nút **Thêm vào WAF**, bảng "Ai đang dùng CPU" — xem [Bot phân tán và CPU cao](#bot-phân-tán-và-cpu-cao).
+- **WAF (ModSecurity)**: luật chặn theo nội dung request (công cụ quét, dò file nhạy cảm, bot) cho mọi VPS hoặc từng VPS; luật mới chỉ ghi nhận, hub hiện số lần trúng và ví dụ, bạn bấm bật chặn; agent kiểm tra cấu hình và tự hoàn tác khi lỗi — xem [Chặn bằng WAF](#chặn-bằng-waf-modsecurity).
 - **Ô "Tra cứu IP"** trên thanh đầu trang: một IP đang truy cập/bị chặn ở VPS nào, lịch sử thao tác, nút chặn/gỡ chặn.
 - Nhận biết agent cũ (nhãn "cũ") và hiện sẵn lệnh cập nhật.
 - **Điều khiển từ xa**: ban/unban, đổi observe↔enforce, **chạy hunt**, **undo** — áp ở chu kỳ kế (xem [Điều khiển từ hub](#điều-khiển-từ-hub)).
@@ -194,6 +195,7 @@ Có — từ giao diện snhub bạn **đặt lệnh cho VPS mà không cần SS
 | **Undo** (gỡ contain + ban của sn) | Agent chạy `sn undo` chu kỳ kế | Hub quyết định |
 | **Gỡ chặn toàn bộ** | Agent xoá mọi IP đang chặn và bộ đếm vi phạm ở lần đồng bộ kế tiếp (nút trên trang VPS, nút cho mọi VPS ở Tổng quan, hoặc `snhub unban-all [--vps TÊN] [--observe]`) | Hub quyết định |
 | **Xoá VPS** | Hub thu hồi khoá agent, xoá báo cáo, lệnh, bằng chứng, đề xuất AI của VPS (nút cuối trang VPS, gõ tên VPS + mật khẩu; hoặc `snhub remove-vps --vps TÊN`). Gỡ agent trên VPS bằng `deploy/uninstall.sh` | Hub quyết định |
+| **Luật WAF** (menu WAF) | Agent ghi file luật ModSecurity của riêng nó, kiểm tra cấu hình, nạp lại máy chủ web ở lần đồng bộ kế tiếp | Luật mới chỉ ghi nhận; chặn khi bạn bấm; lỗi thì tự trả file cũ |
 
 Tier chính sách (đổi `patterns`, `trusted_proxies`, ép observe hàng loạt) cần **chữ ký root key offline** — hub bị chiếm cũng không hạ được bảo vệ. `contain`/`fetch` từ xa là **v1.1** (hiện làm qua SSH). Cần tức thì tại chỗ thì dùng `sn disable` (kill switch) hoặc chạy lệnh qua SSH.
 
@@ -271,8 +273,9 @@ Hub có sẵn một **MCP server** (Model Context Protocol, kiểu Streamable HT
 
 1. Vào **Hermes** trên menu hub, tạo token (hỏi lại mật khẩu). Chọn quyền:
    - **Chỉ xem**: `list_vps`, `get_vps_status`, `get_evidence`, `get_proposals`, `get_activity_log`.
-   - **Xem + đề xuất**: thêm `request_evidence` (VPS thu thập bằng chứng mới) và `submit_plan` (kế hoạch xử lý chờ admin duyệt trên trang VPS).
-   - **Toàn quyền xử lý**: thêm `submit_plan` với `execute: true`, `execute_proposal`, `reject_proposal`, `ban_ip`/`unban_ip` (một VPS hoặc `all`, tối đa 24 giờ), `set_mode`, `run_malware_scan`, `install_clamav`.
+   - **Xem + đề xuất**: thêm `request_evidence` (VPS thu thập bằng chứng mới), `submit_plan` (kế hoạch xử lý chờ admin duyệt trên trang VPS) và `add_waf_rule` (luật WAF mới, luôn chỉ ghi nhận).
+   - **Toàn quyền xử lý**: thêm `submit_plan` với `execute: true`, `execute_proposal`, `reject_proposal`, `ban_ip`/`unban_ip` (một VPS hoặc `all`, tối đa 24 giờ), `set_mode`, `run_malware_scan`, `install_clamav`, `set_waf_rule` (bật/tắt chặn của một luật WAF) và `remove_waf_rule`.
+   - Mọi quyền đều đọc được `get_waf` (luật, số lần trúng, trạng thái ModSecurity từng VPS).
 2. Trên máy chạy Hermes, thêm token vào `~/.hermes/.env` (`SNSEC_MCP_TOKEN=snmcp_…`) và vào `~/.hermes/config.yaml`:
    ```yaml
    mcp_servers:
@@ -292,12 +295,37 @@ Luật theo IP ở trên **không chặn được** bot chạy qua hàng trăm I
 
 - **Hub hiện** mục "Truy cập lặp lại từ nhiều IP": User-Agent nhiều nhất và kiểu request nhiều nhất (`METHOD /đường-dẫn?tên-tham-số`; **giá trị tham số không được lưu**, số/token trong đường dẫn gộp thành `{id}`), kèm số lượt và số IP khác nhau. Ảnh/CSS/JS không tính.
 - **Cảnh báo** (`bot_ua` / `bot_shape`) khi trong một chu kỳ một mục có ≥ `bot_min_ips` IP khác nhau (25), ≥ `bot_min_requests` request (50), mỗi IP trung bình ≤ 8 request, và gấp ≥ `bot_surge` lần mức thường của chính mục đó (5). Mức thường là trung bình trượt riêng từng mục, **đóng băng trong lúc đang bị cảnh báo** (một vụ tấn công kéo dài không tự thành "bình thường"; tối đa 1 ngày, sau đó coi là bình thường). Một giờ đầu sau khi cài chỉ học, chưa cảnh báo. Khi CPU cũng cao thì cảnh báo thành khẩn.
-- **Cách xử lý**: mục bất thường kèm sẵn **luật ModSecurity gợi ý** và vài IP mẫu. Với panel chính (cPanel, Plesk, DirectAdmin, OPanel) hãy dùng WAF: dán luật, để `DetectionOnly` xem có chặn nhầm khách thật không rồi mới bật. **Hub không tự ghi luật vào VPS**, và luật chưa được thử trên ModSecurity thật. VPS không có WAF thì chỉ chặn được theo IP/CIDR, và với bot phân tán cách đó gần như vô ích vì IP đổi liên tục.
+- **Cách xử lý**: mục bất thường có nút **Thêm vào WAF của VPS này** (chỉ ghi nhận trước, xem [Chặn bằng WAF](#chặn-bằng-waf-modsecurity)) và vài IP mẫu. VPS không có ModSecurity thì chỉ chặn được theo IP/CIDR, và với bot phân tán cách đó gần như vô ích vì IP đổi liên tục.
 - **Có thể báo nhầm:** một chiến dịch quảng cáo, crawler thật (Googlebot, Bing… cũng đến từ nhiều IP), hoặc tính năng mới cũng tạo ra đúng dấu hiệu này. Cảnh báo ghi chú khi UA tự nhận là crawler nhưng điều đó chưa được xác minh (cần reverse DNS).
 - **Tắt** bằng `bot_detection = false` trong `[watch]`.
 - **Giới hạn đã biết:** (1) mục mới hoàn toàn (bản Chrome mới, crawler bắt đầu quét) cũng bị gắn "bất thường" cho tới khi đủ lâu để được coi là bình thường (tối đa ~1 ngày); cảnh báo ghi "not seen recently". (2) Mỗi chu kỳ chỉ theo dõi tối đa 2.000 User-Agent và 2.000 kiểu request đầu tiên; ai đó cố tình gửi hàng nghìn UA lạ có thể che mục thật. (3) Chỉ kiểu request **có tham số** mới được cảnh báo; bot phân tán dò `wp-login.php` không tham số chỉ bị bắt nếu User-Agent của nó bất thường. (4) IP của proxy tin cậy (Cloudflare) bị bỏ qua vì không phải IP khách, nên sau Cloudflare với log dạng `combined` (không có IP thật) tính năng này gần như không thấy gì. (5) Request bị server từ chối (403/429/444) không được tính, nên cảnh báo tự tắt sau khi luật WAF có tác dụng. (6) Chu kỳ không có dòng log mới, hoặc đọc bù sau khi agent tắt một thời gian, không được dùng để cảnh báo hay để học mức bình thường. (7) Luật gợi ý khớp **đúng** đường dẫn (không có dấu `/` cuối) và không được tạo cho giá trị bị cắt ngắn hay có mã hoá `%`.
 
 **CPU cao:** mỗi chu kỳ agent lưu bộ đếm CPU và chu kỳ sau lấy hiệu số, nên con số là **trung bình cả khoảng ~5 phút** chứ không phải một thời điểm. Khi ≥ `cpu_alert_pct` hai chu kỳ liền, cảnh báo `cpu_high` nêu tên các tài khoản/chương trình chiếm CPU nhiều nhất (cũng hiện ở bảng "Ai đang dùng CPU", tính theo % của cả máy). Tiến trình chạy xong giữa hai chu kỳ không thấy được nên tổng các dòng có thể nhỏ hơn mức CPU chung. Hai tuỳ chọn cũ `load_alert` và `auto_contain` đã bị bỏ vì không có tác dụng; file cấu hình cũ còn chúng vẫn chạy bình thường.
+
+## Chặn bằng WAF (ModSecurity)
+
+Chặn theo **nội dung request** thay vì theo IP: công cụ quét (`sqlmap`, `nikto`…), request dò file nhạy cảm (`/.env`, `/.git/`…), User-Agent hay kiểu request của bot phân tán. Khách thật dùng chung IP với bot (4G, văn phòng, CGNAT) không bị chặn theo, và bot đổi IP cũng không thoát.
+
+**Cách dùng (menu WAF trên hub):**
+1. Thêm luật: gõ tay, bấm **Thêm gói luật cơ bản**, hoặc bấm **Thêm vào WAF** cạnh một User-Agent / kiểu request bị gắn "Bất thường" trên trang VPS. Luật áp cho mọi VPS hoặc một VPS.
+2. Luật mới luôn **chỉ ghi nhận**: request vẫn đi qua, máy chủ web ghi một dòng log, agent đếm và báo về. Hub hiện số lần trúng, lần gần nhất và vài ví dụ (`host /đường-dẫn`, không có query string).
+3. Thấy đúng là bot/dò quét thì bấm **Bật chặn** (trả 403). Muốn thôi thì **Chỉ ghi nhận** hoặc **Xoá**. VPS áp ở lần lấy lệnh kế tiếp (≤ 15 phút).
+
+**Trên VPS agent làm gì:**
+- Tìm ModSecurity theo máy chủ web (DirectAdmin: `webserver` trong `options.conf`; Apache dùng ModSecurity 2, nginx và OpenLiteSpeed dùng libmodsecurity 3, LiteSpeed Enterprise dùng engine riêng đọc cấu hình Apache). Ghi **một file của riêng nó**, `zz-sn-secure.conf`, vào thư mục luật mà cấu hình đã nạp sẵn (`/etc/modsecurity.d/` trên DirectAdmin), kèm một bản ở `custombuild/custom/modsecurity/conf/` để `da build modsecurity` không xoá mất. Không sửa file nào khác của máy chủ web hay của DirectAdmin.
+- Hub chỉ gửi **dữ liệu** (loại luật + giá trị); agent tự dựng câu `SecRule` từ mẫu cố định, escape mọi giá trị, từ chối `%{…}`, ký tự lạ và từ mà trình duyệt thật cũng gửi. Hub bị chiếm cũng không chèn được `SecRuleEngine Off`, `exec:` hay `Include` vào cấu hình.
+- Ghi file xong thì kiểm tra cấu hình (`httpd -t`, `nginx -t`, `openlitespeed -t`), nạp lại nhẹ (`systemctl reload …`), xem máy chủ còn nghe cổng 80/443 không; LiteSpeed (không có lệnh kiểm tra) thì đọc log của nó sau khi nạp lại. Lỗi ở bất kỳ bước nào: **trả lại file cũ**, nạp lại, báo lỗi lên hub, một giờ sau mới thử lại.
+- Bỏ qua luật có id trùng với file luật khác (id trùng làm máy chủ web không khởi động được). Id luật của hub: 60000–69999.
+- Mỗi chu kỳ kiểm tra file còn đúng chỗ (sau `da build` chẳng hạn) và đặt lại nếu mất.
+- Đọc số lần trúng từ log lỗi theo tên miền (`/var/log/httpd/domains/*.error.log`, nginx tương tự); OpenLiteSpeed thì từ audit log JSON (nó chỉ ghi vào log lỗi ở mức INFO). Chỉ lấy id luật, host và đường dẫn.
+- `sn disable` (và `deploy/uninstall.sh`) gỡ file luật rồi nạp lại máy chủ web. `sn env` in máy chủ web, trạng thái ModSecurity và đường dẫn file luật mà agent dò được.
+
+**Đọc trước khi bật chặn:**
+- Trên DirectAdmin, ModSecurity **mặc định tắt** cho tới khi bạn bật trong mục WAF của panel; từng tên miền còn có thể tắt nó hoặc loại trừ id luật (SecRuleRemoveById). Hub ghi rõ trạng thái (Đang bật / Tắt / Chưa cài) và liệt kê tên miền tắt hoặc loại trừ luật của SN Secure. Ở nơi ModSecurity tắt, luật không chạy, kể cả luật đã bật chặn.
+- Luật trúng cả khi chỉ ghi nhận lẫn khi chặn đều vào audit log, nên chủ site thấy chúng ở trang WAF của DirectAdmin.
+- Chưa chặn được: file tĩnh trên LiteSpeed Enterprise và trang trả từ LSCache trên OpenLiteSpeed (ModSecurity bỏ qua), request bị nginx chuyển hướng trước khi ModSecurity chạy.
+- Đường đặt file qua `custombuild/custom/modsecurity/conf/` lấy từ diễn đàn và hướng dẫn của DirectAdmin, chưa có trong tài liệu chính thức; agent không dựa hẳn vào nó vì vẫn tự kiểm tra mỗi chu kỳ.
+- Chưa chạy thử trên VPS DirectAdmin thật. Nên thêm gói cơ bản, để chỉ ghi nhận một hai ngày, xem ví dụ rồi mới bật chặn.
 
 ## Quét mã độc
 
@@ -356,8 +384,8 @@ Mọi thay đổi đều hoàn tác được (`sn undo`) và ghi vào `/var/lib/
 | `watch [--replay FILE]` | Một chu kỳ theo dõi (tail log, đếm, ban/observe, báo hub) |
 | `enroll --url --name` | Đăng ký với hub (token lấy từ biến môi trường `SN_ENROLL_TOKEN`; `--token` vẫn nhận nhưng lộ trên danh sách tiến trình) |
 | `report` | In báo cáo gần nhất (JSON) |
-| `env` | Phiên bản, cgroup, nftables, whitelist, **log đang theo dõi và web server đã dò ra** |
-| `disable` | Kill switch: gỡ table `inet sn`, thả jail |
+| `env` | Phiên bản, cgroup, nftables, whitelist, **log đang theo dõi và web server đã dò ra**, ModSecurity và file luật WAF |
+| `disable` | Kill switch: gỡ table `inet sn`, thả jail, gỡ file luật WAF của SN Secure và nạp lại máy chủ web |
 
 ## An toàn (những bất biến đã cài trong code)
 

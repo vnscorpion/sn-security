@@ -86,6 +86,11 @@ pub async fn post_report(State(st): State<Arc<AppState>>, body: String) -> impl 
     if let Some(rem) = &env.body.remediation {
         let _ = db.attach_remediation(&agent_id, rem);
     }
+    if let Some(waf) = &env.body.waf
+        && let Err(e) = db.record_waf_hits(&agent_id, &waf.hits)
+    {
+        tracing::error!("record_waf_hits: {e:#}");
+    }
     // This report shows what the VPS has run, so a job slot may have freed up: let a
     // proposal that was waiting for it be ordered now.
     analysis::retry_waiting(&db, &agent_id, at);

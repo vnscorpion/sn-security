@@ -104,6 +104,7 @@ pub(crate) fn shell(title: &str, body: Markup) -> Markup {
                         a href="/add-vps" { "Thêm VPS" }
                         a href="/log" { "Nhật ký" }
                         a href="/settings" { "Cài đặt AI" }
+                        a href="/waf" { "WAF" }
                         a href="/settings/hermes" { "Hermes" }
                         a href="/security" { "Bảo mật" }
                     }
@@ -360,7 +361,8 @@ fn pattern_table(
     heading: &str,
     key_head: &str,
     rows: &[snsec_common::schema::PatternStat],
-    rule_for: fn(&str) -> Option<String>,
+    agent_id: &str,
+    kind: snsec_common::waf::WafKind,
 ) -> Markup {
     html! {
         h2 style="margin-top:6px" { (heading) }
@@ -386,13 +388,19 @@ fn pattern_table(
                                             "Crawler thật cũng đến từ nhiều IP. Chặn nhầm sẽ ảnh hưởng SEO, nên hãy kiểm tra bằng reverse DNS trước khi chặn."
                                         }
                                     }
-                                    @if let Some(rule) = rule_for(&p.key) {
+                                    @if snsec_common::waf::valid_value(kind, &p.key) {
                                         p class="help" {
-                                            "Nếu VPS chạy ModSecurity (cPanel, Plesk, DirectAdmin, OPanel), thêm luật dưới đây rồi để chế độ "
-                                            code { "DetectionOnly" } " một lúc, xem nó có chặn nhầm khách thật không, sau đó mới bật chặn. "
-                                            "Hub không tự ghi luật vào VPS."
+                                            "Chặn bằng WAF (ModSecurity của máy chủ web) thay vì chặn IP: thêm luật ở chế độ chỉ ghi nhận, "
+                                            "xem ở mục WAF bên dưới nó trúng những request nào, đúng là bot thì bấm “Bật chặn”."
                                         }
-                                        pre style="white-space:pre-wrap;word-break:break-all;margin:0 0 10px" { (rule) }
+                                        form method="post" action="/waf/add" class="ctrls" style="margin:0 0 10px" {
+                                            input type="hidden" name="kind" value=(kind.as_str());
+                                            input type="hidden" name="value" value=(p.key);
+                                            input type="hidden" name="scope" value=(agent_id);
+                                            input type="hidden" name="back" value=(agent_id);
+                                            input type="hidden" name="note" value="từ mục truy cập lặp lại";
+                                            button class="ghost" type="submit" { "Thêm vào WAF của VPS này (chỉ ghi nhận)" }
+                                        }
                                     } @else {
                                         p class="help" { "Hub không tạo được luật an toàn cho giá trị này (quá dài, có ký tự đặc biệt/mã hoá %, hoặc quá chung chung nên sẽ chặn nhầm). Hãy tự viết luật nếu cần." }
                                     }
@@ -651,6 +659,10 @@ fn action_vi(a: &str) -> &str {
         "mode" => "Đổi chế độ",
         "job" => "Lệnh một lần",
         "drop" => "Bỏ lệnh sai dạng",
+        "waf_add" => "Thêm luật WAF",
+        "waf_block" => "Bật chặn luật WAF",
+        "waf_log" => "Luật WAF về chỉ ghi nhận",
+        "waf_remove" => "Xoá luật WAF",
         other => other,
     }
 }
@@ -918,6 +930,13 @@ pub async fn agent_detail(
     };
     let report = db.latest_report(&id).ok().flatten();
     let desired = db.get_desired(&id).ok().flatten();
+    let waf_rules: Vec<crate::db_waf::WafRuleRow> = db
+        .list_waf_rules()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.agent_id.is_empty() || r.agent_id == id)
+        .collect();
+    let waf_hits = db.waf_hits(Some(&id)).unwrap_or_default();
     drop(db);
 
     let mode = desired
@@ -1213,9 +1232,9 @@ pub async fn agent_detail(
                         "Bot phân tán dùng hàng trăm IP, mỗi IP chỉ vài lượt nên không bị luật theo IP bắt; điểm chung của chúng là cùng User-Agent "
                         "hoặc cùng kiểu request (đường dẫn + tên tham số, không lưu giá trị). Mục nào tăng vọt so với bình thường sẽ có nhãn “Bất thường”."
                     }
-                    (pattern_table("User-Agent nhiều nhất", "User-Agent", &r.cycle.top_user_agents, snsec_common::waf::rule_for_user_agent))
+                    (pattern_table("User-Agent nhiều nhất", "User-Agent", &r.cycle.top_user_agents, &agent.id, snsec_common::waf::WafKind::UserAgent))
                     div style="height:14px" {}
-                    (pattern_table("Kiểu request nhiều nhất", "Kiểu request", &r.cycle.top_shapes, snsec_common::waf::rule_for_shape))
+                    (pattern_table("Kiểu request nhiều nhất", "Kiểu request", &r.cycle.top_shapes, &agent.id, snsec_common::waf::WafKind::Shape))
                 }
             }
 
@@ -1305,6 +1324,34 @@ pub async fn agent_detail(
             }
         } @else {
             div class="card" { div class="empty" { "Chưa nhận được báo cáo nào từ VPS này. Sau khi cài agent, VPS sẽ báo về sau vài phút." } }
+        }
+
+        div class="card" id="waf" {
+            h2 { "WAF (ModSecurity)" }
+            @if aq.at == "waf" && !aq.msg.trim().is_empty() {
+                div class="note" { (aq.msg.trim()) }
+            }
+            div class="wrap" {
+                table {
+                    thead { tr { th { "VPS" } th { "Máy chủ web" } th { "ModSecurity" } th { "Luật" } th { "Lần áp gần nhất" } } }
+                    tbody { (crate::web_waf::status_row(&agent, report.as_ref().and_then(|r| r.waf.as_ref()))) }
+                }
+            }
+            div style="height:12px" {}
+            (crate::web_waf::rules_table(
+                &waf_rules,
+                &waf_hits,
+                &std::collections::HashMap::from([(agent.id.clone(), agent.name.clone())]),
+                &agent.id,
+            ))
+            details style="margin-top:12px" {
+                summary { "Thêm luật cho riêng VPS này" }
+                div style="margin-top:10px" { (crate::web_waf::add_form(&[], Some(&agent.id))) }
+            }
+            p class="help" {
+                "Số lần trúng ở đây là của VPS này. Bật chặn / xoá một luật “Mọi VPS” sẽ áp cho mọi VPS. "
+                a href="/waf" { "Quản lý mọi luật WAF" }
+            }
         }
 
         div class="card" id="remove" style="border-color:var(--bad)" {
@@ -2134,12 +2181,14 @@ mod tests {
             stat("GET /?tss-sc&tsscat", true),
             stat("GET /shop?page", false),
         ];
-        let html = pattern_table("t", "k", &rows, snsec_common::waf::rule_for_shape).into_string();
+        let html = pattern_table("t", "k", &rows, "vps-1", snsec_common::waf::WafKind::Shape)
+            .into_string();
         assert!(html.contains("Bất thường"));
-        assert!(html.contains("SecRule REQUEST_METHOD"));
+        assert!(html.contains("action=\"/waf/add\""));
+        assert!(html.contains("value=\"vps-1\""));
         assert!(html.contains("203.0.113.5"));
         // Only one row is flagged, so only one rule is offered.
-        assert_eq!(html.matches("SecRule REQUEST_METHOD").count(), 1);
+        assert_eq!(html.matches("action=\"/waf/add\"").count(), 1);
     }
 
     #[test]
@@ -2149,7 +2198,8 @@ mod tests {
             "t",
             "k",
             &[stat(evil, true)],
-            snsec_common::waf::rule_for_user_agent,
+            "vps-1",
+            snsec_common::waf::WafKind::UserAgent,
         )
         .into_string();
         assert!(!html.contains("<script>alert(1)"), "{html}");
@@ -2183,6 +2233,7 @@ mod tests {
             clamav: None,
             evidence: None,
             remediation: None,
+            waf: None,
         }
     }
 

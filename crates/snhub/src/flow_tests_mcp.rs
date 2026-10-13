@@ -76,6 +76,7 @@ impl Hub {
             clamav: None,
             evidence: None,
             remediation: None,
+            waf: None,
         };
         let text = serde_json::to_string(&rep).unwrap();
         db.record_report(&id, 1, now(), &rep, &text).unwrap();
@@ -670,5 +671,185 @@ async fn a_vps_is_removed_only_with_its_name_and_the_password() {
     assert!(
         log.iter()
             .any(|(a, who, action, ..)| a == &id && who == "admin" && action == "remove_vps")
+    );
+}
+
+#[tokio::test]
+async fn waf_rules_start_log_only_and_block_only_when_the_admin_says_so() {
+    let h = hub();
+    let cookie = h.sign_in().await;
+    let (id, sk) = agent_key(&h);
+    let waf = |h: &Hub| {
+        h.st.db
+            .lock()
+            .unwrap()
+            .get_desired(&id)
+            .unwrap()
+            .and_then(|(_, _, d)| d.waf)
+    };
+
+    // Added for every VPS: log-only, sent to the VPS.
+    let r = h
+        .post(
+            "/waf/add",
+            &cookie,
+            "kind=path&value=%2F.env&scope=&note=probe",
+        )
+        .await;
+    assert!(r.location().starts_with("/waf?msg="), "{}", r.location());
+    let rules = waf(&h).unwrap();
+    assert_eq!(rules.len(), 1);
+    assert!(!rules[0].block);
+    let rid = rules[0].id;
+
+    // A value that would block real visitors is refused.
+    let r = h
+        .post("/waf/add", &cookie, "kind=ua_token&value=chrome&scope=")
+        .await;
+    assert!(r.location().contains("msg="), "{}", r.location());
+    assert_eq!(waf(&h).unwrap().len(), 1);
+
+    // The VPS reports matches; the page shows them with an example.
+    let report = signed_report_with(
+        &id,
+        &sk,
+        1,
+        json!({ "waf": { "server": "apache", "engine": "on", "applied": 1,
+            "rules_file": "/etc/modsecurity.d/zz-sn-secure.conf",
+            "hits": [ { "id": rid, "count": 7, "last_at": now(), "samples": ["shop.example /.env"] } ],
+            "notes": ["2 tên miền tắt ModSecurity trong DirectAdmin"] } }),
+    );
+    assert_eq!(h.post_report(report).await.status, StatusCode::OK);
+    let page = h.get("/waf", &cookie).await;
+    assert!(
+        page.body.contains("/.env") && page.body.contains("Chỉ ghi nhận"),
+        "{}",
+        page.body
+    );
+    assert!(page.body.contains("<b>7</b>"), "{}", page.body);
+    assert!(page.body.contains("shop.example /.env"));
+    assert!(page.body.contains("tắt ModSecurity trong DirectAdmin"));
+
+    // The admin lets it block, then removes it.
+    let r = h.post(&format!("/waf/{rid}/block"), &cookie, "on=1").await;
+    assert!(r.location().contains("msg="), "{}", r.location());
+    assert!(waf(&h).unwrap()[0].block);
+    let r = h
+        .post(&format!("/waf/{rid}/delete"), &cookie, "back=")
+        .await;
+    assert!(r.location().contains("msg="), "{}", r.location());
+    assert_eq!(waf(&h).unwrap(), Vec::new());
+
+    // From a VPS page (a flagged User-Agent): for that VPS, back to its page.
+    let r = h
+        .post(
+            "/waf/add",
+            &cookie,
+            &format!("kind=user_agent&value=BadBot%2F1.0&scope={id}&back={id}"),
+        )
+        .await;
+    assert!(
+        r.location()
+            .starts_with(&format!("/agent/{id}?at=waf&msg=")),
+        "{}",
+        r.location()
+    );
+    let page = h.get(&r.location(), &cookie).await;
+    assert!(page.body.contains("BadBot/1.0"), "{}", page.body);
+    // `back` cannot send the browser elsewhere.
+    let r = h
+        .post(
+            "/waf/add",
+            &cookie,
+            "kind=path&value=%2F.git%2F&scope=&back=%2F%2Fevil.example",
+        )
+        .await;
+    assert!(r.location().starts_with("/waf?msg="), "{}", r.location());
+}
+
+#[tokio::test]
+async fn waf_pages_need_a_session() {
+    let h = hub();
+    for (path, form) in [
+        ("/waf/add", "kind=path&value=%2F.env"),
+        ("/waf/starter", ""),
+        ("/waf/60000/block", "on=1"),
+        ("/waf/60000/delete", "back="),
+    ] {
+        let r = h.post(path, "", form).await;
+        assert_eq!(r.location(), "/login", "{path}");
+    }
+    assert_eq!(h.get("/waf", "").await.location(), "/login");
+    assert!(h.st.db.lock().unwrap().list_waf_rules().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn hermes_proposes_waf_rules_and_only_act_lets_them_block() {
+    let h = hub();
+    let id = h.vps(&["evidence", "remediate", "waf"]);
+    let propose = h.token("propose");
+    let act = h.token("act");
+
+    let res = h
+        .call(
+            &propose,
+            "add_waf_rule",
+            json!({ "vps": "all", "kind": "ua_token", "value": "sqlmap", "note": "scanner" }),
+        )
+        .await;
+    assert_eq!(res["isError"], false, "{res}");
+    let rid = res["structuredContent"]["rule_id"].as_u64().unwrap();
+    assert_eq!(res["structuredContent"]["block"], false);
+    let d = h.st.db.lock().unwrap().get_desired(&id).unwrap().unwrap().2;
+    assert!(!d.waf.unwrap()[0].block);
+
+    // Not a value a rule can safely carry.
+    let res = h
+        .call(
+            &propose,
+            "add_waf_rule",
+            json!({ "vps": "web-01", "kind": "path", "value": "/%{TX.a}" }),
+        )
+        .await;
+    assert_eq!(res["isError"], true, "{res}");
+
+    // Blocking needs act.
+    let res = h
+        .call(
+            &propose,
+            "set_waf_rule",
+            json!({ "rule_id": rid, "block": true }),
+        )
+        .await;
+    assert_eq!(res["isError"], true, "{res}");
+    let res = h
+        .call(
+            &act,
+            "set_waf_rule",
+            json!({ "rule_id": rid, "block": true }),
+        )
+        .await;
+    assert_eq!(res["isError"], false, "{res}");
+    let d = h.st.db.lock().unwrap().get_desired(&id).unwrap().unwrap().2;
+    assert!(d.waf.unwrap()[0].block);
+
+    let res = h.call(&propose, "get_waf", json!({})).await;
+    let rules = &res["structuredContent"]["rules"];
+    assert_eq!(rules[0]["value"], "sqlmap");
+    assert_eq!(rules[0]["vps"], "all");
+    assert!(res["structuredContent"]["warning"].is_string());
+
+    let res = h
+        .call(&act, "remove_waf_rule", json!({ "rule_id": rid }))
+        .await;
+    assert_eq!(res["isError"], false, "{res}");
+    let res = h
+        .call(&act, "remove_waf_rule", json!({ "rule_id": rid }))
+        .await;
+    assert_eq!(res["isError"], true, "{res}");
+    let log = h.st.db.lock().unwrap().recent_decisions(10).unwrap();
+    assert!(
+        log.iter()
+            .any(|d| d.2 == "waf_block" && d.1.starts_with("mcp:"))
     );
 }
