@@ -14,6 +14,7 @@ use snsec_common::schema::{Envelope, ReportBody, Signed};
 use crate::AppState;
 use crate::analysis;
 use crate::desired::sign_desired;
+use crate::traffic_ai;
 
 fn now() -> i64 {
     std::time::SystemTime::now()
@@ -35,24 +36,31 @@ pub async fn post_report(
 
     // The lock is held only to read the key, and again below for the writes:
     // checking the signature over a large body and parsing it happen without it.
-    let (pubkey, last) = {
+    let (pubkey, last, cleared) = {
         let db = st.db.lock().expect("db mutex");
         let pubkey = match db.agent_pubkey(&signed.key_id) {
             Ok(Some(pk)) => pk,
             // The same answer as a bad signature: no oracle for which ids exist.
             _ => return (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
         };
-        (pubkey, db.last_report_seq(&signed.key_id).unwrap_or(0))
+        (
+            pubkey,
+            db.last_report_seq(&signed.key_id).unwrap_or(0),
+            db.scan_cleared_at(&signed.key_id),
+        )
     };
     let vk = match crypto::parse_pubkey(&pubkey) {
         Ok(k) => k,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "bad stored key").into_response(),
     };
 
-    let env: Envelope<ReportBody> = match crypto::open(&[vk], &signed, now()) {
+    let mut env: Envelope<ReportBody> = match crypto::open(&[vk], &signed, now()) {
         Ok(e) => e,
         Err(_) => return (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
     };
+    // A scan the admin cleared away is not shown again just because the agent
+    // sends its last result once more.
+    crate::db::drop_stale_scan(&mut env.body, cleared);
     if env.agent_id != signed.key_id {
         return (StatusCode::BAD_REQUEST, "agent_id mismatch").into_response();
     }
@@ -129,6 +137,18 @@ pub async fn post_report(
             if queued.is_ok() {
                 let _ = db.set_pending(&agent_id, true, at);
             }
+        }
+        // The traffic itself, read by the hub's AI: the agent does not ban on a
+        // request count, so what to block is decided here (see `traffic_ai`).
+        let last = db.latest_traffic(&agent_id).ok().flatten();
+        let open = last
+            .as_ref()
+            .is_some_and(|p| traffic_ai::is_open(&p.status, p.created, at));
+        let last_at = last.as_ref().map_or(0, |p| p.created);
+        if traffic_ai::should_run(&ai, at, &env.body, has_provider, last_at, open)
+            && let Err(e) = analysis::start_with(&st, &db, &agent_id, at, false, traffic_ai::run)
+        {
+            tracing::info!("traffic analysis for {agent_id} not started: {e}");
         }
     }
     // Claimed while the lock is still held, so two reports cannot both start one.

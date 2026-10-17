@@ -52,6 +52,12 @@ CREATE TABLE IF NOT EXISTS decisions (
     detail TEXT NOT NULL,
     ts INTEGER NOT NULL
 );
+-- When the admin cleared a VPS's malware-scan results: a scan that finished
+-- before is not shown again, however many times an agent sends it.
+CREATE TABLE IF NOT EXISTS scan_cleared (
+    agent_id TEXT PRIMARY KEY,
+    at INTEGER NOT NULL
+);
 "#;
 
 pub struct Db {
@@ -137,6 +143,8 @@ impl Db {
         conn.execute_batch(SCHEMA).context("applying schema")?;
         conn.execute_batch(crate::db_ai::SCHEMA_AI)
             .context("applying AI schema")?;
+        conn.execute_batch(crate::db_traffic::SCHEMA_TRAFFIC)
+            .context("applying traffic schema")?;
         conn.execute_batch(crate::db_auth::SCHEMA_AUTH)
             .context("applying auth schema")?;
         crate::db_auth::migrate_auth(&conn).context("migrating auth schema")?;
@@ -233,6 +241,53 @@ impl Db {
         Ok(v.unwrap_or(0) as u64)
     }
 
+    /// When the admin last cleared this VPS's scan results (`0`: never).
+    pub fn scan_cleared_at(&self, agent_id: &str) -> i64 {
+        self.conn
+            .query_row(
+                "SELECT at FROM scan_cleared WHERE agent_id = ?1",
+                params![agent_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .unwrap_or(0)
+    }
+
+    /// Clear a VPS's malware-scan results: the report on screen loses them now,
+    /// and a scan that finished before this moment is dropped from every report
+    /// that comes after (an agent keeps sending its last result until it scans
+    /// again).
+    ///
+    /// # Errors
+    /// A database error.
+    pub fn clear_scans(&self, agent_id: &str, now: i64, who: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO scan_cleared (agent_id, at) VALUES (?1, ?2) \
+             ON CONFLICT(agent_id) DO UPDATE SET at = ?2",
+            params![agent_id, now],
+        )?;
+        let latest: Option<(i64, String)> = self
+            .conn
+            .query_row(
+                "SELECT id, body_json FROM reports WHERE agent_id = ?1 ORDER BY seq DESC LIMIT 1",
+                params![agent_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((id, json)) = latest
+            && let Ok(mut body) = serde_json::from_str::<ReportBody>(&json)
+            && drop_stale_scan(&mut body, now)
+        {
+            self.conn.execute(
+                "UPDATE reports SET body_json = ?1 WHERE id = ?2",
+                params![serde_json::to_string(&body)?, id],
+            )?;
+        }
+        self.record_decision(agent_id, who, "scan_clear", "xoá kết quả quét cũ", now)
+    }
+
     pub fn record_report(
         &self,
         agent_id: &str,
@@ -321,7 +376,15 @@ impl Db {
             return Ok(None);
         };
         let tx = self.conn.unchecked_transaction()?;
-        for table in ["reports", "desired", "evidence", "ai_state", "proposals"] {
+        for table in [
+            "reports",
+            "desired",
+            "evidence",
+            "ai_state",
+            "proposals",
+            "traffic_proposals",
+            "scan_cleared",
+        ] {
             tx.execute(
                 &format!("DELETE FROM {table} WHERE agent_id = ?1"),
                 params![agent_id],
@@ -668,6 +731,28 @@ fn canonical_v6_64(input: &str) -> Option<String> {
     let key = snsec_common::net::ban_key(IpAddr::V6(v6));
     let net: Ipv6Addr = key.strip_suffix("/64")?.parse().ok()?;
     banable(IpAddr::V6(net)).then_some(key)
+}
+
+/// Take the scan result out of a report when it finished no later than
+/// `cleared_at` (the moment the admin cleared the VPS's results; `0`: never), with
+/// the alerts it caused. A report with findings but no summary is an old one too.
+/// `true` when something was removed.
+pub(crate) fn drop_stale_scan(body: &mut ReportBody, cleared_at: i64) -> bool {
+    if cleared_at <= 0 {
+        return false;
+    }
+    let stale = match &body.hunt {
+        Some(h) => h.at <= cleared_at,
+        None => !body.findings.is_empty(),
+    };
+    if !stale {
+        return false;
+    }
+    body.hunt = None;
+    body.findings.clear();
+    body.alerts
+        .retain(|a| !matches!(a.kind.as_str(), "malware_found" | "malware_suspect"));
+    true
 }
 
 /// What an unban order may carry: the canonical text of one address, or of an

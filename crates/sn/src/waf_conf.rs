@@ -195,6 +195,100 @@ pub fn log_blames(text: &str, file_name: &str) -> bool {
     })
 }
 
+// ---- OPanel ----------------------------------------------------------------
+//
+// OPanel (OpenLiteSpeed) gives every site its own ModSecurity rules file that
+// includes two shared files, `opanel-base.conf` (the engine) and
+// `opanel-custom.conf` (rules for every site, written by the panel). No
+// directory of rule files is included as a whole, so our file is reached by one
+// `Include` line the agent keeps in `opanel-custom.conf`, between two marker
+// lines. The block exists only while our file does: an `Include` of a file that
+// is missing stops ModSecurity from loading.
+
+/// First line of the block the agent keeps in `opanel-custom.conf`.
+pub const HOOK_BEGIN: &str = "# BEGIN SN Secure (managed by sn: do not edit)";
+/// Last line of that block.
+pub const HOOK_END: &str = "# END SN Secure";
+/// A block is three lines; one that ends further on is not ours to cut out.
+const HOOK_SPAN: usize = 8;
+
+/// The block that makes the file `live` part of the rules.
+#[must_use]
+pub fn hook_block(live: &str) -> String {
+    format!("{HOOK_BEGIN}\nInclude {live}\n{HOOK_END}\n")
+}
+
+/// `text` without our block(s), ending in exactly one newline (or empty).
+/// A begin marker without its end close by is left alone.
+#[must_use]
+pub fn without_hook(text: &str) -> String {
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let mut keep = vec![true; lines.len()];
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].trim() == HOOK_BEGIN
+            && let Some(j) =
+                (i + 1..lines.len().min(i + HOOK_SPAN)).find(|&j| lines[j].trim() == HOOK_END)
+        {
+            keep[i..=j].fill(false);
+            i = j + 1;
+            continue;
+        }
+        i += 1;
+    }
+    let kept: String = lines
+        .iter()
+        .zip(&keep)
+        .filter(|(_, k)| **k)
+        .map(|(l, _)| *l)
+        .collect();
+    let trimmed = kept.trim_end_matches(['\n', '\r']);
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        format!("{trimmed}\n")
+    }
+}
+
+/// `text` with exactly one block for `live`, at the end.
+#[must_use]
+pub fn with_hook(text: &str, live: &str) -> String {
+    let base = without_hook(text);
+    if base.is_empty() {
+        hook_block(live)
+    } else {
+        format!("{base}\n{}", hook_block(live))
+    }
+}
+
+/// Is the block for `live` in `text`, as [`with_hook`] writes it?
+#[must_use]
+pub fn hook_in_place(text: &str, live: &str) -> bool {
+    with_hook(text, live) == text
+}
+
+/// The ModSecurity state of an OPanel server from `opanel-base.conf`, the
+/// server configuration (`modsecurity on|off` for the module), and the
+/// `SecRuleEngine` values found in the other rule files.
+#[must_use]
+pub fn opanel_engine(base: &str, httpd: &str, others: &[String]) -> &'static str {
+    let mut engines: Vec<String> = scan_conf(base).engine.into_iter().collect();
+    engines.extend(others.iter().cloned());
+    engine_state(scan_conf(httpd).module, &engines, None, true)
+}
+
+/// Sites (by directory name) whose virtual host has no `# OPANEL WAF` block:
+/// ModSecurity does not run there, so no rule of ours does. `(name, text)`.
+#[must_use]
+pub fn sites_without_waf(vhosts: &[(String, String)]) -> Vec<String> {
+    vhosts
+        .iter()
+        // The panel's own virtual hosts have no dot in their name.
+        .filter(|(name, text)| name.contains('.') && !text.contains("# OPANEL WAF BEGIN"))
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
 const SAMPLE_MAX: usize = 160;
 /// Examples kept per rule between two reports.
 pub const SAMPLES_PER_RULE: usize = 3;
@@ -470,5 +564,103 @@ SecRule ARGS "@rx w" "ctl:ruleRemoveById:60013,id:1234"
         assert!(out.starts_with("AH00526"));
         assert!(out.len() <= 60);
         assert!(!out.contains('\x1b'));
+    }
+
+    // ---- OPanel ------------------------------------------------------------
+
+    const LIVE: &str = "/usr/local/lsws/conf/opanel/waf/zz-sn-secure.conf";
+    // As OPanel writes it (a VPS on OpenLiteSpeed, 2026-10).
+    const CUSTOM: &str = "# opanel-mcp: AI crawler bot (added 2026-09-26 03:30 UTC by admin)\nSecRule REQUEST_HEADERS:User-Agent \"@contains claudebot\" \"id:1090000,phase:1,t:none,t:lowercase,deny,status:403,log,msg:'opanel mcp: AI crawler bot'\"\n\n# opanel-mcp: SEO bot (added 2026-09-26 03:31 UTC by admin)\nSecRule REQUEST_HEADERS:User-Agent \"@contains ahrefsbot\" \"id:1090004,phase:1,t:none,t:lowercase,deny,status:403,log,msg:'opanel mcp: SEO bot'\"\n";
+
+    #[test]
+    fn the_hook_block_is_added_once_and_taken_out_cleanly() {
+        let hooked = with_hook(CUSTOM, LIVE);
+        assert!(
+            hooked.starts_with(CUSTOM),
+            "the panel's rules are untouched"
+        );
+        assert!(hooked.ends_with(&hook_block(LIVE)));
+        assert!(hook_in_place(&hooked, LIVE));
+        assert!(!hook_in_place(CUSTOM, LIVE));
+        // Adding again changes nothing.
+        assert_eq!(with_hook(&hooked, LIVE), hooked);
+        // Taking it out gives the panel's file back.
+        assert_eq!(without_hook(&hooked), CUSTOM);
+        assert_eq!(without_hook(CUSTOM), CUSTOM);
+        // A file the panel rewrote without our block is not "in place".
+        assert!(!hook_in_place(&without_hook(&hooked), LIVE));
+    }
+
+    #[test]
+    fn the_hook_works_on_an_empty_file_and_one_without_a_final_newline() {
+        let only = with_hook("", LIVE);
+        assert_eq!(only, hook_block(LIVE));
+        assert_eq!(without_hook(&only), "");
+        let bare = with_hook("SecRuleEngine On", LIVE);
+        assert!(bare.starts_with("SecRuleEngine On\n\n# BEGIN SN Secure"));
+        assert_eq!(without_hook(&bare), "SecRuleEngine On\n");
+    }
+
+    #[test]
+    fn a_moved_file_changes_the_include_line() {
+        let hooked = with_hook(CUSTOM, LIVE);
+        assert!(!hook_in_place(&hooked, "/other/zz-sn-secure.conf"));
+        let moved = with_hook(&hooked, "/other/zz-sn-secure.conf");
+        assert_eq!(moved.matches(HOOK_BEGIN).count(), 1);
+        assert!(moved.contains("Include /other/zz-sn-secure.conf"));
+        assert!(!moved.contains(LIVE));
+    }
+
+    #[test]
+    fn a_begin_marker_without_its_end_is_not_cut_out() {
+        // Whoever edited the file by hand, or a truncated write: never delete
+        // what follows a marker that has no end close by.
+        let broken = format!(
+            "{CUSTOM}\n{HOOK_BEGIN}\nInclude {LIVE}\nSecRule ARGS \"@contains x\" \"id:1,deny\"\n"
+        );
+        assert_eq!(without_hook(&broken).matches("SecRule").count(), 3);
+        // An end marker far away does not count either.
+        let far = format!("{HOOK_BEGIN}\n{}{HOOK_END}\n", "# line\n".repeat(20));
+        assert_eq!(without_hook(&far).matches("# line").count(), 20);
+    }
+
+    #[test]
+    fn two_blocks_are_both_taken_out() {
+        let twice = format!("{}\n{CUSTOM}\n{}", hook_block(LIVE), hook_block(LIVE));
+        let clean = without_hook(&twice);
+        assert!(!clean.contains(HOOK_BEGIN) && clean.contains("claudebot"));
+    }
+
+    #[test]
+    fn opanel_with_the_module_and_the_engine_on_is_on() {
+        // opanel-base.conf and the OPANEL managed ModSecurity block of
+        // httpd_config.conf as found on the VPS the hub called "not installed".
+        let base = "SecRuleEngine On\nSecRequestBodyAccess On\nSecRequestBodyLimit 134217728\n";
+        let httpd = "# OPANEL managed ModSecurity BEGIN\nmodule mod_security {\n    modsecurity             on\n    ls_enabled              1\n}\n# OPANEL managed ModSecurity END\n";
+        assert_eq!(opanel_engine(base, httpd, &[]), "on");
+        // The module switched off wins over everything.
+        let off = httpd.replace("modsecurity             on", "modsecurity             off");
+        assert_eq!(opanel_engine(base, &off, &[]), "off");
+        // One rule file of the panel that detects only is reported.
+        assert_eq!(
+            opanel_engine(base, httpd, &["detectiononly".to_string()]),
+            "detection_only"
+        );
+        // Nothing says the engine is on: ModSecurity's default is off.
+        assert_eq!(opanel_engine("", httpd, &[]), "off");
+    }
+
+    #[test]
+    fn sites_without_the_waf_block_are_found_but_not_the_panels_own_hosts() {
+        let with =
+            "virtualHost x {\n# OPANEL WAF BEGIN\nmodule mod_security {\n}\n# OPANEL WAF END\n}\n"
+                .to_string();
+        let without = "virtualHost y {\n}\n".to_string();
+        let v = vec![
+            ("babatap.com".to_string(), with.clone()),
+            ("old.example".to_string(), without.clone()),
+            ("opanel_tools".to_string(), without),
+        ];
+        assert_eq!(sites_without_waf(&v), vec!["old.example".to_string()]);
     }
 }

@@ -60,6 +60,50 @@ rules:
   - name: php-in-uploads
     weight: 40
 
+  # Placement rules for PHP files (kept for score_php callers that pass the flags).
+  # `sn hunt` no longer scores pictures with them: see `images:` below.
+
+images:
+  # score_image(): a file named like a picture, judged by its first bytes.
+  # Kinds: image (JPEG/PNG/GIF/WebP/BMP/ICO/TIFF/HEIF), svg, executable, archive,
+  # text, other. Read whole up to 2 MB, else first + last 512 KB.
+  php_open_tag: >
+    `<?php`+whitespace, `<?=` (needs `$` or `(`), `<script language="php">`, and
+    `<?`+whitespace in text kinds only. Case-insensitive. The tag counts only when
+    >= 4 text bytes follow (>= 8 for the short forms): chance bytes in compressed
+    picture data are not code.
+  rules:
+    - {name: php-in-image,          weight: 70,  when: PHP open tag followed by code; the code around it is scored by score_php and added}
+    - {name: executable-as-image,   weight: 100, when: ELF / MZ+PE / "#!" with an image name}
+    - {name: archive-as-image,      weight: 70,  when: zip / rar / gzip / 7z with an image name}
+    - {name: text-in-image-name,    weight: 40,  when: image name, text content}
+    - {name: double-extension,      weight: 40,  when: "x.php.jpg": a script part before the picture extension}
+    - {name: script-in-image,       weight: 40,  when: "<script"}
+    - {name: remote-script,         weight: 40,  when: "<script" loading src/href from another address}
+    - {name: event-handler-in-image, weight: 30, when: " onload=", " onerror=" ... (known event names)}
+    - {name: javascript-uri,        weight: 50,  when: "javascript:"}
+    - {name: embedded-frame,        weight: 30,  when: "<foreignobject", "<iframe", "<embed", "<object"}
+    - {name: data-html-uri,         weight: 40,  when: "data:text/html"}
+    - {name: js-obfuscation,        weight: 50,  when: eval( atob( fromcharcode unescape( document.write( new function( -- ONLY with script present}
+    - {name: js-exfil-redirect,     weight: 30,  when: document.cookie localstorage window.location location.href fetch( ... -- ONLY with script present}
+    - {name: appended-text,         weight: 40,  when: >= 32 bytes of text at the very end of a real raster picture}
+    - {name: appended-code,         weight: 40,  when: that trailing text has script / decoder words}
+
+config:
+  # score_config(): .htaccess (line by line, comments skipped, <FilesMatch>/<Files>
+  # blocks tracked) and .user.ini / php.ini / .php.ini.
+  rules:
+    - {name: config-image-as-code,         weight: 100, when: AddHandler/AddType with a php/cgi handler for an image extension, or SetHandler/ForceType php inside a <FilesMatch>/<Files> naming pictures}
+    - {name: config-auto-include-nonphp,   weight: 100, when: auto_prepend_file / auto_append_file points at a file that is not PHP}
+    - {name: config-auto-include-odd-path, weight: 80,  when: it points at PHP in uploads/, cache/, tmp/, wp-content/upgrade/ or a hidden folder}
+    - {name: config-data-as-code,          weight: 60,  when: AddHandler/AddType php for txt/css/js/json/pdf/zip/...}
+    - {name: config-allow-url-include,     weight: 50,  when: allow_url_include on}
+  not_flagged:
+    - AddHandler php for .html/.htm (common, legitimate)
+    - PHP-FPM SetHandler for \.php$
+    - cPanel ea-php AddHandler for .php/.phtml
+    - auto_prepend_file pointing at a PHP file in a normal folder (security plugins)
+
 removed:
   - backtick-exec          # two backticks matched markdown in comments
   - variable-function      # replaced by input-as-function (precise)

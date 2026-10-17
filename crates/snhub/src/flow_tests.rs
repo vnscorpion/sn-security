@@ -894,6 +894,300 @@ async fn a_ban_order_holds_one_address_or_nothing() {
 }
 
 #[tokio::test]
+async fn ticked_addresses_are_lifted_in_one_order() {
+    let h = hub_with(false);
+    let cookie = h.sign_in().await;
+    let (id, _) = agent_key(&h);
+    for ip in ["203.0.113.7", "203.0.113.8", "203.0.113.9"] {
+        h.post(
+            &format!("/agent/{id}/ban"),
+            &cookie,
+            &format!("ip={ip}&ttl=3600"),
+        )
+        .await;
+    }
+    // The blocklist has a tick box per address and a button per row that lifts
+    // just that one.
+    let page = h.get(&format!("/agent/{id}"), &cookie).await;
+    for ip in ["203.0.113.7", "203.0.113.8", "203.0.113.9"] {
+        assert!(
+            page.body.contains(&format!(
+                "<input type=\"checkbox\" name=\"ips\" value=\"{ip}\">"
+            )),
+            "{ip}"
+        );
+        assert!(
+            page.body.contains(&format!(
+                "name=\"ip\" value=\"{ip}\" formaction=\"/agent/{id}/unban\""
+            )),
+            "{ip}"
+        );
+    }
+    assert!(
+        page.body
+            .contains(&format!("action=\"/agent/{id}/unban-selected\""))
+    );
+
+    // Two ticked, one that is no address (ignored), one IPv6 in another spelling.
+    let body = format!(
+        "ips=203.0.113.7&ips=203.0.113.8&ips=junk&ips={}&ips=203.0.113.7",
+        web::urlenc("2001:DB8:1:2::9/64")
+    );
+    let r = h
+        .post(&format!("/agent/{id}/unban-selected"), &cookie, &body)
+        .await;
+    assert!(r.location().ends_with("#bans"), "{}", r.location());
+    let d = h.st.db.lock().unwrap().get_desired(&id).unwrap().unwrap().2;
+    let bans: Vec<&str> = d.bans.iter().map(|b| b.ip.as_str()).collect();
+    assert_eq!(bans, ["203.0.113.9"], "the one not ticked is still banned");
+    assert_eq!(
+        d.unbans,
+        ["203.0.113.7", "203.0.113.8", "2001:db8:1:2::/64"]
+    );
+    // The orders are in the log as one entry.
+    let page = h.get("/log", &cookie).await;
+    assert!(
+        page.body.contains("203.0.113.7, 203.0.113.8"),
+        "{}",
+        page.body
+    );
+
+    // Nothing ticked: nothing happens.
+    let before = h.st.db.lock().unwrap().get_desired(&id).unwrap().unwrap().2;
+    h.post(
+        &format!("/agent/{id}/unban-selected"),
+        &cookie,
+        "ip=1.2.3.4",
+    )
+    .await;
+    let after = h.st.db.lock().unwrap().get_desired(&id).unwrap().unwrap().2;
+    assert_eq!(before.unbans, after.unbans);
+}
+
+fn traffic_items() -> Vec<crate::traffic_ai::TrafficItem> {
+    use crate::traffic_ai::{TrafficAction, TrafficItem};
+    vec![
+        TrafficItem {
+            action: TrafficAction::WafRule {
+                kind: "path".into(),
+                value: "/.env".into(),
+            },
+            reason: "dò file <b>bí mật</b>".into(),
+            risk: "low".into(),
+        },
+        TrafficItem {
+            action: TrafficAction::BanIp {
+                ip: "203.0.113.7".into(),
+                ttl_secs: 600,
+            },
+            reason: "tấn công".into(),
+            risk: "high".into(),
+        },
+    ]
+}
+
+fn stored_traffic(h: &Hub, id: &str) -> i64 {
+    let items = traffic_items();
+    h.st.db
+        .lock()
+        .unwrap()
+        .create_traffic(
+            now(),
+            &crate::db_traffic::NewTraffic {
+                agent_id: id,
+                provider: "mô hình thử",
+                status: "proposed",
+                summary: "Một bot dò file.",
+                items: &items,
+                rejected: &["8.8.8.8: IP không có trong số liệu traffic".to_string()],
+                note: "",
+                auto: false,
+            },
+        )
+        .unwrap()
+}
+
+#[tokio::test]
+async fn the_traffic_card_shows_the_proposal_and_escapes_what_the_model_wrote() {
+    let h = hub_with(false);
+    let cookie = h.sign_in().await;
+    let (id, _) = agent_key(&h);
+    // No AI configured yet: the card says so and offers no analysis.
+    let page = h.get(&format!("/agent/{id}"), &cookie).await;
+    assert!(page.body.contains("AI phân tích traffic"));
+    assert!(page.body.contains("Chưa cấu hình AI"), "{}", page.body);
+    assert!(!page.body.contains("/traffic/analyze"));
+
+    let pid = stored_traffic(&h, &id);
+    let page = h.get(&format!("/agent/{id}"), &cookie).await;
+    assert!(page.body.contains("Một bot dò file."));
+    assert!(page.body.contains("Chờ duyệt"));
+    assert!(page.body.contains("203.0.113.7") && page.body.contains("10 phút"));
+    // The reason carried markup: it is shown as text.
+    assert!(!page.body.contains("<b>bí mật</b>"), "{}", page.body);
+    assert!(page.body.contains("&lt;b&gt;bí mật&lt;/b&gt;"));
+    assert!(
+        page.body
+            .contains(&format!("/agent/{id}/traffic/{pid}/apply"))
+    );
+    assert!(page.body.contains("Hub đã loại 1 đề xuất"));
+}
+
+#[tokio::test]
+async fn the_ai_settings_are_one_place_for_both_analyses_and_name_no_local_model() {
+    let h = hub_with(false);
+    let cookie = h.sign_in().await;
+    let page = h.get("/settings", &cookie).await;
+    assert_eq!(page.status, StatusCode::OK);
+    // One provider serves the incident analysis and the traffic analysis alike.
+    assert!(page.body.contains("phân tích sự cố và phân tích traffic"));
+    // No local-model presets or hints: the hub is pointed at Hermes or an API.
+    let lower = page.body.to_lowercase();
+    for word in ["ollama", "vllm", "llama.cpp", "11434", "sn_preset"] {
+        assert!(!lower.contains(word), "{word}: {}", page.body);
+    }
+}
+#[tokio::test]
+async fn analysing_traffic_without_an_ai_says_what_is_missing() {
+    let h = hub_with(false);
+    let cookie = h.sign_in().await;
+    let (id, _) = agent_key(&h);
+    let r = h
+        .post(&format!("/agent/{id}/traffic/analyze"), &cookie, "")
+        .await;
+    assert!(r.location().contains("at=traffic"), "{}", r.location());
+    let page = h
+        .get(r.location().split('#').next().unwrap(), &cookie)
+        .await;
+    assert!(
+        page.body.contains("Chưa cấu hình AI: vào Cài đặt AI"),
+        "{}",
+        page.body
+    );
+}
+
+#[tokio::test]
+async fn a_click_carries_out_one_proposed_action_or_all_of_them() {
+    let h = hub_with(false);
+    let cookie = h.sign_in().await;
+    let (id, _) = agent_key(&h);
+    let pid = stored_traffic(&h, &id);
+    // The rule only: the ban is not touched, and the proposal stays open.
+    let r = h
+        .post(
+            &format!("/agent/{id}/traffic/{pid}/apply"),
+            &cookie,
+            "idx=0",
+        )
+        .await;
+    assert!(r.location().contains("at=traffic"), "{}", r.location());
+    {
+        let db = h.st.db.lock().unwrap();
+        assert!(
+            db.waf_rules_for(&id)
+                .unwrap()
+                .iter()
+                .any(|w| w.value == "/.env")
+        );
+        assert!(db.get_desired(&id).unwrap().unwrap().2.bans.is_empty());
+        assert_eq!(db.get_traffic(pid).unwrap().unwrap().status, "proposed");
+    }
+    // All: the ban follows, and the proposal is closed.
+    h.post(
+        &format!("/agent/{id}/traffic/{pid}/apply"),
+        &cookie,
+        "idx=all",
+    )
+    .await;
+    {
+        let db = h.st.db.lock().unwrap();
+        let d = db.get_desired(&id).unwrap().unwrap().2;
+        assert_eq!(d.bans.len(), 1);
+        assert_eq!(
+            (d.bans[0].ip.as_str(), d.bans[0].ttl_secs),
+            ("203.0.113.7", 600)
+        );
+        assert_eq!(db.get_traffic(pid).unwrap().unwrap().status, "done");
+    }
+    // A bad index and another VPS's proposal change nothing.
+    let r = h
+        .post(
+            &format!("/agent/{id}/traffic/{pid}/apply"),
+            &cookie,
+            "idx=nope",
+        )
+        .await;
+    assert!(r.location().contains("at=traffic"));
+    let (other, _) = {
+        let sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let pk = snsec_common::crypto::encode_pubkey(&sk.verifying_key());
+        let id2 =
+            h.st.db
+                .lock()
+                .unwrap()
+                .enroll_agent("web-02", &pk, now())
+                .unwrap();
+        (id2, sk)
+    };
+    h.post(
+        &format!("/agent/{other}/traffic/{pid}/apply"),
+        &cookie,
+        "idx=all",
+    )
+    .await;
+    assert!(
+        h.st.db
+            .lock()
+            .unwrap()
+            .get_desired(&other)
+            .unwrap()
+            .unwrap()
+            .2
+            .bans
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn a_rejected_proposal_runs_nothing() {
+    let h = hub_with(false);
+    let cookie = h.sign_in().await;
+    let (id, _) = agent_key(&h);
+    let pid = stored_traffic(&h, &id);
+    h.post(&format!("/agent/{id}/traffic/{pid}/reject"), &cookie, "")
+        .await;
+    {
+        let db = h.st.db.lock().unwrap();
+        assert_eq!(db.get_traffic(pid).unwrap().unwrap().status, "rejected");
+    }
+    // It cannot be applied afterwards.
+    h.post(
+        &format!("/agent/{id}/traffic/{pid}/apply"),
+        &cookie,
+        "idx=all",
+    )
+    .await;
+    let db = h.st.db.lock().unwrap();
+    assert!(db.get_desired(&id).unwrap().unwrap().2.bans.is_empty());
+    assert!(
+        db.waf_rules_for(&id)
+            .unwrap()
+            .iter()
+            .all(|w| w.value != "/.env")
+    );
+}
+
+#[test]
+fn a_repeated_form_field_is_read_value_by_value() {
+    assert_eq!(
+        web::form_values("ips=a%3Ab&x=1&ips=c+d&ips=%zz&ips=%4&y=ips", "ips"),
+        ["a:b", "c d", "%zz", "%4"]
+    );
+    assert!(web::form_values("", "ips").is_empty());
+    assert!(web::form_values("ipsx=1&=2", "ips").is_empty());
+}
+
+#[tokio::test]
 async fn the_hub_refuses_to_ban_a_cloudflare_edge_or_a_private_address() {
     let h = hub_with(false);
     let cookie = h.sign_in().await;
@@ -1117,30 +1411,38 @@ fn the_database_and_its_directory_are_private() {
 }
 
 #[tokio::test]
-async fn the_install_command_for_a_new_vps_carries_no_token() {
+async fn the_install_command_for_a_new_vps_is_one_line_with_the_token_in_its_environment() {
     let h = hub();
     let cookie = h.sign_in().await;
     let r = h.post("/add-vps", &cookie, "name=web-01").await;
     assert_eq!(r.status, StatusCode::OK);
     let cmd = r
         .body
-        .split("<pre>")
+        .split("<pre style=\"user-select:all\">")
         .nth(1)
         .and_then(|s| s.split("</pre>").next())
         .unwrap()
         .to_string();
-    assert_eq!(
-        cmd,
-        "curl -fsSL https://sec.example.test/install.sh | sudo sh -s -- --hub https://sec.example.test --name web-01"
+    // One line: no line break to trip a paste.
+    assert!(!cmd.contains('\n'), "{cmd}");
+    let (head, rest) = cmd
+        .split_once("| SN_ENROLL_TOKEN=")
+        .unwrap_or_else(|| panic!("{cmd}"));
+    assert_eq!(head, "curl -fsSL https://sec.example.test/install.sh ");
+    let (token, tail) = rest.split_once(' ').unwrap();
+    assert!(
+        token.len() >= 32 && token.chars().all(|c| c.is_ascii_alphanumeric()),
+        "{token}"
     );
-    // The token is on the page, apart from the command.
-    let token = r
-        .body
-        .split("user-select:all;font-size:16px\">")
-        .nth(1)
-        .and_then(|s| s.split("</pre>").next())
-        .unwrap();
-    assert!(token.len() >= 32 && !cmd.contains(token));
+    // The token is handed to the installer through the environment of sudo, and is
+    // on no command line: `ps` shows a command's arguments to every local user.
+    assert_eq!(
+        tail,
+        "sudo --preserve-env=SN_ENROLL_TOKEN sh -s -- --hub https://sec.example.test --name web-01"
+    );
+    assert!(!tail.contains(token) && !cmd.contains("--token"));
+    // Nothing else on the page repeats it.
+    assert_eq!(r.body.matches(token).count(), 1);
     // A name that is not a plain word is quoted for the shell.
     let r = h.post("/add-vps", &cookie, "name=a%3B+rm+-rf+%2F").await;
     assert!(

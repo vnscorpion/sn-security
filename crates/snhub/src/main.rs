@@ -14,15 +14,18 @@ mod db;
 mod db_ai;
 mod db_auth;
 mod db_mcp;
+mod db_traffic;
 mod db_waf;
 mod desired;
 mod keys;
 mod mcp;
 mod totp;
+mod traffic_ai;
 mod web;
 mod web_ai;
 mod web_auth;
 mod web_mcp;
+mod web_traffic;
 mod web_waf;
 mod webauthn;
 
@@ -107,6 +110,14 @@ enum Cmd {
         #[arg(long)]
         vps: String,
     },
+    /// Clear the malware-scan results the hub shows, for every VPS (or one, with
+    /// --vps). A scan that finished before now is not shown again; the next scan
+    /// of each VPS fills the page again.
+    ClearScans {
+        /// Only this VPS (id or name).
+        #[arg(long)]
+        vps: Option<String>,
+    },
     /// Lift every ban on every VPS (or one, with --vps): the hub's orders are
     /// dropped and each VPS empties its ban sets at its next sync.
     UnbanAll {
@@ -151,6 +162,7 @@ fn real_main() -> Result<()> {
         Cmd::TotpNow => cmd_totp_now(&cli.config),
         Cmd::RemoveVps { vps } => cmd_remove_vps(&cli.config, &vps),
         Cmd::UnbanAll { vps, observe } => cmd_unban_all(&cli.config, vps.as_deref(), observe),
+        Cmd::ClearScans { vps } => cmd_clear_scans(&cli.config, vps.as_deref()),
         Cmd::McpRevokeAll => {
             let cfg = HubConfig::load(&cli.config)?;
             let db = Db::open(&cfg.data_path().join("snhub.sqlite"))?;
@@ -361,6 +373,29 @@ fn cmd_unban_all(config_path: &Path, vps: Option<&str>, observe: bool) -> Result
     Ok(())
 }
 
+fn cmd_clear_scans(config_path: &Path, vps: Option<&str>) -> Result<()> {
+    let cfg = HubConfig::load(config_path)?;
+    let db = Db::open(&cfg.data_path().join("snhub.sqlite"))?;
+    let agents = db.list_agents()?;
+    let chosen: Vec<_> = match vps {
+        Some(want) => agents
+            .into_iter()
+            .filter(|a| a.id == want || a.name.eq_ignore_ascii_case(want))
+            .collect(),
+        None => agents,
+    };
+    if chosen.is_empty() {
+        anyhow::bail!("no such VPS");
+    }
+    let at = now();
+    for a in &chosen {
+        db.clear_scans(&a.id, at, "console")?;
+        println!("{}: scan results cleared", a.name);
+    }
+    println!("A VPS shows a scan again once it has made a new one (`Quét ngay` on its page).");
+    Ok(())
+}
+
 fn cmd_totp_now(config_path: &Path) -> Result<()> {
     let cfg = HubConfig::load(config_path)?;
     let db = Db::open(&cfg.data_path().join("snhub.sqlite"))?;
@@ -418,15 +453,11 @@ fn cmd_add_vps(config_path: &Path, name: &str) -> Result<()> {
     } else {
         cfg.public_url.trim_end_matches('/').to_string()
     };
-    // The token is kept off the command line: on the VPS every local user can read
-    // a running command's arguments. The installer asks for it instead.
-    println!("Install command (run on the VPS as root; it asks for the token):\n");
+    println!("Install command (run on the VPS as root; one line installs and enrolls):\n");
+    println!("{}", web::install_command(&base, name, &token));
     println!(
-        "curl -fsSL {base}/install.sh | sudo sh -s -- --hub {base} --name {}",
-        web::sh_quote(name)
+        "\n(the token is in it: single use, valid 15 minutes, in the command's environment, not its arguments)"
     );
-    println!("\nToken: {token}");
-    println!("\n(single use, valid 15 minutes; type it when the installer asks)");
     Ok(())
 }
 
@@ -495,6 +526,8 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/agent/{id}", get(web::agent_detail))
         .route("/agent/{id}/ban", post(web::ban_post))
         .route("/agent/{id}/unban", post(web::unban_post))
+        .route("/agent/{id}/unban-selected", post(web::unban_selected_post))
+        .route("/agent/{id}/clear-scan", post(web::clear_scan_post))
         .route("/agent/{id}/unban-all", post(web::unban_all_post))
         .route("/agent/{id}/delete", post(web::remove_post))
         .route("/unban-all", post(web::unban_all_fleet_post))
@@ -507,6 +540,18 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/agent/{id}/ai/autonomy", post(web_ai::ai_autonomy_post))
         .route("/agent/{id}/ai/{pid}/apply", post(web_ai::ai_apply_post))
         .route("/agent/{id}/ai/{pid}/reject", post(web_ai::ai_reject_post))
+        .route(
+            "/agent/{id}/traffic/analyze",
+            post(web_traffic::analyze_post),
+        )
+        .route(
+            "/agent/{id}/traffic/{pid}/apply",
+            post(web_traffic::apply_post),
+        )
+        .route(
+            "/agent/{id}/traffic/{pid}/reject",
+            post(web_traffic::reject_post),
+        )
         .route("/settings", get(web_ai::settings_page))
         .route("/settings/hermes", get(web_mcp::page))
         .route("/settings/hermes/token", post(web_mcp::create_post))

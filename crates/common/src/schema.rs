@@ -242,6 +242,14 @@ pub struct HuntSummary {
     pub malicious: u32,
     /// Files scoring "suspicious" (70-99): for a human to look at.
     pub suspicious: u32,
+    /// Pictures left unread because the scan ran out of the time it gives them
+    /// (PHP and configuration files are always read). The next run starts over.
+    #[serde(default)]
+    pub images_skipped: u64,
+    /// Version of the scoring rules that made this result (`0`: before it was
+    /// recorded). The agent drops a result of an older version.
+    #[serde(default)]
+    pub scorer: u32,
 }
 
 /// One ban currently in force on a VPS.

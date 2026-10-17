@@ -236,6 +236,15 @@ fn latest_hunt(cfg: &Config, state: &State) -> (Option<HuntSummary>, Vec<Finding
         Ok(_) => {}
         Err(e) => eprintln!("hunt: could not take in the scan result: {e:#}"),
     }
+    // A result of older scoring rules is not what this agent would say: it is
+    // not reported, and goes, so that `sn clean` cannot act on it either.
+    if crate::hunt::result_is_stale(state) {
+        eprintln!("hunt: dropped a scan result made by older scoring rules");
+        for name in ["hunt-latest.json", "findings-latest.json"] {
+            let _ = std::fs::remove_file(state.dir.join(name));
+        }
+        return (None, Vec::new());
+    }
     let summary = std::fs::read(state.dir.join("hunt-latest.json"))
         .ok()
         .and_then(|b| serde_json::from_slice::<HuntSummary>(&b).ok());
@@ -331,6 +340,11 @@ fn import_scan(cfg: &Config, state: &State, now: i64) -> Result<Imported> {
     let Ok(mut summary) = serde_json::from_slice::<HuntSummary>(&bytes) else {
         return Ok(Imported::Refused("summary unreadable"));
     };
+    // Left by a scan of older scoring rules: not taken in (and not worth a line
+    // in the log every cycle).
+    if summary.scorer < snsec_common::heuristic::SCORER_VERSION {
+        return Ok(Imported::Nothing);
+    }
     let current = std::fs::read(state.dir.join("hunt-latest.json"))
         .ok()
         .and_then(|b| serde_json::from_slice::<HuntSummary>(&b).ok());
@@ -1745,6 +1759,7 @@ mod tests {
             duration_secs: 31,
             malicious: 1,
             suspicious: 1,
+            scorer: snsec_common::heuristic::SCORER_VERSION,
             ..HuntSummary::default()
         };
         std::fs::write(
@@ -1758,6 +1773,63 @@ mod tests {
         assert_eq!(got_findings[0].path, "/home/a/uploads/x.php");
         let got_summary = got_summary.unwrap();
         assert_eq!((got_summary.scanned, got_summary.malicious), (4_200, 1));
+    }
+
+    #[test]
+    fn a_scan_result_of_older_scoring_rules_is_dropped_not_reported_or_cleaned() {
+        // Left by an agent that scored pictures with the PHP rules: "malicious"
+        // photos. No `scorer` field, as written before it existed.
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::at(dir.path().to_path_buf());
+        let findings = vec![finding(
+            "/home/a/public_html/wp-content/uploads/2026/07/Map-to.png",
+            150,
+            "malicious",
+        )];
+        std::fs::write(
+            state.dir.join("findings-latest.json"),
+            serde_json::to_vec(&findings).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            state.dir.join("hunt-latest.json"),
+            br#"{"at":1000,"scanned":142970,"duration_secs":1460,"malicious":570,"suspicious":4012}"#,
+        )
+        .unwrap();
+        assert!(crate::hunt::result_is_stale(&state));
+        // `sn clean` will not quarantine what it names.
+        let err = crate::clean::clean(&state, &["/home".to_string()], true).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("older scoring rules"),
+            "{err:#}"
+        );
+
+        // The report does not carry it, there is no "malware found" alert, and the
+        // files are gone, so a later `sn clean` finds nothing either.
+        let (summary, got) = latest_hunt(&default_config(), &state);
+        assert!(summary.is_none() && got.is_empty());
+        assert!(hunt_alerts(summary.as_ref()).is_empty());
+        assert!(!state.dir.join("hunt-latest.json").exists());
+        assert!(!state.dir.join("findings-latest.json").exists());
+        assert!(!crate::hunt::result_is_stale(&state));
+    }
+
+    #[test]
+    fn a_result_of_the_current_rules_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::at(dir.path().to_path_buf());
+        let now = HuntSummary {
+            at: 5,
+            scorer: snsec_common::heuristic::SCORER_VERSION,
+            ..HuntSummary::default()
+        };
+        std::fs::write(
+            state.dir.join("hunt-latest.json"),
+            serde_json::to_vec(&now).unwrap(),
+        )
+        .unwrap();
+        assert!(!crate::hunt::result_is_stale(&state));
+        assert!(latest_hunt(&default_config(), &state).0.is_some());
     }
 
     #[test]
@@ -2165,6 +2237,7 @@ mod tests {
             scanned: 50,
             malicious: 99,
             suspicious: 99,
+            scorer: snsec_common::heuristic::SCORER_VERSION,
             ..HuntSummary::default()
         };
         std::fs::write(
@@ -2235,6 +2308,7 @@ mod tests {
         let now = 1_700_000_000;
         let by_hand = HuntSummary {
             at: now,
+            scorer: snsec_common::heuristic::SCORER_VERSION,
             ..HuntSummary::default()
         };
         std::fs::write(
@@ -2283,6 +2357,7 @@ mod tests {
         let dir = state.dir.join(crate::state::SCAN_DIR);
         let mut huge = serde_json::to_vec(&HuntSummary {
             at: now + 1,
+            scorer: snsec_common::heuristic::SCORER_VERSION,
             ..HuntSummary::default()
         })
         .unwrap();
@@ -2303,6 +2378,7 @@ mod tests {
         let elsewhere = d.path().join("elsewhere.json");
         let summary = HuntSummary {
             at: now,
+            scorer: snsec_common::heuristic::SCORER_VERSION,
             ..HuntSummary::default()
         };
         std::fs::write(&elsewhere, serde_json::to_vec(&summary).unwrap()).unwrap();

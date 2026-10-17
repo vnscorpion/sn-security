@@ -140,13 +140,32 @@ pub fn model_call_permit() -> Option<tokio::sync::OwnedSemaphorePermit> {
 /// # Errors
 /// When one is already running for this VPS, or every model call is taken.
 pub fn start(st: &Arc<AppState>, db: &Db, agent_id: &str, at: i64) -> Result<(), Refused> {
+    start_with(st, db, agent_id, at, true, run)
+}
+
+/// [`start`] for another kind of analysis (`job`): it shares the one-per-VPS
+/// claim and the model-call permits. `touch` starts the incident cool-down; the
+/// traffic analysis keeps its own, in its proposals.
+///
+/// # Errors
+/// When one is already running for this VPS, or every model call is taken.
+pub fn start_with(
+    st: &Arc<AppState>,
+    db: &Db,
+    agent_id: &str,
+    at: i64,
+    touch: bool,
+    job: fn(&Arc<AppState>, &str),
+) -> Result<(), Refused> {
     let claim = SLOTS.claim(agent_id)?;
-    let _ = db.touch_analysis(agent_id, at);
+    if touch {
+        let _ = db.touch_analysis(agent_id, at);
+    }
     let st2 = Arc::clone(st);
     let id = agent_id.to_string();
     tokio::task::spawn_blocking(move || {
         let _claim = claim;
-        run(&st2, &id);
+        job(&st2, &id);
     });
     Ok(())
 }

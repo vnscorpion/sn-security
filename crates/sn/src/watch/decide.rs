@@ -554,6 +554,8 @@ mod tests {
             crawler: false,
             span: CYCLE_SECS,
             volume_exempt: false,
+            // The ban logic is what these tests exercise.
+            rate_bans: true,
         }
     }
 

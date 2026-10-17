@@ -300,31 +300,31 @@ fn clamav_block(agent_id: &str, r: &ReportBody, flash: &str, install_pending: bo
             @if !flash.is_empty() {
                 p style="margin:0 0 8px;color:var(--ok)" { b { (flash) } }
             }
-            b { "ClamAV (engine thứ hai, chữ ký mã độc đã biết)" }
+            b { "ClamAV (chữ ký mã độc đã biết)" }
             br;
             @if !knows_clamav(r) {
-                "Agent trên VPS này cũ, chưa hỗ trợ ClamAV. Cập nhật agent để dùng."
+                "Agent cũ, chưa hỗ trợ ClamAV."
             } @else if let Some(c) = &r.clamav {
                 @if c.disabled {
-                    "Đang tắt trên VPS này (" code { "[hunt] clamav = \"off\"" } "). Quét chỉ dùng heuristic."
+                    "Đã tắt (" code { "[hunt] clamav = \"off\"" } ")."
                 } @else if install_pending && !c.installed {
                     // The order is queued but the VPS has not picked it up yet (it asks
                     // the hub every few minutes).
-                    span class="badge b-warn" { "Đã gửi lệnh" } " Đang chờ VPS nhận lệnh ở lần báo cáo kế tiếp (tối đa ~5–15 phút); sau đó VPS mới bắt đầu cài. Tải lại trang để xem trạng thái."
+                    span class="badge b-warn" { "Đã gửi lệnh" } " chờ VPS nhận (tối đa ~15 phút), tải lại trang để xem."
                 } @else if c.install_state == "running" {
                     // Before "installed": the package puts its programs on disk early,
                     // long before the signatures are downloaded.
-                    span class="badge b-warn" { "Đang cài" } " Có thể mất vài phút (gói + tải chữ ký, hàng trăm MB). Tải lại trang sau để xem kết quả."
+                    span class="badge b-warn" { "Đang cài" } " (vài phút), tải lại trang để xem."
                 } @else if c.installed {
                     @match c.db_age_hours {
-                        Some(h) if h <= 72 => { span class="badge b-ok" { "Đã cài" } " chữ ký cập nhật " (h) " giờ trước. Mỗi lần quét, các file PHP được đối chiếu thêm với chữ ký ClamAV." }
-                        Some(h) => { span class="badge b-warn" { "Chữ ký cũ" } " cập nhật " (h) " giờ trước: kiểm tra " code { "freshclam" } " trên VPS." }
-                        None => { span class="badge b-warn" { "Chưa có chữ ký" } " ClamAV đã cài nhưng chưa tải được CSDL chữ ký (cần mạng tới database.clamav.net)." }
+                        Some(h) if h <= 72 => { span class="badge b-ok" { "Đã cài" } " chữ ký cập nhật " (h) " giờ trước." }
+                        Some(h) => { span class="badge b-warn" { "Chữ ký cũ" } " (" (h) " giờ): kiểm tra " code { "freshclam" } " trên VPS." }
+                        None => { span class="badge b-warn" { "Chưa có chữ ký" } " (cần mạng tới database.clamav.net)." }
                     }
                 } @else {
-                    "Chưa cài. Cài cần VPS có tổng RAM từ khoảng 1,8 GB (loại 2 GB trở lên), và mỗi lần quét cần khoảng 1,5 GB RAM còn trống."
+                    "Chưa cài (cần RAM từ ~1,8 GB)."
                     @if c.can_install && c.install_allowed && r.cycle.mem_total_mb > 0 && r.cycle.mem_total_mb < 1800 {
-                        p class="help" style="margin:8px 0 0" { "VPS này chỉ có " (r.cycle.mem_total_mb) " MB RAM nên không cài ClamAV (agent sẽ từ chối)." }
+                        p class="help" style="margin:8px 0 0" { "VPS chỉ có " (r.cycle.mem_total_mb) " MB RAM, không cài được." }
                     } @else if c.can_install && c.install_allowed {
                         form method="post" action={"/agent/" (agent_id) "/job"} style="margin:10px 0 0"
                              onsubmit="return confirm('Cài ClamAV trên VPS này bằng trình quản lý gói của hệ điều hành (chạy bằng root)?')" {
@@ -333,16 +333,16 @@ fn clamav_block(agent_id: &str, r: &ReportBody, flash: &str, install_pending: bo
                         }
                     } @else if c.can_install {
                         p class="help" style="margin:8px 0 0" {
-                            "VPS này đang tắt lệnh từ hub (" code { "[remote] hub_orders = false" } " trong " code { "/etc/sn/agent.toml" } "). Đặt lại " code { "true" } " hoặc xoá dòng đó thì hub cài được."
+                            "VPS đang tắt lệnh từ hub (" code { "[remote] hub_orders = false" } ")."
                         }
                     } @else {
-                        p class="help" style="margin:8px 0 0" { "Hệ điều hành này chưa có công thức cài tự động (hỗ trợ: Debian, Ubuntu, AlmaLinux, Rocky, CentOS, Fedora). Cài ClamAV thủ công rồi lần quét sau sẽ tự dùng." }
+                        p class="help" style="margin:8px 0 0" { "Hệ điều hành chưa hỗ trợ cài tự động (Debian, Ubuntu, AlmaLinux, Rocky, CentOS, Fedora); cài tay thì lần quét sau sẽ dùng." }
                     }
                 }
                 // What the agent did with the last install order: without this a
                 // silently ignored order looks like one that never arrived.
                 @if !c.installed && c.last_order_at > 0 && !c.last_order.is_empty() {
-                    p class="help" style="margin:8px 0 0" { "Lệnh cài gần nhất VPS nhận (" (rel_time(c.last_order_at)) "): " (c.last_order) }
+                    p class="help" style="margin:8px 0 0" { "Lệnh cài gần nhất (" (rel_time(c.last_order_at)) "): " (c.last_order) }
                 }
                 // Whether or not the programs ended up on disk, a failed attempt
                 // says why. (The message of a success would go stale, so it is
@@ -356,12 +356,9 @@ fn clamav_block(agent_id: &str, r: &ReportBody, flash: &str, install_pending: bo
             @if let Some(h) = &r.hunt {
                 @if !h.clamav_engine.is_empty() {
                     p class="help" style="margin:8px 0 0" {
-                        "Lần quét cuối: ClamAV (" (h.clamav_engine) ") đã đối chiếu " b { (h.clamav_scanned) } " file"
-                        @if h.clamav_up_to_date > 0 {
-                            "; " (h.clamav_up_to_date) " file không đổi đã được quét gần đây nên bỏ qua"
-                        }
+                        "Lần quét cuối: ClamAV (" (h.clamav_engine) ") đối chiếu " b { (h.clamav_scanned) } " file"
                         @if h.clamav_pending > 0 {
-                            "; " b { (h.clamav_pending) } " file chờ quét ở các lần sau"
+                            "; " b { (h.clamav_pending) } " file chờ lần sau"
                         }
                         "."
                     }
@@ -402,18 +399,13 @@ fn pattern_table(
                         @if p.flagged {
                             tr { td colspan="4" {
                                 details open {
-                                    summary { "Cách xử lý mục này" }
+                                    summary { "Xử lý" }
                                     @if snsec_common::waf::claims_crawler(&p.key) {
                                         p class="help" style="color:var(--warn)" {
-                                            "Mục này tự nhận là crawler của công cụ tìm kiếm (Googlebot, Bingbot…), chưa được xác minh. "
-                                            "Crawler thật cũng đến từ nhiều IP. Chặn nhầm sẽ ảnh hưởng SEO, nên hãy kiểm tra bằng reverse DNS trước khi chặn."
+                                            "Tự nhận là crawler công cụ tìm kiếm, chưa xác minh. Kiểm tra reverse DNS trước khi chặn (chặn nhầm ảnh hưởng SEO)."
                                         }
                                     }
                                     @if snsec_common::waf::valid_value(kind, &p.key) {
-                                        p class="help" {
-                                            "Chặn bằng WAF (ModSecurity của máy chủ web) thay vì chặn IP: thêm luật ở chế độ chỉ ghi nhận, "
-                                            "xem ở mục WAF bên dưới nó trúng những request nào, đúng là bot thì bấm “Bật chặn”."
-                                        }
                                         form method="post" action="/waf/add" class="ctrls" style="margin:0 0 10px" {
                                             input type="hidden" name="kind" value=(kind.as_str());
                                             input type="hidden" name="value" value=(p.key);
@@ -423,17 +415,13 @@ fn pattern_table(
                                             button class="ghost" type="submit" { "Thêm vào WAF của VPS này (chỉ ghi nhận)" }
                                         }
                                     } @else {
-                                        p class="help" { "Hub không tạo được luật an toàn cho giá trị này (quá dài, có ký tự đặc biệt/mã hoá %, hoặc quá chung chung nên sẽ chặn nhầm). Hãy tự viết luật nếu cần." }
+                                        p class="help" { "Không tạo được luật an toàn cho giá trị này (quá dài, ký tự đặc biệt hoặc quá chung chung)." }
                                     }
                                     @if !p.sample_ips.is_empty() {
                                         p class="help" style="margin:0" {
-                                            "Một vài IP mẫu (" (p.sample_ips.len()) "): "
+                                            "IP mẫu: "
                                             span style="font-family:monospace" { (p.sample_ips.join(", ")) }
                                         }
-                                    }
-                                    p class="help" style="margin:6px 0 0" {
-                                        "Nếu không có WAF thì chỉ chặn được theo IP/CIDR bằng ô chặn IP ở trên. Với bot phân tán, "
-                                        "IP đổi liên tục nên cách này gần như không hiệu quả."
                                     }
                                 }
                             } }
@@ -554,6 +542,21 @@ pub(crate) fn sh_quote(s: &str) -> String {
         return s.to_string();
     }
     format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// The one line that installs the agent on a new VPS and enrolls it.
+///
+/// The token is in the environment of `sudo`, not among its arguments: another
+/// user on the VPS can read a running command's arguments (`ps`), but not its
+/// environment. `--preserve-env` hands it on to the installer, which reads it from
+/// there. The token is single use and lapses in 15 minutes, so the copy that stays
+/// in the shell history of whoever pasted it is worth nothing afterwards.
+pub(crate) fn install_command(base: &str, name: &str, token: &str) -> String {
+    format!(
+        "curl -fsSL {base}/install.sh | SN_ENROLL_TOKEN={} sudo --preserve-env=SN_ENROLL_TOKEN sh -s -- --hub {base} --name {}",
+        sh_quote(token),
+        sh_quote(name),
+    )
 }
 
 pub(crate) fn urlenc(s: &str) -> String {
@@ -969,6 +972,7 @@ pub async fn agent_detail(
     let hidden = hidden_bans(report.as_ref());
 
     let ai_data = crate::web_ai::card_data(&st, &agent.id);
+    let traffic_data = crate::web_traffic::card_data(&st, &agent.id);
 
     // An install order that is queued but that the VPS has not run yet: until it
     // does, the page says so instead of offering the button again.
@@ -1016,8 +1020,7 @@ pub async fn agent_detail(
 
         @if agent_outdated(&agent.version) {
             div class="note" style="border-left-color:var(--warn)" {
-                "Agent trên VPS này là bản " b { (agent.version) } ", cũ hơn hub (" (HUB_VERSION) "). "
-                "Một số số liệu mới (như RAM) sẽ chưa hiện cho tới khi cập nhật. Chạy trên VPS, bằng root:"
+                "Agent bản " b { (agent.version) } " cũ hơn hub (" (HUB_VERSION) "). Cập nhật trên VPS (root):"
                 pre style="margin:10px 0 0" { "curl -fsSL " (hub_base(&st)) "/install.sh | sudo sh -s -- --hub " (hub_base(&st)) " --upgrade" }
             }
         }
@@ -1027,7 +1030,7 @@ pub async fn agent_detail(
             @if aq.at == "ctl" && !aq.msg.trim().is_empty() {
                 div class="note" style="border-left-color:var(--bad);color:var(--fg)" { (aq.msg.trim()) }
             }
-            p class="help" { "Mọi thao tác áp dụng ở lần quét kế tiếp của VPS (tối đa ~15 phút), vì VPS tự gọi về hub chứ hub không gọi vào VPS." }
+            p class="help" { "Áp dụng ở lần quét kế tiếp (tối đa ~15 phút)." }
             div class="ctrls" {
                 form method="post" action={"/agent/" (agent.id) "/mode"} {
                     label class="f" {
@@ -1058,16 +1061,18 @@ pub async fn agent_detail(
                     input type="hidden" name="kind" value="hunt";
                     // PHP files are always all scanned; `days` only widens the net for other recently changed files.
                     input type="hidden" name="days" value="7";
-                    label class="f" { span class="t" { "Quét mã độc (toàn bộ file PHP)" } button type="submit" { "Quét ngay" } }
+                    label class="f" { span class="t" { "Quét mã độc" } button type="submit" { "Quét ngay" } }
                 }
                 form method="post" action={"/agent/" (agent.id) "/job"} {
                     input type="hidden" name="kind" value="undo";
                     label class="f" { span class="t" { "Hoàn tác" } button class="ghost" type="submit" { "Gỡ chặn + thả cách ly" } }
                 }
             }
-            p class="help" { "“Hoàn tác” gỡ chặn IP và thả nhốt tiến trình do agent đặt; không đụng tới việc của AI." }        }
+        }
 
-        (crate::web_ai::ai_card(&agent.id, report.as_ref(), &ai_data, if aq.at == "scan" || aq.at == "ctl" { "" } else { aq.msg.trim() }))
+        (crate::web_traffic::card(&agent.id, &traffic_data, if aq.at == "traffic" { aq.msg.trim() } else { "" }))
+
+        (crate::web_ai::ai_card(&agent.id, report.as_ref(), &ai_data, if aq.at == "scan" || aq.at == "ctl" || aq.at == "traffic" { "" } else { aq.msg.trim() }))
 
         div class="card" id="bans" {
             h2 { "IP đang bị chặn (" (bans.len() + hidden) ")" }
@@ -1086,9 +1091,7 @@ pub async fn agent_detail(
 
             @if let Some((listed, total)) = partial {
                 div class="note" style="border-left-color:var(--warn)" {
-                    "VPS này đang chặn " b { (total) } " IP nhưng chỉ gửi về hub " b { (listed) } " IP (những IP bị chặn lâu nhất). "
-                    "Phần còn lại vẫn đang bị chặn trên VPS nhưng hub không liệt kê được, nên ô lọc và ô tra cứu IP "
-                    "chỉ chắc chắn với các IP trong danh sách này."
+                    "VPS đang chặn " b { (total) } " IP, hub chỉ nhận danh sách " b { (listed) } " IP (chặn lâu nhất)."
                 }
             }
 
@@ -1103,29 +1106,44 @@ pub async fn agent_detail(
                 }
             }
 
-            div class="wrap" {
-                table {
-                    thead { tr { th { "IP" } th { "Do ai chặn" } th { "Lý do" } th { "Hết hạn" } th { "Trạng thái" } th {} } }
-                    tbody {
-                        @if filtered.is_empty() {
-                            tr { td colspan="6" { div class="empty" {
-                                @if needle.is_empty() { "Hiện không có IP nào bị chặn." } @else { "Không có IP nào khớp bộ lọc." }
-                            } } }
+            // One form for the whole page: tick boxes lift several at once, and a
+            // row's own button (its formaction) lifts just that one.
+            form method="post" action={"/agent/" (agent.id) "/unban-selected"} {
+                @if !shown.is_empty() {
+                    div class="ctrls" style="margin:0 0 10px" {
+                        label style="display:flex;gap:6px;align-items:center" {
+                            input type="checkbox" onclick="for(const c of this.form.querySelectorAll('input[name=ips]'))c.checked=this.checked";
+                            "Chọn cả trang"
                         }
-                        @for b in shown {
-                            tr {
-                                td { code { (b.ip) } }
-                                td { @if b.by_admin { span class="badge b-mut" { "Admin" } } @else { span class="badge b-mut" { "Tự động" } } }
-                                td { (if b.by_admin { "Admin đặt" } else { reason_vi(&b.reason) }) }
-                                td class="mut" { (expires_in(b.expires_at)) }
-                                td {
-                                    @if b.applied { span class="badge b-ok" { "Đang hiệu lực" } }
-                                    @else { span class="badge b-warn" { "Chờ VPS áp dụng" } }
-                                }
-                                td {
-                                    form method="post" action={"/agent/" (agent.id) "/unban"} style="margin:0" {
-                                        input type="hidden" name="ip" value=(b.ip);
-                                        button class="ghost" type="submit" { "Gỡ chặn" }
+                        button class="ghost" type="submit"
+                            onclick="return this.form.querySelector('input[name=ips]:checked')?confirm('Gỡ chặn các IP đã chọn?'):false" {
+                            "Gỡ các IP đã chọn"
+                        }
+                    }
+                }
+                div class="wrap" {
+                    table {
+                        thead { tr { th {} th { "IP" } th { "Do ai chặn" } th { "Lý do" } th { "Hết hạn" } th { "Trạng thái" } th {} } }
+                        tbody {
+                            @if filtered.is_empty() {
+                                tr { td colspan="7" { div class="empty" {
+                                    @if needle.is_empty() { "Hiện không có IP nào bị chặn." } @else { "Không có IP nào khớp bộ lọc." }
+                                } } }
+                            }
+                            @for b in shown {
+                                tr {
+                                    td { input type="checkbox" name="ips" value=(b.ip); }
+                                    td { code { (b.ip) } }
+                                    td { @if b.by_admin { span class="badge b-mut" { "Admin" } } @else { span class="badge b-mut" { "Tự động" } } }
+                                    td { (if b.by_admin { "Admin đặt" } else { reason_vi(&b.reason) }) }
+                                    td class="mut" { (expires_in(b.expires_at)) }
+                                    td {
+                                        @if b.applied { span class="badge b-ok" { "Đang hiệu lực" } }
+                                        @else { span class="badge b-warn" { "Chờ VPS áp dụng" } }
+                                    }
+                                    td {
+                                        button class="ghost" type="submit" name="ip" value=(b.ip)
+                                            formaction={"/agent/" (agent.id) "/unban"} { "Gỡ chặn" }
                                     }
                                 }
                             }
@@ -1140,7 +1158,6 @@ pub async fn agent_detail(
                     @if page < pages { a href=(bans_url(&agent.id, aq.q.trim(), page + 1)) { "Sau →" } } @else { span class="mut" { "Sau →" } }
                 }
             }
-            p class="help" { "“Chờ VPS áp dụng” = lệnh chặn đã gửi, VPS sẽ nhận ở lần quét kế tiếp (tối đa ~15 phút) rồi tự chuyển sang “Đang hiệu lực”." }
         }
 
         @if let Some(r) = &report {
@@ -1177,8 +1194,7 @@ pub async fn agent_detail(
 
             @if r.cycle.watch_blind {
                 div class="note" style="border-left-color:var(--warn)" {
-                    "Agent đang gặp vấn đề khi đọc log của web server (chi tiết ở mục Cảnh báo bên dưới). "
-                    "Trên VPS, chạy " code { "sn env" } " để xem agent đang theo dõi những file log nào, và sửa " code { "[[watch.sources]]" } " trong " code { "/etc/sn/agent.toml" } " nếu cần."
+                    "Agent không đọc được log web server (chi tiết ở Cảnh báo). Chạy " code { "sn env" } " trên VPS để kiểm tra."
                 }
             }
 
@@ -1220,14 +1236,13 @@ pub async fn agent_detail(
                         }
                     }
                 }
-                p class="help" { "“Đăng nhập thử” = số lần POST vào wp-login.php/xmlrpc.php (dấu hiệu dò mật khẩu)." }
                 p class="help" {
-                    "Ngưỡng “truy cập nhiều” tự học: "
+                    "Mức truy cập bình thường: "
                     @if r.cycle.baseline_ready {
-                        span class="badge b-ok" { "Đã học" }
+                        span class="badge b-ok" { "đã học" }
                     } @else {
-                        span class="badge b-warn" { "Đang học" }
-                        " VPS chưa học xong mức truy cập bình thường của mình; nên để “Chỉ theo dõi” tới khi mục này báo “Đã học”."
+                        span class="badge b-warn" { "đang học" }
+                        " (để “Chỉ theo dõi” tới khi học xong)"
                     }
                 }
             }
@@ -1243,11 +1258,7 @@ pub async fn agent_detail(
                             }}
                         }
                     }
-                    p class="help" {
-                        "Trung bình từ lần quét trước đến nay (không phải một thời điểm), gộp theo tài khoản và chương trình. "
-                        "Tiến trình chạy xong trước khi agent kịp nhìn sẽ không có ở đây nên tổng có thể nhỏ hơn mức CPU chung. "
-                        "Tài khoản chiếm CPU thường là site bị tấn công hoặc có mã độc: xem thêm mục “Truy cập lặp lại” và “Quét mã độc”."
-                    }
+                    p class="help" { "Trung bình từ lần quét trước, gộp theo tài khoản và chương trình." }
                 }
             }
 
@@ -1255,12 +1266,10 @@ pub async fn agent_detail(
             div class="card" {
                 h2 { "Truy cập lặp lại từ nhiều IP" }
                 @if agent_outdated(&agent.version) && r.cycle.top_shapes.is_empty() && r.cycle.top_user_agents.is_empty() {
-                    p class="help" style="margin:0" { "Chưa có số liệu: agent trên VPS này cũ (chưa gửi mục này) hoặc lần quét gần nhất chưa có truy cập động nào. Cập nhật agent nếu nghi là bản cũ." }
+                    p class="help" style="margin:0" { "Chưa có số liệu (agent cũ hoặc chưa có truy cập động)." }
                 } @else {
                     p class="help" style="margin:0 0 12px" {
-                        "Trong lần quét gần nhất có " b { (r.cycle.dynamic_requests) } " lượt truy cập động (không tính ảnh, CSS, JS). "
-                        "Bot phân tán dùng hàng trăm IP, mỗi IP chỉ vài lượt nên không bị luật theo IP bắt; điểm chung của chúng là cùng User-Agent "
-                        "hoặc cùng kiểu request (đường dẫn + tên tham số, không lưu giá trị). Mục nào tăng vọt so với bình thường sẽ có nhãn “Bất thường”."
+                        b { (r.cycle.dynamic_requests) } " lượt truy cập động ở lần quét gần nhất (không tính ảnh, CSS, JS)."
                     }
                     (pattern_table("User-Agent nhiều nhất", "User-Agent", &r.cycle.top_user_agents, &agent.id, snsec_common::waf::WafKind::UserAgent))
                     div style="height:14px" {}
@@ -1291,7 +1300,7 @@ pub async fn agent_detail(
                 h2 { "Quét mã độc" }
                 @if let Some(h) = &r.hunt {
                     p style="margin:0 0 12px" {
-                        "Lần quét cuối " b { (rel_time(h.at)) } ": đã xem " b { (h.scanned) } " file PHP trong " (h.duration_secs) " giây. "
+                        "Lần quét cuối " b { (rel_time(h.at)) } ": đã xem " b { (h.scanned) } " file (PHP, ảnh, file cấu hình) trong " (h.duration_secs) " giây. "
                         @if h.malicious == 0 && h.suspicious == 0 {
                             span class="badge b-ok" { "Không phát hiện gì" }
                         } @else {
@@ -1299,10 +1308,23 @@ pub async fn agent_detail(
                             @if h.suspicious > 0 { span class="badge b-warn" { (h.suspicious) " nghi ngờ" } }
                         }
                     }
+                    // A clean result must not read as "every picture was looked at".
+                    @if h.images_skipped > 0 {
+                        p class="help" style="margin:0 0 12px;color:var(--warn)" {
+                            b { (h.images_skipped) } " ảnh chưa được đọc vì hết thời gian dành cho ảnh trong lần quét này (PHP và file cấu hình đã quét đủ). Bấm “Quét ngay” để quét lại."
+                        }
+                    }
                 } @else if agent_outdated(&agent.version) {
-                    p class="help" style="margin:0 0 12px" { "Agent trên VPS này quá cũ nên chưa gửi kết quả quét lên hub. Cập nhật agent để thấy kết quả." }
+                    p class="help" style="margin:0 0 12px" { "Agent cũ, chưa gửi kết quả quét. Cập nhật agent." }
                 } @else {
-                    p class="help" style="margin:0 0 12px" { "Chưa có kết quả quét. VPS tự quét lúc 3 giờ sáng mỗi ngày; hoặc bấm “Quét ngay” ở mục Điều khiển phía trên." }
+                    p class="help" style="margin:0 0 12px" { "Chưa có kết quả quét (VPS tự quét 3 giờ sáng, hoặc bấm “Quét ngay”)." }
+                }
+
+                @if r.hunt.is_some() || !r.findings.is_empty() {
+                    form method="post" action={"/agent/" (agent.id) "/clear-scan"} style="margin:0 0 12px"
+                        onsubmit="return confirm('Xoá kết quả quét hiện có của VPS này khỏi hub? Lần quét mới sẽ hiện lại.')" {
+                        button class="ghost" type="submit" { "Xoá kết quả quét cũ" }
+                    }
                 }
 
                 (clamav_block(
@@ -1320,8 +1342,7 @@ pub async fn agent_detail(
                     @if let Some(h) = &r.hunt {
                         @if (h.malicious + h.suspicious) as usize > r.findings.len() {
                             p class="help" style="margin:0 0 10px" {
-                                "VPS tìm thấy " b { (h.malicious + h.suspicious) } " file nhưng chỉ gửi về hub " b { (r.findings.len()) } " file có điểm cao nhất. "
-                                "Danh sách đầy đủ có trên VPS: chạy " code { "sn hunt" } "."
+                                "Hub nhận " b { (r.findings.len()) } "/" b { (h.malicious + h.suspicious) } " file (điểm cao nhất). Đủ danh sách: " code { "sn hunt" } " trên VPS."
                             }
                         }
                     }
@@ -1346,9 +1367,7 @@ pub async fn agent_detail(
                         }
                     }
                     p class="help" {
-                        "Điểm ≥ 100 là “độc hại” (đủ chắc chắn để cách ly), 70–99 là “nghi ngờ” (cần bạn xem). "
-                        "Đây là heuristic nên có thể sai: đọc đoạn mã trích ra trước khi xử lý. Cách ly bằng " code { "sn clean --yes" }
-                        " trên VPS (chỉ file “độc hại”, khôi phục được bằng " code { "sn restore <id>" } ")."
+                        "≥ 100 độc hại, 70–99 nghi ngờ. Đọc đoạn trích trước khi xử lý; cách ly: " code { "sn clean --yes" } " (khôi phục: " code { "sn restore <id>" } ")."
                     }
                 }
             }
@@ -1378,18 +1397,14 @@ pub async fn agent_detail(
                 summary { "Thêm luật cho riêng VPS này" }
                 div style="margin-top:10px" { (crate::web_waf::add_form(&[], Some(&agent.id))) }
             }
-            p class="help" {
-                "Số lần trúng ở đây là của VPS này. Bật chặn / xoá một luật “Mọi VPS” sẽ áp cho mọi VPS. "
-                a href="/waf" { "Quản lý mọi luật WAF" }
-            }
+            p class="help" { a href="/waf" { "Quản lý mọi luật WAF" } }
         }
 
-        div class="card" id="remove" style="border-color:var(--bad)" {
-            h2 { "Xoá VPS khỏi hub" }
+        // Rarely used, so folded away.
+        details class="card" id="remove" style="border-color:var(--bad)" {
+            summary { "Xoá VPS khỏi hub" }
             p class="help" {
-                "Hub thu hồi khoá của agent (VPS không gửi báo cáo, không nhận lệnh được nữa) và xoá báo cáo, lệnh, bằng chứng, đề xuất AI của VPS này; nhật ký thao tác được giữ. "
-                "Không hoàn tác được: muốn quản lý lại thì cài agent lại bằng lệnh mới ở “Thêm VPS”. "
-                "Nên gỡ agent trên VPS trước (" code { "deploy/uninstall.sh" } "), vì xoá ở hub không gỡ được gì trên VPS: các lệnh chặn đang có vẫn còn tới khi hết hạn."
+                "Không hoàn tác được. Gỡ agent trên VPS trước (" code { "deploy/uninstall.sh" } "): các lệnh chặn đang có vẫn còn tới khi hết hạn."
             }
             form method="post" action={"/agent/" (agent.id) "/delete"} style="margin:0"
                 onsubmit="return confirm('Xoá VPS này khỏi hub? Không hoàn tác được.')" {
@@ -1596,6 +1611,102 @@ pub async fn unban_post(
     Redirect::to(&format!("/agent/{id}")).into_response()
 }
 
+/// Most addresses one "gỡ các IP đã chọn" click lifts (the hub keeps at most
+/// [`crate::db::MAX_UNBANS`] unban orders per VPS).
+const MAX_BULK_UNBAN: usize = 200;
+
+/// One percent-encoded form value: `+` is a space, `%XX` a byte.
+fn form_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'+' => out.push(b' '),
+            // Two hex digits must follow.
+            b'%' if i + 2 < b.len() => {
+                let hex = std::str::from_utf8(&b[i + 1..i + 3])
+                    .ok()
+                    .and_then(|h| u8::from_str_radix(h, 16).ok());
+                if let Some(v) = hex {
+                    out.push(v);
+                    i += 3;
+                    continue;
+                }
+                out.push(b'%');
+            }
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Every value of the field `key` in a urlencoded form body. A column of tick
+/// boxes repeats one field name, which a struct cannot take.
+pub(crate) fn form_values(body: &str, key: &str) -> Vec<String> {
+    body.split('&')
+        .filter_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            (form_decode(k) == key).then(|| form_decode(v))
+        })
+        .collect()
+}
+
+/// Clear the malware-scan results shown for a VPS (see `Db::clear_scans`).
+pub async fn clear_scan_post(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Some(r) = guard(&st, &headers) {
+        return r;
+    }
+    let msg = match st.db.lock().expect("db").clear_scans(&id, now(), "admin") {
+        Ok(()) => "Đã xoá kết quả quét cũ. VPS quét lại sẽ hiện kết quả mới.",
+        Err(_) => "Không xoá được kết quả quét.",
+    };
+    Redirect::to(&format!("/agent/{id}?msg={}&at=scan#scan", urlenc(msg))).into_response()
+}
+
+/// Lift the bans of the addresses ticked in the blocklist, in one order.
+pub async fn unban_selected_post(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: String,
+) -> Response {
+    if let Some(r) = guard(&st, &headers) {
+        return r;
+    }
+    let mut ips: Vec<String> = Vec::new();
+    for raw in form_values(&body, "ips") {
+        if let Some(ip) = crate::db::unban_target(&raw)
+            && ips.len() < MAX_BULK_UNBAN
+            && !ips.contains(&ip)
+        {
+            ips.push(ip);
+        }
+    }
+    if !ips.is_empty() {
+        let detail: String = format!("{} IP: {}", ips.len(), ips.join(", "))
+            .chars()
+            .take(200)
+            .collect();
+        let db = st.db.lock().expect("db");
+        let _ = db.update_desired(&id, now(), "admin", "unban", &detail, |d| {
+            for ip in &ips {
+                let key = key_of(ip);
+                d.bans.retain(|b| key_of(&b.ip) != key);
+                if !d.unbans.iter().any(|u| key_of(u) == key) {
+                    d.unbans.push(ip.clone());
+                }
+            }
+        });
+    }
+    Redirect::to(&format!("/agent/{id}#bans")).into_response()
+}
+
 #[derive(Deserialize)]
 pub struct ModeForm {
     mode: String,
@@ -1722,7 +1833,7 @@ pub async fn add_vps_page(State(st): State<Arc<AppState>>, headers: HeaderMap) -
                         }
                         p { button type="submit" { "Tạo lệnh cài" } }
                     }
-                    p class="help" { "Hub tạo lệnh cài và một mã dùng một lần (hết hạn sau 15 phút); bộ cài sẽ hỏi mã. VPS mới sẽ ở chế độ “Chỉ theo dõi”." }
+                    p class="help" { "Hub tạo một dòng lệnh đã kèm mã dùng một lần (hết hạn sau 15 phút): dán vào VPS là cài xong. VPS mới sẽ ở chế độ “Chỉ theo dõi”." }
                 }
             },
         )
@@ -1751,13 +1862,7 @@ pub async fn add_vps_post(
     };
     drop(db);
 
-    let base = hub_base(&st);
-    // The token is not in the command: on the VPS every local user can read a
-    // running command's arguments. The installer asks for it.
-    let install = format!(
-        "curl -fsSL {base}/install.sh | sudo sh -s -- --hub {base} --name {}",
-        sh_quote(f.name.trim()),
-    );
+    let install = install_command(&hub_base(&st), f.name.trim(), &token);
     Html(
         shell(
             "Lệnh cài",
@@ -1765,11 +1870,9 @@ pub async fn add_vps_post(
                 p { a href="/add-vps" { "← Thêm VPS khác" } }
                 h1 { "Lệnh cài cho “" (f.name) "”" }
                 div class="card" {
-                    p { "1. Đăng nhập VPS bằng " b { "root" } " và dán nguyên dòng dưới đây:" }
-                    pre { (install) }
-                    p { "2. Khi bộ cài hỏi " code { "Enroll token" } ", dán mã này:" }
-                    pre style="user-select:all;font-size:16px" { (token) }
-                    p class="help" { "Mã dùng một lần, hết hạn sau 15 phút. Mã không nằm trong lệnh để người dùng khác trên VPS không đọc được từ danh sách tiến trình. Cài xong, VPS sẽ hiện ở Tổng quan sau vài phút (chế độ “Chỉ theo dõi”)." }
+                    p { "Đăng nhập VPS bằng " b { "root" } " và dán nguyên dòng dưới đây. Một lệnh là cài xong:" }
+                    pre style="user-select:all" { (install) }
+                    p class="help" { "Lệnh chứa mã dùng một lần, hết hạn sau 15 phút, nên đừng gửi nó cho ai và không dùng lại. Mã nằm trong biến môi trường của lệnh chứ không nằm trong tham số, nên người dùng khác trên VPS không đọc được từ danh sách tiến trình. Cài xong, VPS sẽ hiện ở Tổng quan sau vài phút (chế độ “Chỉ theo dõi”)." }
                 }
                 p { a href="/" { "Về Tổng quan" } }
             },
@@ -1818,7 +1921,7 @@ fn never_ban_msg(ip: &str, why: &str) -> String {
 
 /// Canonical key an IP is tracked under: plain IPv4, or the /64 for IPv6.
 /// Anything that is not an address is compared verbatim.
-fn key_of(s: &str) -> String {
+pub(crate) fn key_of(s: &str) -> String {
     match s.trim().parse::<IpAddr>() {
         Ok(ip) => snsec_common::net::ban_key(ip),
         Err(_) => s.trim().to_string(),

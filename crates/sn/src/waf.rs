@@ -89,6 +89,13 @@ const SCAN_FILES_MAX: usize = 400;
 const SCAN_BYTES_MAX: u64 = 16 << 20;
 /// Site settings read for the notes.
 const SITES_MAX: usize = 5000;
+/// OPanel (OpenLiteSpeed) keeps ModSecurity here; see `waf_conf` for how our
+/// file is reached.
+const OPANEL_WAF_DIR: &str = "/usr/local/lsws/conf/opanel/waf";
+const OPANEL_BASE: &str = "opanel-base.conf";
+const OPANEL_CUSTOM: &str = "opanel-custom.conf";
+const OPANEL_VHOSTS: &str = "/usr/local/lsws/conf/opanel/vhosts/*/vhost.conf";
+const OLS_CONF: &str = "/usr/local/lsws/conf/httpd_config.conf";
 
 /// Where ModSecurity lives on this VPS and how to drive the web server.
 #[derive(Debug, Clone, Default)]
@@ -101,6 +108,8 @@ pub struct Layout {
     pub live: Option<PathBuf>,
     /// DirectAdmin: the copy CustomBuild puts back after a rebuild.
     pub persist: Option<PathBuf>,
+    /// OPanel: the rules file that has to `Include` ours (see `waf_conf`).
+    pub hook: Option<PathBuf>,
     /// Configuration test (`httpd -t`); `None` when the server has none.
     pub test: Option<Vec<String>>,
     pub reload: Option<Vec<String>>,
@@ -384,6 +393,9 @@ pub fn detect() -> Layout {
         out.why_none = "không nhận ra máy chủ web".into();
         return out;
     }
+    if server == "openlitespeed" && Path::new(OPANEL_WAF_DIR).join(OPANEL_BASE).is_file() {
+        return detect_opanel(out);
+    }
     let directadmin = !opts.is_empty();
     if directadmin && opts.get("modsecurity").is_none_or(|v| v != "yes") {
         out.engine = "missing".into();
@@ -442,6 +454,62 @@ pub fn detect() -> Layout {
         None
     };
     out.engine = waf_conf::engine_state(module, &engines, panel.as_deref(), directadmin).into();
+    out
+}
+
+/// OPanel on OpenLiteSpeed: the engine from its own files, our file next to
+/// them, and `opanel-custom.conf` (included by every site's rules) as the hook.
+fn detect_opanel(mut out: Layout) -> Layout {
+    let dir = Path::new(OPANEL_WAF_DIR);
+    let read = |p: &Path| fs::read_to_string(p).unwrap_or_default();
+    let (taken, mut engines) = scan_rule_dir(dir);
+    let (taken_sites, engines_sites) = scan_rule_dir(&dir.join("sites"));
+    out.taken = taken.union(&taken_sites).copied().collect();
+    engines.extend(engines_sites);
+    out.engine = waf_conf::opanel_engine(
+        &read(&dir.join(OPANEL_BASE)),
+        &read(Path::new(OLS_CONF)),
+        &engines,
+    )
+    .into();
+    let custom = dir.join(OPANEL_CUSTOM);
+    let custom_ok = fs::symlink_metadata(&custom)
+        .is_ok_and(|m| m.is_file() && m.uid() == 0 && m.mode() & 0o022 == 0);
+    if !safe_dir(dir) {
+        out.why_none = format!("{OPANEL_WAF_DIR} không phải thư mục do root sở hữu");
+    } else if !custom_ok {
+        out.why_none = format!("thiếu {OPANEL_CUSTOM} do root sở hữu trong {OPANEL_WAF_DIR}");
+    } else {
+        out.live = Some(dir.join(FILE_NAME));
+        out.hook = Some(custom);
+    }
+    let mut vhosts = Vec::new();
+    if let Ok(paths) = glob::glob(OPANEL_VHOSTS) {
+        for p in paths.filter_map(Result::ok).take(SITES_MAX) {
+            let name = p
+                .parent()
+                .and_then(Path::file_name)
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            vhosts.push((name, read(&p)));
+        }
+    }
+    let without = waf_conf::sites_without_waf(&vhosts);
+    if !without.is_empty() {
+        let mut list = without
+            .iter()
+            .take(5)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        if without.len() > 5 {
+            list.push_str(", …");
+        }
+        out.notes.push(format!(
+            "{} tên miền chưa bật WAF trong OPanel, luật không chạy ở đó: {list}",
+            without.len()
+        ));
+    }
     out
 }
 
@@ -608,10 +676,16 @@ pub fn ensure(state: &State, enforce: bool) {
     let applied: Applied = load(state, APPLIED_FILE);
     let mut local: Local = load(state, LOCAL_FILE);
     let have = layout.live.as_deref().and_then(in_place);
+    // OPanel: the panel rewriting `opanel-custom.conf` can take our line out.
+    let hook_ok = layout
+        .live
+        .as_deref()
+        .is_none_or(|l| hook_matches(&layout, l, want != NO_FILE));
     if have.as_deref() == Some(want.as_str())
         && applied.hash == want
         && applied.error.is_empty()
         && applied.pending_hash.is_empty()
+        && hook_ok
     {
         return;
     }
@@ -722,6 +796,12 @@ fn run(argv: &[String], timeout: Duration) -> (Option<i32>, String) {
 /// whose name does not match `*.conf`, readable by the web server, then a
 /// rename. Never follows a link.
 fn write_conf(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_conf_mode(path, bytes, 0o644)
+}
+
+/// [`write_conf`] with the file's permission bits given (a file of someone
+/// else's is rewritten with the bits it had).
+fn write_conf_mode(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     let dir = path.parent().context("no parent")?;
     if !safe_dir(dir) {
         anyhow::bail!("{} is not a root-owned directory", dir.display());
@@ -731,7 +811,7 @@ fn write_conf(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut f = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .mode(0o644)
+        .mode(mode)
         .custom_flags(nix::libc::O_NOFOLLOW)
         .open(&tmp)
         .with_context(|| format!("creating {}", tmp.display()))?;
@@ -765,6 +845,78 @@ fn restore(path: &Path, old: Option<&[u8]>) {
     };
     if let Err(e) = r {
         eprintln!("waf: could not put {} back: {e:#}", path.display());
+    }
+}
+
+/// The hook file as it was, to put back if an apply fails.
+struct HookState {
+    path: PathBuf,
+    bytes: Vec<u8>,
+    mode: u32,
+}
+
+fn hook_state(layout: &Layout) -> Option<HookState> {
+    let path = layout.hook.clone()?;
+    let bytes = fs::read(&path).ok()?;
+    let mode = fs::metadata(&path).ok()?.mode() & 0o777;
+    Some(HookState { path, bytes, mode })
+}
+
+/// Make the hook file include `live` (`want`) or not. A file that is already
+/// right is not touched.
+fn set_hook(h: &HookState, live: &Path, want: bool) -> Result<()> {
+    let text = std::str::from_utf8(&h.bytes)
+        .with_context(|| format!("{} is not text", h.path.display()))?;
+    if !want && !text.contains(waf_conf::HOOK_BEGIN) {
+        return Ok(());
+    }
+    let new = if want {
+        waf_conf::with_hook(text, &live.to_string_lossy())
+    } else {
+        waf_conf::without_hook(text)
+    };
+    if new.as_bytes() == h.bytes.as_slice() {
+        return Ok(());
+    }
+    write_conf_mode(&h.path, new.as_bytes(), h.mode)
+}
+
+fn restore_hook(h: &HookState) {
+    if let Err(e) = write_conf_mode(&h.path, &h.bytes, h.mode) {
+        eprintln!("waf: could not put {} back: {e:#}", h.path.display());
+    }
+}
+
+/// Is the hook as it should be: including our file when `want`, not when not?
+/// Always true where there is no hook.
+fn hook_matches(layout: &Layout, live: &Path, want: bool) -> bool {
+    let Some(h) = &layout.hook else {
+        return true;
+    };
+    let Ok(text) = fs::read_to_string(h) else {
+        return false;
+    };
+    if want {
+        waf_conf::hook_in_place(&text, &live.to_string_lossy())
+    } else {
+        !text.contains(waf_conf::HOOK_BEGIN)
+    }
+}
+
+/// Undo an apply that failed, in an order that never leaves an `Include` of a
+/// file that is missing: when it added our file and then the line, the line goes
+/// first; when it removed the line and then the file, the file comes back first.
+fn undo(live: &Path, old: Option<&[u8]>, hook: Option<&HookState>, was_adding: bool) {
+    if was_adding {
+        if let Some(h) = hook {
+            restore_hook(h);
+        }
+        restore(live, old);
+    } else {
+        restore(live, old);
+        if let Some(h) = hook {
+            restore_hook(h);
+        }
     }
 }
 
@@ -853,18 +1005,35 @@ fn swap(
         return Err("không biết cách nạp lại máy chủ web này: không áp".into());
     };
     let was_serving = serving();
-    let put = match text {
-        Some(t) => write_conf(live, t.as_bytes()),
-        None => remove_if_exists(live),
-    };
+    let adding = text.is_some();
+    let hook = hook_state(layout);
+    let put = (|| -> Result<()> {
+        match text {
+            // The file first, then the line that includes it...
+            Some(t) => {
+                write_conf(live, t.as_bytes())?;
+                if let Some(h) = &hook {
+                    set_hook(h, live, true)?;
+                }
+            }
+            // ...and the line goes before the file.
+            None => {
+                if let Some(h) = &hook {
+                    set_hook(h, live, false)?;
+                }
+                remove_if_exists(live)?;
+            }
+        }
+        Ok(())
+    })();
     if let Err(e) = put {
-        restore(live, old);
+        undo(live, old, hook.as_ref(), adding);
         return Err(format!("không ghi được {}: {e:#}", live.display()));
     }
     if let Some(test) = &layout.test {
         let (code, output) = run(test, TEST_TIMEOUT);
         if !waf_conf::test_passed(&layout.server, code, &output, FILE_NAME) {
-            restore(live, old);
+            undo(live, old, hook.as_ref(), adding);
             return Err(format!(
                 "kiểm tra cấu hình ({}) báo lỗi, đã trả lại file cũ:\n{output}",
                 test.join(" ")
@@ -898,7 +1067,7 @@ fn swap(
         None
     };
     if let Some(why) = why {
-        restore(live, old);
+        undo(live, old, hook.as_ref(), adding);
         let how = recover(layout, was_serving);
         return Err(format!("{why}\n{how}"));
     }
@@ -974,7 +1143,8 @@ pub fn apply_now(state: &State, enforce: bool) -> Result<()> {
             .filter(|b| ours(b));
         have = String::from("untested");
     }
-    if have != w.hash {
+    let hook_wrong = !hook_matches(&layout, &live, w.text.is_some());
+    if have != w.hash || hook_wrong {
         // Remember where we were, in case this run is cut short.
         let backup = match &old {
             Some(b) => state.save_file(BACKUP_FILE, b),
@@ -1076,6 +1246,21 @@ pub fn remove_all(state: &State) -> String {
             Err(e) => return format!("WAF rules NOT removed from {}: {e}", p.display()),
         }
     }
+    // OPanel: a line of ours that includes a file that is not there (the file
+    // was deleted by hand) would stop ModSecurity from loading.
+    if let (Some(h), Some(live)) = (hook_state(&layout), layout.live.as_deref())
+        && String::from_utf8_lossy(&h.bytes).contains(waf_conf::HOOK_BEGIN)
+    {
+        match set_hook(&h, live, false) {
+            Ok(()) => {
+                if let Some(reload) = &layout.reload {
+                    let _ = run(reload, RELOAD_TIMEOUT);
+                }
+                removed.push(h.path.display().to_string());
+            }
+            Err(e) => return format!("WAF hook NOT removed from {}: {e:#}", h.path.display()),
+        }
+    }
     let out = Applied {
         hash: NO_FILE.into(),
         ..Applied::default()
@@ -1101,21 +1286,35 @@ pub fn remove_all(state: &State) -> String {
 /// when ModSecurity itself is being taken away); a server that stops serving
 /// gets the file back.
 fn remove_live(layout: &Layout, p: &Path, old: &[u8]) -> Result<(), String> {
+    // OPanel: the line that includes the file goes first.
+    let hook = hook_state(layout);
+    if let Some(h) = &hook {
+        set_hook(h, p, false).map_err(|e| format!("{e:#}"))?;
+    }
+    let gone = |e: String| {
+        if let Some(h) = &hook {
+            restore_hook(h);
+        }
+        e
+    };
     let Some(reload) = &layout.reload else {
-        return remove_if_exists(p).map_err(|e| format!("{e:#}")).map(|()| {
-            eprintln!(
-                "waf: {} removed; reload the web server yourself",
-                p.display()
-            )
-        });
+        return remove_if_exists(p)
+            .map_err(|e| gone(format!("{e:#}")))
+            .map(|()| {
+                eprintln!(
+                    "waf: {} removed; reload the web server yourself",
+                    p.display()
+                )
+            });
     };
     let was_serving = serving();
-    remove_if_exists(p).map_err(|e| format!("{e:#}"))?;
+    remove_if_exists(p).map_err(|e| gone(format!("{e:#}")))?;
     let (code, output) = run(reload, RELOAD_TIMEOUT);
     if code == Some(0) && (!was_serving || wait_serving()) {
         return Ok(());
     }
-    restore(p, Some(old));
+    // The file comes back before the line that includes it.
+    undo(p, Some(old), hook.as_ref(), false);
     let how = recover(layout, was_serving);
     Err(format!(
         "nạp lại ({}) lỗi:\n{output}\n{how}",
@@ -1204,13 +1403,16 @@ pub fn status(state: &State, enforce: bool) -> WafStatus {
 pub fn describe() -> String {
     let l = detect();
     let mut s = format!(
-        "waf: server {} | modsecurity {} | rules file {} | test {} | reload {}",
+        "waf: server {} | modsecurity {} | rules file {}{} | test {} | reload {}",
         if l.server.is_empty() { "?" } else { &l.server },
         l.engine,
         l.live.as_ref().map_or_else(
             || format!("none ({})", l.why_none),
             |p| p.display().to_string()
         ),
+        l.hook
+            .as_ref()
+            .map_or_else(String::new, |h| format!(" (included from {})", h.display())),
         l.test.map_or_else(|| "none".into(), |t| t.join(" ")),
         l.reload.map_or_else(|| "none".into(), |t| t.join(" ")),
     );

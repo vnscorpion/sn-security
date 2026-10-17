@@ -399,7 +399,7 @@ fn schema_scan() -> Value {
     json!({ "type": "object", "properties": {
         "vps": vps_arg(),
         "days": { "type": "integer", "minimum": 1, "maximum": 30, "default": 1,
-            "description": "Quét file thay đổi trong bấy nhiêu ngày (file PHP luôn được quét)" }
+            "description": "Quét file thay đổi trong bấy nhiêu ngày (file PHP, ảnh và .htaccess/.user.ini luôn được quét)" }
     }, "required": ["vps"], "additionalProperties": false })
 }
 

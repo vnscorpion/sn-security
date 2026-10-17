@@ -43,6 +43,9 @@ fn ready() -> Judge {
         crawler: false,
         span: 300,
         volume_exempt: false,
+        // The ban logic is what these tests exercise; the agent itself runs
+        // with `RATE_BANS` (see `counting_alone_never_bans_in_the_agent`).
+        rate_bans: true,
     }
 }
 
@@ -1468,4 +1471,51 @@ fn user_agents_are_told_apart() {
     );
     assert_eq!(classify_ua("curl/8.5"), UaClass::Other);
     assert_eq!(classify_ua("WordPress/6.5; https://x"), UaClass::Other);
+}
+
+// ---- the agent does not ban on a count --------------------------------------
+
+#[test]
+fn counting_alone_never_bans_in_the_agent() {
+    // What the agent runs with: a flood by count only reports the address, so
+    // a busy shop, an office behind one address or a crawler is never cut off
+    // by a number. What to block is decided from the traffic, on the hub.
+    const _: () = assert!(!RATE_BANS);
+    let agent = Judge {
+        rate_bans: RATE_BANS,
+        ..ready()
+    };
+    let mut a = IpAgg::default();
+    send(
+        &mut a,
+        1,
+        "GET",
+        "/?add-to-cart=1",
+        200,
+        "python-requests/2.31",
+        5000,
+    );
+    // Under rules that do ban on a count, this is banned...
+    let h = judge(&a, &ready()).unwrap();
+    assert_eq!((h.reason, h.ban), ("rate", true));
+    // ...and under the agent's it is only reported, with nothing left to enforce.
+    let h = judge(&a, &agent).unwrap();
+    assert_eq!(
+        (h.reason, h.ban, h.escalate, h.ttl_secs, h.ttl_cap),
+        ("rate", false, false, 0, 0)
+    );
+    // Browsing past the bar, a crawler and a shared address: reported too.
+    let mut b = IpAgg::default();
+    page_view(&mut b, 1, BROWSER, "/");
+    send(&mut b, 1, "GET", "/san-pham/", 200, BROWSER, 900);
+    assert!(judge(&b, &agent).is_none_or(|h| !h.ban));
+    // A clear attack still bans on its own.
+    let mut c = IpAgg::default();
+    send(&mut c, 1, "POST", "/wp-login.php", 200, BROWSER, 40);
+    let h = judge(&c, &agent).unwrap();
+    assert_eq!((h.reason, h.ban), ("bruteforce", true));
+    let mut d = IpAgg::default();
+    send(&mut d, 1, "GET", "/.env", 404, "curl/8.5.0", 1);
+    let h = judge(&d, &agent).unwrap();
+    assert_eq!((h.reason, h.ban), ("probe", true));
 }

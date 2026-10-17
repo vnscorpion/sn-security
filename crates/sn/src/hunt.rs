@@ -17,9 +17,20 @@ use crate::state::State;
 use crate::util;
 
 const PHP_EXTS: &[&str] = &[
-    "php", "phtml", "php5", "php7", "php8", "pht", "phar", "inc", "phps",
+    "php", "phtml", "php3", "php4", "php5", "php6", "php7", "php8", "pht", "phtm", "phar", "inc",
+    "phps",
 ];
-const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "gif", "webp", "bmp", "ico", "svg"];
+/// Files that make the web server run a picture as code.
+const CONFIG_NAMES: &[&str] = &[".htaccess", ".user.ini", "php.ini", ".php.ini"];
+const CONFIG_MAX_BYTES: u64 = 256 * 1024;
+/// A picture up to this size is read whole; a larger one by its two ends, where
+/// metadata and appended payloads sit, so a gallery of big photos costs little.
+const IMAGE_WHOLE_BYTES: u64 = 2 * 1024 * 1024;
+const IMAGE_EDGE_BYTES: u64 = 512 * 1024;
+/// Pictures are read for this long at most. A media library can hold hundreds
+/// of thousands, and the unit is stopped at 30 minutes without a result: PHP and
+/// configuration files are always read, pictures are counted when left over.
+const IMAGE_BUDGET_SECS: u64 = 18 * 60;
 /// Files handed to ClamAV in one hunt.
 const MAX_CLAM_FILES: usize = crate::clamav_cache::MAX_ENTRIES;
 /// What a hunt may use in total, a little under the 30 minutes the systemd unit
@@ -62,6 +73,7 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<Vec<Finding>> 
     // The files the heuristic opened, handed to ClamAV afterwards as well.
     let mut clam_files: Vec<crate::clamav_cache::FileInfo> = Vec::new();
     let mut clam_skipped = 0u64;
+    let mut images_skipped = 0u64;
 
     for root in &roots {
         for entry in WalkDir::new(root)
@@ -79,8 +91,10 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<Vec<Finding>> 
                 .map(|e| e.to_ascii_lowercase())
                 .unwrap_or_default();
 
+            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
             let is_php = PHP_EXTS.contains(&ext.as_str());
-            let is_image = IMAGE_EXTS.contains(&ext.as_str());
+            let is_image = !is_php && heuristic::IMAGE_EXTS.contains(&ext.as_str());
+            let is_config = CONFIG_NAMES.contains(&name.as_str());
             let is_upload = is_upload_path(path);
 
             // Decide whether to open this file.
@@ -88,55 +102,85 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<Vec<Finding>> 
                 Ok(m) => m,
                 Err(_) => continue,
             };
-            if meta.len() > max_bytes {
+            // A picture of any size is looked at (by its ends when large): a
+            // payload is no less dangerous for being in a big file.
+            let cap = if is_config {
+                CONFIG_MAX_BYTES
+            } else {
+                max_bytes
+            };
+            if !is_image && meta.len() > cap {
                 continue;
             }
             let recent = file_recent(&meta, now, window);
 
-            // Always scan PHP; scan image-ext/no-ext in uploads; scan other
-            // files only if recent (deep ignores the time filter).
+            // Always scan PHP, pictures (wherever they are: a panel keeps them
+            // in public_html/images, media, assets... not only in uploads) and
+            // the files that turn pictures into code; scan other files without
+            // an extension in uploads, and other recent files, only when they
+            // hold a PHP tag (deep ignores the time filter).
             let should_scan = is_php
-                || (is_upload && (is_image || ext.is_empty()))
+                || is_image
+                || is_config
+                || (is_upload && ext.is_empty())
                 || (opts.deep && recent)
                 || (recent && is_upload);
             if !should_scan {
                 continue;
             }
+            if is_image && started.elapsed().as_secs() >= IMAGE_BUDGET_SECS {
+                images_skipped += 1;
+                continue;
+            }
 
-            let Some(bytes) = read_capped(path, max_bytes) else {
+            let bytes = if is_image {
+                read_image(path, meta.len())
+            } else {
+                read_capped(path, cap)
+            };
+            let Some(bytes) = bytes else {
                 continue;
             };
-            // For non-php candidates, require a PHP marker to avoid noise.
-            if !is_php
-                && memchr::memmem::find(&bytes, b"<?php").is_none()
-                && memchr::memmem::find(&bytes, b"<?=").is_none()
-            {
+            let score = if is_php {
+                heuristic::score_php(&bytes, is_upload, false)
+            } else if is_config {
+                heuristic::score_config(&name, &bytes)
+            } else if is_image {
+                heuristic::score_image(&name, &bytes)
+            } else if heuristic::has_php_marker(&bytes) {
+                // For other candidates, require a PHP tag to avoid noise.
+                heuristic::score_php(&bytes, is_upload, false)
+            } else {
                 continue;
-            }
+            };
 
             scanned += 1;
-            // ClamAV gets the same files. A name that is not valid UTF-8 cannot
-            // go in its text list, and the list is capped: both are counted so
-            // the summary can say the second engine saw fewer files.
-            match path.to_str() {
-                Some(p) if clam_files.len() < MAX_CLAM_FILES => {
-                    use std::os::unix::fs::MetadataExt;
-                    clam_files.push(crate::clamav_cache::FileInfo {
-                        path: p.to_string(),
-                        stamp: crate::clamav_cache::Stamp {
-                            dev: meta.dev(),
-                            ino: meta.ino(),
-                            size: meta.size(),
-                            mtime: meta.mtime(),
-                            mtime_nsec: meta.mtime_nsec(),
-                            ctime: meta.ctime(),
-                            ctime_nsec: meta.ctime_nsec(),
-                        },
-                    });
+            // ClamAV gets the PHP the heuristic opened, and any picture or
+            // configuration file it flagged (a second opinion, with a family
+            // name). Not every picture: that would crowd the PHP out of its
+            // list. A name that is not valid UTF-8 cannot go in its text list,
+            // and the list is capped: both are counted so the summary can say
+            // the second engine saw fewer files.
+            if (!is_image && !is_config) || score.verdict != Verdict::Clean {
+                match path.to_str() {
+                    Some(p) if clam_files.len() < MAX_CLAM_FILES => {
+                        use std::os::unix::fs::MetadataExt;
+                        clam_files.push(crate::clamav_cache::FileInfo {
+                            path: p.to_string(),
+                            stamp: crate::clamav_cache::Stamp {
+                                dev: meta.dev(),
+                                ino: meta.ino(),
+                                size: meta.size(),
+                                mtime: meta.mtime(),
+                                mtime_nsec: meta.mtime_nsec(),
+                                ctime: meta.ctime(),
+                                ctime_nsec: meta.ctime_nsec(),
+                            },
+                        });
+                    }
+                    _ => clam_skipped += 1,
                 }
-                _ => clam_skipped += 1,
             }
-            let score = heuristic::score_php(&bytes, is_upload, is_image && !is_php);
             if score.verdict == Verdict::Clean {
                 continue;
             }
@@ -167,6 +211,7 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<Vec<Finding>> 
         util::now_secs(),
         started.elapsed().as_secs(),
     );
+    summary.images_skipped = images_skipped;
     if clam_present && cfg.hunt.clamav == ClamavMode::Auto && !clam_files.is_empty() {
         summary.clamav_note =
             "ClamAV chưa chạy xong (bị dừng giữa chừng hoặc quá thời gian)".into();
@@ -202,6 +247,7 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<Vec<Finding>> 
             util::now_secs(),
             started.elapsed().as_secs(),
         );
+        summary.images_skipped = images_skipped;
         summary.clamav_engine = clam.engine.clone();
         summary.clamav_scanned = clam.scanned;
         summary.clamav_up_to_date = clam.up_to_date;
@@ -212,6 +258,12 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<Vec<Finding>> 
 
     if opts.print {
         print_findings(&findings, scanned);
+        if images_skipped > 0 {
+            println!(
+                "{images_skipped} ảnh chưa đọc vì hết thời gian dành cho ảnh ({} phút); PHP và file cấu hình đã quét đủ",
+                IMAGE_BUDGET_SECS / 60
+            );
+        }
         if !clam.engine.is_empty() {
             println!(
                 "ClamAV ({}): {} file, {} phát hiện",
@@ -241,6 +293,17 @@ fn store_results(state: &State, findings: &[Finding], summary: &HuntSummary) -> 
     Ok(())
 }
 
+/// Is the scan result in the state directory the work of older scoring rules
+/// (see [`heuristic::SCORER_VERSION`])? Such a result is not reported, and
+/// `sn clean` does not act on it: it could name ordinary pictures.
+#[must_use]
+pub fn result_is_stale(state: &State) -> bool {
+    std::fs::read(state.dir.join("hunt-latest.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<HuntSummary>(&b).ok())
+        .is_some_and(|s| s.scorer < heuristic::SCORER_VERSION)
+}
+
 /// Count findings by verdict into the scan summary that goes to the hub.
 pub fn summarize(findings: &[Finding], scanned: u64, at: i64, duration_secs: u64) -> HuntSummary {
     let count = |verdict: &str| {
@@ -252,6 +315,7 @@ pub fn summarize(findings: &[Finding], scanned: u64, at: i64, duration_secs: u64
         duration_secs,
         malicious: count("malicious"),
         suspicious: count("suspicious"),
+        scorer: heuristic::SCORER_VERSION,
         // Filled in by `run` once ClamAV has been consulted.
         ..HuntSummary::default()
     }
@@ -303,6 +367,22 @@ fn read_capped(path: &Path, cap: u64) -> Option<Vec<u8>> {
     let f = std::fs::File::open(path).ok()?;
     let mut buf = Vec::new();
     f.take(cap).read_to_end(&mut buf).ok()?;
+    Some(buf)
+}
+
+/// A picture's bytes: the whole file when it is small, otherwise its first and
+/// last parts joined. A payload sits in the metadata at the start or is appended
+/// after the image at the end; the middle is compressed picture data.
+fn read_image(path: &Path, len: u64) -> Option<Vec<u8>> {
+    use std::io::{Seek, SeekFrom};
+    if len <= IMAGE_WHOLE_BYTES {
+        return read_capped(path, IMAGE_WHOLE_BYTES);
+    }
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut buf = Vec::with_capacity(2 * IMAGE_EDGE_BYTES as usize);
+    (&mut f).take(IMAGE_EDGE_BYTES).read_to_end(&mut buf).ok()?;
+    f.seek(SeekFrom::End(-(IMAGE_EDGE_BYTES as i64))).ok()?;
+    f.take(IMAGE_EDGE_BYTES).read_to_end(&mut buf).ok()?;
     Some(buf)
 }
 
@@ -393,6 +473,140 @@ mod tests {
 
         assert_eq!(findings.len(), 1, "{findings:?}");
         assert!(findings[0].path.ends_with("uploads/2026/x.php"));
+        assert_eq!(findings[0].verdict, "malicious");
+    }
+
+    /// A JPEG-looking file: header, picture-like bytes, `middle`, more bytes.
+    fn jpeg(middle: &[u8], filler: usize) -> Vec<u8> {
+        let mut v = vec![0xFF, 0xD8, 0xFF, 0xE0, 0, 16, b'J', b'F', b'I', b'F', 0];
+        let mut x = 99u64;
+        let mut noise = |n: usize| -> Vec<u8> {
+            (0..n)
+                .map(|_| {
+                    x = x
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (x >> 33) as u8
+                })
+                .collect()
+        };
+        v.extend(noise(filler));
+        v.extend(middle);
+        v.extend(noise(filler));
+        v.extend([0xFF, 0xD9]);
+        v
+    }
+
+    fn shell() -> Vec<u8> {
+        ["<?php sys", "tem($_", "GET['c']); ?>"]
+            .concat()
+            .into_bytes()
+    }
+
+    fn write(dir: &std::path::Path, rel: &str, bytes: &[u8]) {
+        let p = dir.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, bytes).unwrap();
+    }
+
+    #[test]
+    fn finds_code_in_a_picture_wherever_the_panel_keeps_it() {
+        // A panel's pictures are in public_html/images, media, assets: not only
+        // in wp-content/uploads.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "public_html/images/banner.jpg",
+            &jpeg(&shell(), 4000),
+        );
+        write(dir.path(), "public_html/media/ok.jpg", &jpeg(b"", 4000));
+        write(
+            dir.path(),
+            "public_html/assets/logo.png",
+            b"\x89PNG\r\n\x1a\nxx",
+        );
+        let state_dir = tempfile::tempdir().unwrap();
+        let state = State::at(state_dir.path().to_path_buf());
+
+        let findings = run(&default_cfg(), &state, &opts(dir.path())).unwrap();
+
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].path.ends_with("images/banner.jpg"));
+        assert_eq!(findings[0].verdict, "malicious");
+        assert!(findings[0].rules.iter().any(|r| r == "php-in-image"));
+        // The clean pictures were opened too: "scanned, nothing" is not "skipped".
+        let summary: HuntSummary =
+            serde_json::from_slice(&std::fs::read(state.dir.join("hunt-latest.json")).unwrap())
+                .unwrap();
+        assert_eq!(summary.scanned, 3);
+    }
+
+    #[test]
+    fn finds_a_payload_appended_to_a_large_picture() {
+        // Over the size read whole: only its two ends are read, and the payload
+        // is at the end.
+        let dir = tempfile::tempdir().unwrap();
+        let mut big = jpeg(b"", 2_000_000);
+        big.extend(shell());
+        write(dir.path(), "site/gallery/big.jpg", &big);
+        let mut clean = jpeg(b"", 2_000_000);
+        clean.extend([0u8; 16]);
+        write(dir.path(), "site/gallery/clean.jpg", &clean);
+        let state_dir = tempfile::tempdir().unwrap();
+        let state = State::at(state_dir.path().to_path_buf());
+
+        let findings = run(&default_cfg(), &state, &opts(dir.path())).unwrap();
+
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].path.ends_with("gallery/big.jpg"));
+    }
+
+    #[test]
+    fn finds_the_files_that_turn_pictures_into_code() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "public_html/.htaccess",
+            b"AddHandler application/x-httpd-php .jpg\n",
+        );
+        write(
+            dir.path(),
+            "public_html/blog/.user.ini",
+            b"auto_prepend_file = /home/u/public_html/blog/logo.png\n",
+        );
+        write(
+            dir.path(),
+            "public_html/shop/.htaccess",
+            b"RewriteEngine On\nRewriteRule . /index.php [L]\n",
+        );
+        let state_dir = tempfile::tempdir().unwrap();
+        let state = State::at(state_dir.path().to_path_buf());
+
+        let findings = run(&default_cfg(), &state, &opts(dir.path())).unwrap();
+
+        let mut paths: Vec<&str> = findings.iter().map(|f| f.path.as_str()).collect();
+        paths.sort();
+        assert_eq!(paths.len(), 2, "{findings:?}");
+        assert!(paths[0].ends_with("public_html/.htaccess"));
+        assert!(paths[1].ends_with("blog/.user.ini"));
+        assert!(findings.iter().all(|f| f.verdict == "malicious"));
+    }
+
+    #[test]
+    fn a_file_with_the_tag_in_capitals_is_found_too() {
+        let dir = tempfile::tempdir().unwrap();
+        // Not a PHP name and not a picture, in uploads: opened because of the tag.
+        write(
+            dir.path(),
+            "site/wp-content/uploads/notes.txt",
+            ["<?PHP SYS", "TEM($_", "GET['c']); ?>"].concat().as_bytes(),
+        );
+        let state_dir = tempfile::tempdir().unwrap();
+        let state = State::at(state_dir.path().to_path_buf());
+
+        let findings = run(&default_cfg(), &state, &opts(dir.path())).unwrap();
+
+        assert_eq!(findings.len(), 1, "{findings:?}");
         assert_eq!(findings[0].verdict, "malicious");
     }
 

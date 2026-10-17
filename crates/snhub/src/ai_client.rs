@@ -1,5 +1,5 @@
 //! Talking to the language model the operator configured: any OpenAI-compatible
-//! chat endpoint (OpenAI, OpenRouter, Nous, vLLM, Ollama's `/v1`, LiteLLM, ...)
+//! chat endpoint (OpenAI, OpenRouter, Nous, LiteLLM, ...)
 //! or Anthropic's Messages API. The operator picks the endpoint, model and key
 //! on the settings page; nothing is hard-coded.
 //!

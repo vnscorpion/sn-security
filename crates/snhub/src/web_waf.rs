@@ -212,8 +212,7 @@ pub(crate) fn add_form(agents: &[AgentRow], fixed_scope: Option<&str>) -> Markup
             button type="submit" { "Thêm (chỉ ghi nhận)" }
         }
         p class="help" {
-            "Đường dẫn kết thúc bằng " code { "/" } " áp cho mọi thứ bên dưới. Công cụ quét: chữ thường, ít nhất 4 ký tự, "
-            "không được là từ mà trình duyệt thật cũng gửi (chrome, safari, mozilla…). Hub từ chối giá trị không viết được thành luật an toàn."
+            "Đường dẫn kết thúc bằng " code { "/" } " áp cho mọi thứ bên dưới. Công cụ quét: chữ thường, từ 4 ký tự, không trùng từ trình duyệt thật gửi."
         }
     }
 }
@@ -249,10 +248,8 @@ pub async fn page(
     let body = html! {
         h1 { "WAF (ModSecurity)" }
         p class="sub" {
-            "Chặn theo nội dung request (công cụ quét, đường dẫn dò file nhạy cảm, kiểu request của bot) thay vì chặn IP, "
-            "nên khách thật dùng chung IP với bot (4G, mạng công ty) không bị chặn theo. Luật mới luôn ở chế độ "
-            b { "chỉ ghi nhận" } ": request vẫn đi qua; agent so access log với luật và báo về số request khớp (bao nhiêu đã nhận 403) cùng vài ví dụ. "
-            "Xem số lần trúng và ví dụ, thấy đúng thì bấm " b { "Bật chặn" } " (trả 403)."
+            "Chặn theo nội dung request thay vì chặn IP. Luật mới chỉ " b { "ghi nhận" } ": xem số lần trúng và ví dụ, đúng thì bấm "
+            b { "Bật chặn" } " (trả 403)."
         }
         @if !q.msg.is_empty() { div class="note" { (q.msg) } }
         @if not_blocking > 0 {
@@ -271,10 +268,6 @@ pub async fn page(
                     }
                 }
             }
-            p class="help" {
-                "Agent chỉ ghi vào một file luật riêng của nó, kiểm tra cấu hình máy chủ web trước khi nạp lại, "
-                "và trả lại file cũ nếu kiểm tra lỗi."
-            }
         }
         div class="card" {
             h2 { "Luật (" (rules.len()) ")" }
@@ -288,9 +281,8 @@ pub async fn page(
                 button class="ghost" type="submit" { "Thêm gói luật cơ bản (chỉ ghi nhận)" }
             }
             p class="help" {
-                "Gói cơ bản cho mọi VPS: dò file " code { (STARTER_PATHS.join(" ")) }
-                " và công cụ quét " code { (STARTER_TOKENS.join(" ")) } ". Luật đã có thì bỏ qua. Tối đa "
-                (MAX_WAF_RULES) " luật cho một VPS."
+                "Gói cơ bản: dò file " code { (STARTER_PATHS.join(" ")) }
+                " và công cụ quét " code { (STARTER_TOKENS.join(" ")) } ". Tối đa " (MAX_WAF_RULES) " luật cho một VPS."
             }
         }
     };

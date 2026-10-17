@@ -1,4 +1,4 @@
-﻿# SN Secure
+# SN Secure
 
 [![CI](https://github.com/vnscorpion/sn-security/actions/workflows/ci.yml/badge.svg)](https://github.com/vnscorpion/sn-security/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#giấy-phép)
@@ -12,8 +12,8 @@ Một binary Rust tĩnh (`sn`, ~3 MB) cấp cứu VPS Linux đang bị mã độ
 **Cấp cứu (chạy tay, không cần hub)**
 - `triage` — ảnh chụp chỉ-đọc: top process theo CPU (đo delta 2 mẫu), exe thật/`(deleted)`, cwd, kết nối ra, persistence (cron/`ld.so.preload`/rc.local), disk/inode; gắn nhãn `miner`/`php-bot`/`ddos-l7`/`bruteforce`/`disk-full`/`mixed`/`unknown`.
 - `contain` — nhốt process nghi ngờ vào cgroup 5% CPU (**cả cgroup v2 lẫn v1**), tuỳ chọn `--freeze`; **không bao giờ kill**; loại trừ dịch vụ hệ thống theo exe thật (miner đội tên `nginx` ở `/tmp` không thoát).
-- `hunt` — quét webshell PHP bằng heuristic (source→sink, decode→eval, dropper, `preg_replace /e`, entropy, file PHP trong uploads/đuôi ảnh); nhận diện encoder thương mại (ionCube...) để tránh báo nhầm.
-- **AI xử lý sự cố**: hub nhờ mô hình AI bạn cấu hình (endpoint/model/key tuỳ ý; Hermes, Claude, OpenRouter, Ollama…) chẩn đoán từ bằng chứng agent thu thập và đề xuất hành động (cách ly file, khoá shell, gỡ dòng độc, tắt dịch vụ, dừng tiến trình), bạn duyệt hoặc cho tự xử — xem [AI xử lý sự cố](#ai-xử-lý-sự-cố-hub--agent).
+- `hunt` — quét webshell PHP bằng heuristic (source→sink, decode→eval, dropper, `preg_replace /e`, entropy); **quét cả ảnh ở mọi thư mục** (mã PHP/script nhét trong ảnh, file giả đuôi ảnh, SVG chứa script, dữ liệu nối sau ảnh) và `.htaccess`/`.user.ini` biến ảnh thành mã chạy; nhận diện encoder thương mại (ionCube...) để tránh báo nhầm.
+- **AI xử lý sự cố**: hub nhờ mô hình AI bạn cấu hình (endpoint/model/key tuỳ ý; Hermes, Claude, OpenRouter…) chẩn đoán từ bằng chứng agent thu thập và đề xuất hành động (cách ly file, khoá shell, gỡ dòng độc, tắt dịch vụ, dừng tiến trình), bạn duyệt hoặc cho tự xử — xem [AI xử lý sự cố](#ai-xử-lý-sự-cố-hub--agent).
 - **ClamAV tuỳ chọn** làm engine thứ hai cho `hunt`; hub có nút **Cài ClamAV** (agent tự chọn công thức theo hệ điều hành, mặc định tắt vì chạy trình quản lý gói bằng root) — xem [ClamAV](#clamav-engine-thứ-hai-tuỳ-chọn).
 - `clean`/`quarantine`/`restore` — cách ly file giữ nguyên owner/mode/mtime, phục hồi được.
 - `undo` — đảo ngược mọi contain/ban đã làm (log có cấu trúc `undo.jsonl`, không chạy shell).
@@ -124,15 +124,17 @@ Hub cập nhật từ bản trước: mật khẩu cũ vẫn dùng được (k�
 
 ## Thêm một VPS
 
-Trên giao diện hub bấm **"Thêm VPS"** → nhập tên → hub hiện lệnh cài và, ở ô riêng bên dưới, **token** (dùng một lần, hết hạn 15 phút). Copy lệnh, dán vào VPS. Lệnh có dạng (`HUB` = URL hub của bạn):
+Trên giao diện hub bấm **"Thêm VPS"** → nhập tên → hub hiện **một dòng lệnh** đã kèm token (dùng một lần, hết hạn 15 phút). Đăng nhập VPS bằng root, dán nguyên dòng đó là cài xong, không có bước nào khác. Lệnh có dạng (`HUB` = URL hub của bạn, `<TOKEN>` do hub điền):
 
 ```sh
-curl -fsSL https://HUB/install.sh | sudo sh -s -- --hub https://HUB --name web-01
+curl -fsSL https://HUB/install.sh | SN_ENROLL_TOKEN=<TOKEN> sudo --preserve-env=SN_ENROLL_TOKEN sh -s -- --hub https://HUB --name web-01
 ```
 
-Bộ cài hỏi token: dán token vào khi được hỏi. Token không nằm trên dòng lệnh nào nên các user khác trên VPS không đọc được qua danh sách tiến trình (`ps`, `/proc`), và sudo không ghi nó vào nhật ký; bộ cài chuyển nó cho `sn enroll` qua biến môi trường `SN_ENROLL_TOKEN` (chỉ root đọc được). Trên máy hub, `snhub add-vps --name web-01` in lệnh cùng dạng và token ở dòng `Token:` riêng.
+Token nằm trong **biến môi trường** của `sudo`, không nằm trong tham số dòng lệnh, nên các user khác trên VPS không đọc được qua danh sách tiến trình (`ps`); bộ cài chuyển nó cho `sn enroll` cũng qua biến môi trường (chỉ root đọc được). Hai chỗ token vẫn còn dấu vết: nhật ký của sudo (`ENV=SN_ENROLL_TOKEN=…`, chỉ root và nhóm `adm` đọc được) và history của shell người dán. Token dùng một lần, hết hạn sau 15 phút và vô hiệu ngay khi VPS enroll xong, nên các dấu vết đó hết giá trị; đừng gửi dòng lệnh cho người khác trước khi dùng. Trên máy hub, `snhub add-vps --name web-01` in đúng dòng lệnh này.
 
-**Cài tự động (không có terminal):** gán token cho `SN_ENROLL_TOKEN` bằng `export` trong shell hoặc script chạy bộ cài, không bao giờ đặt nó trên một dòng lệnh, rồi:
+Bộ cài vẫn tự hỏi token trên terminal nếu bạn chạy lệnh **không có** `SN_ENROLL_TOKEN=…` (dạng cũ `curl … | sudo sh -s -- --hub … --name …`).
+
+**Cài tự động (không có terminal):** gán token cho `SN_ENROLL_TOKEN` bằng `export` trong shell hoặc script chạy bộ cài (không đặt nó trong tham số của một lệnh), rồi:
 
 - chạy bằng root (shell root, script cloud-init), không qua sudo:
   ```sh
@@ -214,13 +216,15 @@ Mỗi chu kỳ (~5 phút) agent đếm các dòng log mới theo **từng IP** (
 | `bad_ua` | UA công cụ tấn công (sqlmap, nikto, masscan, nmap, zgrab, dirbuster, wpscan, acunetix, nuclei, havij) trên **≥ 3** request, hoặc trên một request bị trả 4xx | 1 giờ, leo thang |
 | `bad_ua` | **> 50** request không có UA mà **ít nhất một nửa** bị trả 4xx (UA rỗng nhưng trả lời bình thường, như job đồng bộ gọi REST API, để luật `rate` lo) | 24 giờ, leo thang |
 | `probe` (từ trình duyệt) | **3 loại** đường dẫn dò khác nhau (`.env`, `.git`, phpMyAdmin...; nhiều file của một loại chỉ tính một), hoặc một đường dẫn dò kèm ≥ 10 lỗi 4xx trang trên ≥ 10 đường dẫn, với UA trình duyệt | 10 phút, **không** leo thang (một trang web có thể khiến trình duyệt của khách gửi đúng như vậy) |
-| `rate` | Request động của IP trên website bận nhất ≥ **ngưỡng × số người sau IP** (bên dưới). IP đang **duyệt web như người thật** (UA trình duyệt, nhiều trang khác nhau) chỉ bị chặn khi gấp **≥ 3 ×** mức đó, chạm trần tuyệt đối hay flood 404 tài nguyên; dưới đó **chỉ báo** (bot giả trình duyệt thì chặn bằng [WAF](#chặn-bằng-waf-modsecurity) theo UA hay kiểu request) | 10 phút, leo thang (bên dưới) |
+| `rate` | Request động của IP trên website bận nhất ≥ **ngưỡng × số người sau IP** (bên dưới). IP đang **duyệt web như người thật** (UA trình duyệt, nhiều trang khác nhau) chỉ bị chặn khi gấp **≥ 3 ×** mức đó, chạm trần tuyệt đối hay flood 404 tài nguyên; dưới đó **chỉ báo** (bot giả trình duyệt thì chặn bằng [WAF](#chặn-bằng-waf-modsecurity) theo UA hay kiểu request) | **chỉ báo, không chặn** (từ 0.10.1) |
 | `xmlrpc_pingback` | **> 3** request `xmlrpc.php` với UA `WordPress/` | chỉ báo, **không chặn** |
 | `probe` (lẻ) | Một đường dẫn dò từ trình duyệt (hoặc từ crawler đã xác minh), IP có ≤ 20 request | chỉ báo, **không chặn** |
 
 **Request động** = trang, API, form, `admin-ajax.php`, sitemap: **không** tính ảnh, CSS, JS, font, video/âm thanh (cả đoạn HLS/DASH `.ts`, `.m4s`, `.m3u8`, `.mpd`), PDF, và câu trả lời 206 (tải từng đoạn) hay 304 (dùng bản trong cache). Một lượt xem trang WooCommerce kéo 60–100 file nhưng chỉ vài request động.
 
 Các mức trên viết cho chu kỳ 5 phút; chu kỳ dài hơn (timer trễ, 5–60 phút log) thì mọi mức nhân theo độ dài.
+
+> **Từ 0.10.1, agent không chặn IP chỉ vì đếm số request.** Một con số không phân biệt được cửa hàng đang đông khách, văn phòng hay nhà mạng dùng chung một IP, crawler với một cuộc flood. Luật `rate` chỉ **báo** (mục "Chỉ ghi nhận, không chặn" và số liệu gửi về hub); chặn gì do AI trên hub quyết định từ nội dung traffic ([AI phân tích traffic](#ai-phân-tích-traffic)) hoặc do bạn. Chỉ tấn công rõ ràng từ thứ được yêu cầu (dò mật khẩu, dò `.env`/`.git`, công cụ tấn công) vẫn tự chặn. Phần dưới mô tả cách `rate` tính ngưỡng để báo.
 
 **Ngưỡng của `rate`** = `max(min_requests, k × mức bình thường)`, không bao giờ quá **3000** (trừ khi `min_requests` cao hơn):
 - `min_requests` mặc định **300** request động / website / chu kỳ (khoảng 1 request/giây liên tục), `k` mặc định **5** (chỉnh trong `[watch]` của `/etc/sn/agent.toml`). Bản cài cũ ghi `min_requests = 120` (khi đó đếm mọi dòng log); `--upgrade` tự đổi đúng giá trị cũ đó thành 300, giá trị bạn tự đặt thì giữ nguyên.
@@ -252,8 +256,8 @@ Các mức trên viết cho chu kỳ 5 phút; chu kỳ dài hơn (timer trễ, 5
 Luật cố định không viết hết được các biến thể kiểu: miner giả tiến trình `[kworker/0:1Z]`, mã độc cài trong `.bashrc`, công cụ đào trong `/dev/shm`, đăng nhập SSH lạ, cổng 111 mở công khai. Hub vì thế có thể nhờ một mô hình AI do bạn cấu hình làm "bộ não": agent thu thập bằng chứng, AI chẩn đoán và đề xuất hành động, bạn duyệt (hoặc cho phép tự xử), agent thực hiện.
 
 **1. Cài đặt AI (`/settings` trên hub).** Tự nhập **endpoint, model, API key**, không gắn cứng nhà cung cấp nào:
-- **OpenAI-compatible**: Hermes (Nous Portal, OpenRouter, vLLM, Ollama `/v1`, LiteLLM…), OpenAI… Nhập địa chỉ gốc (ví dụ `https://openrouter.ai/api/v1`) hoặc đầy đủ tới `/chat/completions`.
-- **OpenAI Responses API** (`wire_api = "responses"` trong Codex): endpoint `…/v1/responses`, gửi `instructions` + `input`. Hub đọc được cả câu trả lời dạng `output_text`/`output[]` lẫn dạng chat, và cả luồng SSE. Hermes chạy trên máy bạn thì dùng `http://127.0.0.1:11434/v1`, key có thể để trống.
+- **OpenAI-compatible**: Hermes (Nous Portal), OpenRouter, LiteLLM…, OpenAI… Nhập địa chỉ gốc (ví dụ `https://openrouter.ai/api/v1`) hoặc đầy đủ tới `/chat/completions`.
+- **OpenAI Responses API** (`wire_api = "responses"` trong Codex): endpoint `…/v1/responses`, gửi `instructions` + `input`. Hub đọc được cả câu trả lời dạng `output_text`/`output[]` lẫn dạng chat, và cả luồng SSE.
 - **Anthropic (Claude)**: để trống endpoint thì dùng `api.anthropic.com`.
 - Có nút **Thử kết nối**, đặt mặc định, sửa (để trống key = giữ key cũ), xoá. Dưới mỗi nhà cung cấp hub hiện **URL sẽ gọi**; khi lỗi, thông báo nêu mã HTTP, loại nội dung, URL đã gọi và đoạn đầu phản hồi. “Phản hồi không phải JSON … trang web (HTML)” gần như luôn là endpoint sai (thiếu `/v1`, hoặc trỏ vào giao diện web của dịch vụ thay vì API); hub không theo chuyển hướng (để không gửi key sang máy khác) nên báo địa chỉ đích để bạn nhập lại. API key lưu nguyên văn trong file SQLite của hub (chỉ user chạy hub đọc được) vì hub phải dùng nó; trang chỉ hiện 4 ký tự cuối.
 
@@ -262,7 +266,7 @@ Luật cố định không viết hết được các biến thể kiểu: miner
 2. Hub gửi bằng chứng cho AI. AI trả về chẩn đoán và danh sách hành động; hub loại những đề xuất không hợp lệ.
 3. Bạn thấy chẩn đoán, từng hành động kèm **mức rủi ro** và lý do, rồi bấm **Thực hiện** từng việc hoặc **Thực hiện tất cả**. Hub gửi một lệnh ký số cho agent; kết quả từng hành động hiện lại trong khung.
 
-**Bằng chứng agent thu thập** (`sn evidence`): tiến trình đáng ngờ (kể cả tên giả tiến trình nhân `[kworker]` nhưng có chương trình thật), kết nối ra ngoài, các **dòng đáng ngờ** trong file khởi động shell của các tài khoản (`.bashrc`, `.profile`, `.zshrc`… không gửi cả file), cron và `ld.so.preload`, `authorized_keys` (không gửi khoá), chương trình biên dịch/thực thi lạ trong `/dev/shm`, `/tmp`, `/var/tmp` và thư mục ẩn trong home, các lần đăng nhập SSH thành công gần đây, cổng đang lắng nghe ngoài loopback, tài khoản có shell. **Không** gửi nội dung website hay database. **Lưu ý:** dòng lệnh tiến trình và các dòng khởi động/cron có thể chứa mật khẩu hoặc token gõ trên dòng lệnh; agent che các dạng phổ biến (`password=…`, `--token`, `-pMẬT_KHẨU`, `user:pass@host`, `Bearer …`) nhưng **không đảm bảo che hết**, và bằng chứng cũng lưu trong database của hub. Muốn tránh gửi ra ngoài thì dùng model chạy trên máy bạn. Xem đúng những gì AI nhận được ở `/agent/<id>/evidence.json`.
+**Bằng chứng agent thu thập** (`sn evidence`): tiến trình đáng ngờ (kể cả tên giả tiến trình nhân `[kworker]` nhưng có chương trình thật), kết nối ra ngoài, các **dòng đáng ngờ** trong file khởi động shell của các tài khoản (`.bashrc`, `.profile`, `.zshrc`… không gửi cả file), cron và `ld.so.preload`, `authorized_keys` (không gửi khoá), chương trình biên dịch/thực thi lạ trong `/dev/shm`, `/tmp`, `/var/tmp` và thư mục ẩn trong home, các lần đăng nhập SSH thành công gần đây, cổng đang lắng nghe ngoài loopback, tài khoản có shell. **Không** gửi nội dung website hay database. **Lưu ý:** dòng lệnh tiến trình và các dòng khởi động/cron có thể chứa mật khẩu hoặc token gõ trên dòng lệnh; agent che các dạng phổ biến (`password=…`, `--token`, `-pMẬT_KHẨU`, `user:pass@host`, `Bearer …`) nhưng **không đảm bảo che hết**, và bằng chứng cũng lưu trong database của hub. Muốn tránh gửi ra ngoài thì dùng endpoint do chính bạn quản lý. Xem đúng những gì AI nhận được ở `/agent/<id>/evidence.json`.
 
 **Hành động AI được phép đề xuất** (danh sách đóng, không có "chạy lệnh tuỳ ý"):
 
@@ -288,6 +292,16 @@ Luật cố định không viết hết được các biến thể kiểu: miner
 **4. Trên VPS không cần cài đặt gì thêm.** Agent đã cài thì **hub quyết định**: thu thập bằng chứng, thực hiện hành động của AI, cài ClamAV, quét, hoàn tác, đổi chế độ đều chạy theo lệnh từ hub, không có cờ hay tham số nào phải thêm. (Lệnh vẫn được ký bằng khoá của hub và nằm trong danh sách hành động cố định.) Muốn riêng một VPS chỉ báo cáo mà không nhận lệnh, đặt `hub_orders = false` trong `[remote]` của `/etc/sn/agent.toml`. Các cờ cũ `--allow-clamav-install` và `--allow-remote-fix` không còn tác dụng (vẫn chấp nhận để lệnh cũ không lỗi), và `--upgrade` tự xoá các dòng `allow_*` cũ khỏi cấu hình. **Hệ quả cần biết:** ai điều khiển được hub thì điều khiển được cả đội VPS, nên bảo vệ đăng nhập hub (mật khẩu mạnh, 2FA) là việc quan trọng nhất.
 
 **Giới hạn đã biết:** các luật kiểm tra (đặc biệt "đáng ngờ" của dòng `.bashrc`, tiến trình giả danh) là heuristic nên có thể bỏ sót hoặc báo thừa; chưa chặn IP bằng ipset/firewall toàn cổng (nft của agent chỉ chặn cổng web) và chưa tự chặn bot ở Nginx của DirectAdmin; AI có thể chẩn đoán sai, nên đọc kỹ trước khi duyệt. **Chưa thử trên VPS thật.**
+
+## AI phân tích traffic
+
+Agent chỉ báo (`rate`) chứ không chặn theo số request, nên việc **quyết định chặn gì** là của AI cấu hình ở hub (cùng nhà cung cấp với [AI xử lý sự cố](#ai-xử-lý-sự-cố-hub--agent); Hermes chạy trên chính máy hub thì đặt endpoint `http://127.0.0.1:...`). Khung **"AI phân tích traffic"** trên trang VPS:
+
+- **Khi nào chạy:** tự chạy khi báo cáo có điều bất thường (IP agent đã báo, User-Agent hay kiểu request bị gắn "Bất thường", cảnh báo CPU cao, bot, flood...), tối đa **15 phút một lần** mỗi VPS và chỉ khi mức tự xử lý khác "Tắt"; hoặc bấm **Phân tích traffic**. Đang có đề xuất chờ duyệt thì không hỏi thêm.
+- **AI nhận gì:** bản tóm tắt một chu kỳ (top IP với số request/4xx/đăng nhập thử, User-Agent và kiểu request nhiều nhất kèm số IP khác nhau, IP agent đã báo, luật WAF và lệnh chặn đang có, cảnh báo). Mọi chuỗi lấy từ traffic được làm sạch và đặt trong vùng "dữ liệu không tin cậy" để chữ do kẻ tấn công viết không ra lệnh được cho AI.
+- **AI được đề xuất gì:** *luật WAF* (chỉ ghi nhận, chưa chặn gì) hoặc *chặn một IP* 5–60 phút. Hub kiểm tra lại: luật phải viết được thành luật an toàn và chưa có; IP phải là IP có trong tóm tắt và hub được phép chặn (không Cloudflare, mạng nội bộ, CGNAT); tối đa 5 luật và 5 IP mỗi lần; mọi thứ khác bị loại và ghi rõ lý do.
+- **Ai bấm:** mặc định **chờ bạn bấm** "Áp dụng" từng việc hoặc tất cả. Mức *Tự xử lý việc hoàn tác được* tự thêm **luật WAF** (luật chỉ ghi nhận, bạn vẫn là người bật chặn ở menu WAF); chỉ mức *Tự xử lý tất cả* mới tự **chặn IP**. Mọi việc ghi ở Nhật ký (`ai-auto` hoặc `admin`).
+- **Chi phí:** mỗi lần phân tích là một lượt gọi mô hình. Hub giới hạn 15 phút/VPS và 3 lượt cùng lúc trên cả đội.
 
 ## Kết nối Hermes (MCP)
 
@@ -335,6 +349,7 @@ Chặn theo **nội dung request** thay vì theo IP: công cụ quét (`sqlmap`,
 
 **Trên VPS agent làm gì:**
 - Tìm ModSecurity theo máy chủ web (DirectAdmin: `webserver` trong `options.conf`; Apache dùng ModSecurity 2, nginx và OpenLiteSpeed dùng libmodsecurity 3, LiteSpeed Enterprise dùng engine riêng đọc cấu hình Apache). Ghi **một file của riêng nó**, `zz-sn-secure.conf`, vào thư mục luật mà cấu hình đã nạp sẵn (`/etc/modsecurity.d/` trên DirectAdmin), kèm một bản ở `custombuild/custom/modsecurity/conf/` để `da build modsecurity` không xoá mất. Không sửa file nào khác của máy chủ web hay của DirectAdmin; file trùng tên mà không phải của SN Secure thì không ghi đè.
+- **OPanel (OpenLiteSpeed):** agent nhận ra bố cục của OPanel (`/usr/local/lsws/conf/opanel/waf/`) và báo đúng trạng thái ModSecurity. OPanel không nạp cả một thư mục luật, nên agent ghi `zz-sn-secure.conf` cạnh các file của OPanel và giữ **một khối** `# BEGIN SN Secure … # END SN Secure` với một dòng `Include` trong `opanel-custom.conf` (file luật chung mà mọi site đều nạp). Khối chỉ có khi hub có luật và bị gỡ khi hết luật; `sn disable` cũng gỡ nó; nếu OPanel ghi đè file làm mất khối thì chu kỳ sau agent đặt lại. Đây là chỗ duy nhất agent sửa file của OPanel (luật của OPanel dùng id từ 1000000, của hub 60000–69999, không đụng nhau). Site chưa bật WAF trong OPanel thì luật không chạy ở đó: hub báo tên các site này.
 - Hub chỉ gửi **dữ liệu** (loại luật + giá trị); agent tự dựng câu `SecRule` từ mẫu cố định. Giá trị chỉ được chứa ký tự an toàn (không `"`, `\`, `%{…}`, ký tự điều khiển), có giới hạn độ dài, và không được là thứ khách thật cũng gửi: User-Agent nguyên bản của trình duyệt, từ như `chrome`, `x86_64`, `15e148`, tên crawler, thư mục như `/wp-content/` (chỉ thư mục ẩn như `/.git/` mới được chặn cả thư mục), `/?s` (tìm kiếm WordPress). Hub bị chiếm cũng không chèn được `SecRuleEngine Off`, `exec:` hay `Include` vào cấu hình.
 - Ghi file xong thì kiểm tra cấu hình (`httpd -t`, `nginx -t`, `openlitespeed -t`; thiếu lệnh kiểm tra thì không áp), nạp lại nhẹ (`systemctl reload …`), xem máy chủ còn nghe cổng 80/443 không; LiteSpeed Enterprise (không có lệnh kiểm tra) thì đọc log của nó sau khi nạp lại. Lỗi ở bất kỳ bước nào: **trả lại file cũ** và nạp lại (máy chủ vẫn không chạy thì khởi động lại), báo lỗi lên hub, một giờ sau mới thử lại. Lần áp bị cắt ngang (khởi động lại máy giữa chừng) được kiểm tra lại từ đầu.
 - Bỏ qua luật có id trùng với file luật khác (id trùng làm máy chủ web không khởi động được). Id luật của hub: 60000–69999.
@@ -352,7 +367,7 @@ Chặn theo **nội dung request** thay vì theo IP: công cụ quét (`sqlmap`,
 
 ## Quét mã độc
 
-`sn hunt` quét **toàn bộ file PHP** trong `[hunt] allowed_roots` (mặc định `/home` và `/var/www`), cộng file `.php` giả đuôi ảnh trong `uploads/`. Mỗi file được chấm điểm bằng heuristic; **≥ 100 là "độc hại"**, **70–99 là "nghi ngờ"**.
+`sn hunt` quét trong `[hunt] allowed_roots` (mặc định `/home` và `/var/www`): **toàn bộ file PHP**, **mọi file ảnh** (ở bất kỳ thư mục nào, không chỉ `uploads/`) và các file cấu hình `.htaccess`, `.user.ini`, `php.ini`. Mỗi file được chấm điểm bằng heuristic; **≥ 100 là "độc hại"**, **70–99 là "nghi ngờ"**. Cách chấm ảnh và cấu hình ở mục [Ảnh và file cấu hình](#ảnh-và-file-cấu-hình).
 
 ```sh
 sn hunt                 # quét ngay, in kết quả
@@ -361,23 +376,58 @@ sn clean --yes          # cách ly các file "độc hại" (khôi phục đư�
 
 Ba cách chạy: **tự động lúc 3 giờ sáng** (timer `sn-hunt`, ưu tiên CPU/IO thấp), **bấm "Quét ngay" trên hub**, hoặc chạy tay như trên. Kết quả (số file đã quét, số độc hại/nghi ngờ, danh sách file kèm đoạn mã trích ra) hiện ở mục **Quét mã độc** trên trang VPS; có file độc hại thì hub báo cảnh báo khẩn. Trang cũng cho biết "đã quét, không có gì" khác với "chưa quét lần nào". Danh sách hiện 10 file mỗi trang, và có thể **tải xuống**: CSV (tất cả file, kèm điểm, dấu hiệu khớp, đoạn mã trích, sha256; các ô bắt đầu bằng `=`, `+`, `-`, `@` được thêm dấu `'` để Excel không chạy chúng như công thức) hoặc `.txt` chỉ gồm đường dẫn các file "độc hại", mỗi dòng một file. VPS chỉ gửi về hub tối đa 100 file điểm cao nhất mỗi lần; muốn đủ danh sách thì chạy `sn hunt` trên VPS. Danh sách IP đang bị chặn cũng hiện 10 IP mỗi trang.
 
-**Nó bắt được gì:** request đi thẳng vào lệnh chạy mã/lệnh hệ thống (`eval`, `system`, `exec`, `call_user_func`...), biến lấy từ request rồi đưa vào các lệnh đó, request quyết định tên hàm được gọi, `eval` của dữ liệu đã giải mã (base64/gzinflate...), `preg_replace` với modifier `/e`, file ghi dữ liệu từ request ra đĩa, file PHP trong `uploads/` hoặc đuôi ảnh, blob base64/entropy cao.
+**Kết quả quét cũ.** Mỗi kết quả quét ghi kèm phiên bản bộ chấm (`scorer`). Khi agent được nâng cấp lên bản có bộ chấm mới, nó **tự bỏ** kết quả do bộ chấm cũ tạo ra: không báo lên hub, và `sn clean` từ chối hành động trên đó (bộ chấm cũ từng gọi ảnh thường là mã độc), nên không phải dọn tay trên VPS. Trên hub, nút **Xoá kết quả quét cũ** (trang VPS, mục Quét mã độc) hoặc `snhub clear-scans [--vps TÊN]` bỏ ngay kết quả đang hiện cùng cảnh báo `malware_found` đi kèm; kết quả của lần quét kết thúc trước lúc xoá không hiện lại dù agent gửi lại, còn lần quét mới thì hiện bình thường. Thứ tự gọn nhất: cập nhật hub, nâng cấp từng VPS (`install.sh --upgrade`), rồi `snhub clear-scans`.
+
+**Nó bắt được gì:** request đi thẳng vào lệnh chạy mã/lệnh hệ thống (`eval`, `system`, `exec`, `call_user_func`...), biến lấy từ request rồi đưa vào các lệnh đó, request quyết định tên hàm được gọi, `eval` của dữ liệu đã giải mã (base64/gzinflate...), `preg_replace` với modifier `/e`, file ghi dữ liệu từ request ra đĩa, file PHP trong `uploads/`, blob base64/entropy cao; cùng với đó là ảnh chứa mã và file cấu hình biến ảnh thành mã (mục [Ảnh và file cấu hình](#ảnh-và-file-cấu-hình)).
 
 **Độ chính xác đã đo, và chưa đo:**
 - **Báo nhầm:** 0 trên **9.024 file PHP hợp lệ** (lõi WordPress, WooCommerce, Yoast SEO, Contact Form 7, Elementor). Con số này đo bằng công cụ `cargo run -p snsec-common --release --example scan_dir -- <thư mục>`, chạy lại mỗi khi sửa bộ chấm điểm. Phiên bản đầu từng báo nhầm 10 file "độc hại" trên cùng bộ này (kể cả file lõi WordPress); đã sửa.
 - **Phát hiện:** mới kiểm trên các mẫu tự dựng của những dạng web shell phổ biến. **Chưa kiểm trên bộ mã độc thật**, nên không có số liệu tỷ lệ bắt được. Kết quả "sạch" không phải bằng chứng máy không bị nhiễm.
 
-**Giới hạn:** chỉ quét file PHP (không quét database, không quét mã JavaScript bị chèn, không đối chiếu checksum lõi/plugin của WordPress); web shell dựng tên hàm bằng cách nối chuỗi (`$f = 'ev'.'al'; $f($x)`) chưa bắt được; file lớn hơn `max_file_mb` (5 MB) bị bỏ qua. `sn clean --yes` chỉ cách ly file "độc hại"; file "nghi ngờ" luôn để bạn xem tay. Heuristic có thể sai, nên đọc đoạn mã trích ra trước khi cách ly.
+**Giới hạn:** ngoài PHP, ảnh và các file cấu hình ở trên, không quét database, không quét JavaScript bị chèn vào file `.js`/`.html`, không đối chiếu checksum lõi/plugin của WordPress; web shell dựng tên hàm bằng cách nối chuỗi (`$f = 'ev'.'al'; $f($x)`) chưa bắt được; file PHP lớn hơn `max_file_mb` (5 MB) bị bỏ qua. `sn clean --yes` chỉ cách ly file "độc hại"; file "nghi ngờ" luôn để bạn xem tay. Heuristic có thể sai, nên đọc đoạn mã trích ra trước khi cách ly.
+
+### Ảnh và file cấu hình
+
+Ảnh là chỗ giấu mã quen thuộc: không ai mở ra xem, và chỉ cần một dòng trong `.htaccess` (hoặc `.user.ini`) là web server chạy nó như PHP. Vì vậy `hunt` đọc **mọi ảnh** (`jpg`, `jpeg`, `png`, `gif`, `webp`, `bmp`, `ico`, `svg`, `tiff`, `avif`, `heic`...) ở mọi thư mục dưới `allowed_roots`, dù panel (OPanel, BPanel, SNPanel, DirectAdmin...) để ảnh ở `public_html/images`, `media`, `assets`... chứ không riêng `wp-content/uploads`. Loại file được nhận bằng **byte đầu của file**, không tin đuôi tên.
+
+| Dấu hiệu | Điểm | Ghi chú |
+| --- | --- | --- |
+| `php-in-image` | 70 | Có thẻ mở PHP (`<?php`, `<?=`, `<script language="php">`) và sau nó là text đọc như mã. Không phân biệt hoa thường (`<?PHP`). Phần mã quanh thẻ được chấm tiếp bằng bộ chấm PHP: có `system($_GET[..])` thì cộng 100 thành "độc hại" |
+| `executable-as-image` | 100 | File chương trình (ELF, `.exe`, script `#!`) đội tên ảnh |
+| `archive-as-image` | 70 | zip/rar/gzip/7z đội tên ảnh |
+| `text-in-image-name` | 40 | Đuôi ảnh nhưng nội dung là text (trang HTML, script). Trang lỗi 404 lưu nhầm thành `.jpg` ở mức này là chưa báo; có thẻ PHP hay script thì cộng thêm |
+| `double-extension` | 40 | `shell.php.jpg`: server map đuôi ở bất kỳ vị trí nào sẽ chạy nó |
+| `script-in-image`, `remote-script`, `event-handler-in-image`, `javascript-uri`, `embedded-frame`, `data-html-uri` | 30–50 | Script trong SVG hoặc trong metadata của ảnh (`<script>`, `onload=`, `javascript:`, `<iframe>`...) |
+| `js-obfuscation`, `js-exfil-redirect` | 50, 30 | `eval(`, `atob(`, `fromCharCode`... và `document.cookie`, `window.location`, `fetch(`..., **chỉ tính khi đã có script** (thẻ, handler hoặc `javascript:`), nên chữ "fetch(" trong một đoạn văn không bị tính |
+| `appended-text`, `appended-code` | 40, 40 | Có đoạn text ở cuối ảnh thật (sau dữ liệu ảnh luôn là binary). Chỉ riêng việc có text là chưa báo; kèm từ khoá mã thì thành "nghi ngờ" |
+
+Ảnh ≤ 2 MB được đọc hết; ảnh lớn hơn được đọc phần đầu và phần cuối (512 KB mỗi đầu), là nơi metadata và dữ liệu nối thêm nằm. Phần ảnh dùng tối đa **18 phút** mỗi lần quét (PHP và file cấu hình luôn được quét đủ); ảnh chưa kịp đọc được đếm và hub báo "N ảnh chưa được đọc". Ảnh nghi ngờ hay độc hại được đưa thêm cho ClamAV; ảnh sạch thì không (để không chiếm chỗ của file PHP).
+
+Dữ liệu ảnh nén có thể tình cờ chứa `<?=` hay `eval(`, nên thẻ PHP chỉ tính khi sau nó là text đọc như mã (không phải vài byte rồi tới dữ liệu ảnh), và chữ script chỉ tính khi có script.
+
+**File cấu hình** (`.htaccess`, `.user.ini`, `php.ini`):
+
+| Dấu hiệu | Điểm | Ví dụ |
+| --- | --- | --- |
+| `config-image-as-code` | 100 | `AddHandler application/x-httpd-php .jpg`, hoặc `SetHandler`/`ForceType` kiểu PHP trong khối `<FilesMatch "\.(jpg\|png)$">` |
+| `config-auto-include-nonphp` | 100 | `auto_prepend_file`/`auto_append_file` trỏ tới file không phải PHP (ảnh, `.txt`): mọi trang PHP của site sẽ chạy nội dung ảnh đó |
+| `config-auto-include-odd-path` | 80 | `auto_prepend_file` trỏ tới file PHP nằm trong `uploads/`, `cache/`, `tmp/` hoặc thư mục ẩn. Plugin bảo mật (Wordfence...) trỏ tới file PHP của chính nó ở thư mục thường thì **không** báo |
+| `config-data-as-code` | 60 | Map `.txt`, `.css`, `.js`, `.pdf`... sang PHP |
+| `config-allow-url-include` | 50 | `allow_url_include = On` |
+
+`AddHandler ... .html .htm` (nhiều site chạy PHP trong `.html`), cấu hình PHP-FPM (`SetHandler proxy:...` cho `\.php$`), khối `AddHandler ...ea-php74___lsphp .php` của cPanel và các luật rewrite của WordPress không bị báo.
+
+**Độ chính xác đã đo, và chưa đo:** báo nhầm **0 trên khoảng 26.800 ảnh thật** (PNG, ICO, SVG, JPG, GIF... lấy từ Windows, các chương trình cài sẵn và bộ tài liệu Rust). Đo bằng `cargo run -p snsec-common --release --example scan_dir -- <thư mục>` (nay in riêng PHP, ảnh và cấu hình). **Chưa đo trên kho ảnh của một site thật** (ảnh chụp từ điện thoại, ảnh sản phẩm đã qua plugin tối ưu, ảnh trong `uploads` của WooCommerce) và **chưa kiểm trên bộ ảnh mã độc thật**: mới có test trên các mẫu tự dựng (shell trong EXIF, sau header GIF, đuôi PNG, SVG chứa script, `.htaccess` map ảnh sang PHP). **Chưa bắt được:** mã giấu trong dữ liệu điểm ảnh (steganography) mà một file khác tự giải ra; payload PHP nằm giữa một ảnh lớn hơn 2 MB (chỉ đọc hai đầu); mã PHP bị mã hoá hoàn toàn trong ảnh không có thẻ mở. Kết quả "sạch" không phải bằng chứng ảnh không có mã độc.
 
 ### ClamAV (engine thứ hai, tuỳ chọn)
 
-Heuristic bắt được biến thể lạ nhưng không biết tên họ mã độc; chữ ký ClamAV thì ngược lại. Khi VPS có ClamAV, mỗi lần `sn hunt` đối chiếu thêm **cùng các file PHP** với chữ ký của nó, và hiện hai nguồn cạnh nhau (cột "Dấu hiệu khớp" có `clamav:Php.Webshell...`). Hub **không** lấy chữ ký về hay phân phối lại: mỗi VPS tự cập nhật bằng `freshclam` từ máy chủ chữ ký của ClamAV.
+Heuristic bắt được biến thể lạ nhưng không biết tên họ mã độc; chữ ký ClamAV thì ngược lại. Khi VPS có ClamAV, mỗi lần `sn hunt` đối chiếu thêm **cùng các file PHP** (và ảnh, file cấu hình mà heuristic đã đánh dấu) với chữ ký của nó, và hiện hai nguồn cạnh nhau (cột "Dấu hiệu khớp" có `clamav:Php.Webshell...`). Hub **không** lấy chữ ký về hay phân phối lại: mỗi VPS tự cập nhật bằng `freshclam` từ máy chủ chữ ký của ClamAV.
 
 - **Dùng khi nào:** `[hunt] clamav = "auto"` (mặc định): có ClamAV và đủ điều kiện thì dùng, không thì bỏ qua. `"off"` để tắt hẳn. Có `clamd` đang chạy thì dùng `clamdscan`; không thì `clamscan`, loại này nạp cả CSDL chữ ký (hơn 1 GB) nên chỉ chạy khi RAM còn trống ≥ `clamav_min_ram_mb` (mặc định 1536), và tối đa `clamav_timeout_secs` (1200). Nếu `clamd` lỗi giữa chừng thì chuyển sang `clamscan`. **Quét tăng dần:** agent ghi lại file nào ClamAV đã quét (kích thước, mtime, ctime, kết quả) trong `/var/lib/sn/clamav-scanned.tsv`; mỗi lần quét ưu tiên file từng bị đánh dấu, rồi file mới hoặc vừa đổi, rồi file không đổi đến hạn quét lại (`clamav_rescan_days`, mặc định 7), file không đổi vừa quét thì bỏ qua. Hết giờ giữa chừng thì phần đã quét vẫn được giữ và lần sau quét tiếp, nên máy có hàng trăm nghìn file PHP được phủ dần qua vài lần quét.
 - **Nút "Cài ClamAV" trên hub:** agent đọc `/etc/os-release` rồi cài: Debian/Ubuntu bằng `apt` (chỉ gói `clamav`, không cài daemon để khỏi chiếm ~1 GB RAM thường trực); AlmaLinux/Rocky/CentOS/Fedora bằng `dnf`/`yum` (EPEL + `clamav`, `clamav-update`, tắt dòng `Example` trong `freshclam.conf`, tải chữ ký, đặt timer cập nhật hằng ngày `sn-clamav-update.timer`). Hệ điều hành khác bị từ chối kèm lý do. Cần VPS có tổng RAM ≥ ~1,8 GB và còn ≥ 1,5 GB ổ đĩa ở `/var/lib`. Kết quả (đang cài / xong / lỗi và lý do) hiện ngay trong khung ClamAV của trang VPS.
 - **Hub quyết định việc cài**: nút "Cài ClamAV" chạy trình quản lý gói bằng root trên VPS, không cần bật gì thêm ở VPS. Hub chỉ gửi lệnh cho agent đã báo hỗ trợ ClamAV.
 - **Một file ClamAV báo sẽ thành "độc hại"** (đủ điều kiện để `sn clean --yes` cách ly) trừ chữ ký dạng `Heuristics.*` và `PUA.*` chỉ thành "nghi ngờ". ClamAV vẫn có thể báo nhầm; đọc kết quả trước khi cách ly.
-- **Giới hạn:** ClamAV chỉ nhận các file mà heuristic đã mở (PHP, và file trong `uploads/` có dấu hiệu PHP), không quét cả ổ đĩa. File tên không phải UTF-8, tên có xuống dòng, hay quá 200.000 file được đếm và ghi vào ghi chú ("ClamAV bỏ qua N file"). Cờ dòng lệnh và gói của từng bản phân phối được viết theo tài liệu nhưng **chưa thử trên VPS thật**; hãy thử trên một VPS thử nghiệm trước.
+- **Giới hạn:** ClamAV chỉ nhận các file mà heuristic đã mở (PHP, và ảnh hay file cấu hình mà heuristic đã đánh dấu; ảnh sạch không được gửi), không quét cả ổ đĩa. File tên không phải UTF-8, tên có xuống dòng, hay quá 200.000 file được đếm và ghi vào ghi chú ("ClamAV bỏ qua N file"). Cờ dòng lệnh và gói của từng bản phân phối được viết theo tài liệu nhưng **chưa thử trên VPS thật**; hãy thử trên một VPS thử nghiệm trước.
 
 
 ## Cấp cứu một VPS đang bị (chạy tay)

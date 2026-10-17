@@ -49,6 +49,11 @@ pub fn clean(state: &State, roots: &[String], yes: bool) -> Result<usize> {
     if !yes {
         bail!("refusing to quarantine without --yes (review `sn hunt` output first)");
     }
+    if crate::hunt::result_is_stale(state) {
+        bail!(
+            "the last scan was made by older scoring rules, which could name ordinary files: run `sn hunt` again first"
+        );
+    }
     let findings: Vec<Finding> = std::fs::read(state.dir.join("findings-latest.json"))
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())

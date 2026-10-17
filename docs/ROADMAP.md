@@ -16,7 +16,8 @@ Rút ra từ một lượt review đa góc (6 lens) + kiểm chứng đối khá
 - **UI**: TOTP + vai trò operator/viewer; nhúng panel qua SSO; trình soạn `patterns.yml` trên web.
 - **Self-update do hub điều khiển** (bản ký, chặn hạ version, tự rollback nếu chu kỳ đầu hỏng).
 - **Baseline histogram p99** theo vhost + ASN; seed từ log đã rotate khi cài.
-- **`sn hunt --db`** (admin WP lạ, `.user.ini auto_prepend_file`, plugin/theme checksum từ wordpress.org), hub cache checksum.
+- **`sn hunt --db`** (admin WP lạ, plugin/theme checksum từ wordpress.org), hub cache checksum. (`.user.ini auto_prepend_file` đã làm ở 0.10: xem mục "Ảnh và file cấu hình" trong README.)
+- **Quét ảnh**: đo báo nhầm trên kho ảnh của site thật và bộ ảnh mã độc thật; bộ nhớ đệm (dev, ino, size, mtime) để không đọc lại ảnh không đổi mỗi đêm; bắt payload giữa ảnh lớn hơn 2 MB; steganography.
 - Tín hiệu theo vhost (login-fail/phút), redaction PII trước khi lên hub, token chung cloud-init (vào trạng thái "chờ duyệt").
 
 ## v2

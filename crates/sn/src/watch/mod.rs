@@ -180,6 +180,7 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<()> {
         crawler: false,
         span,
         volume_exempt: false,
+        rate_bans: patterns::RATE_BANS,
     };
 
     // Decide bans.
@@ -1013,6 +1014,7 @@ fn replay(cfg: &Config, path: &PathBuf) -> Result<()> {
         crawler: false,
         span: 300,
         volume_exempt: false,
+        rate_bans: patterns::RATE_BANS,
     };
     let never_ban = cfg.never_ban_cidrs();
     let mut bans = 0u64;

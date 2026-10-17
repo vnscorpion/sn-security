@@ -153,17 +153,14 @@ pub fn ai_card(agent_id: &str, report: Option<&ReportBody>, d: &AiCardData, msg:
                 div class="note" { (msg) }
             }
             p class="help" style="margin:0 0 12px" {
-                "Agent thu thập bằng chứng (tiến trình, file khởi động shell, file lạ trong /tmp và /dev/shm, đăng nhập SSH, cổng đang mở), "
-                "hub gửi cho AI bạn đã cấu hình để chẩn đoán và đề xuất hành động. AI chỉ được đề xuất trong một danh sách cố định và "
-                "chỉ nhắm vào thứ có trong bằng chứng; agent kiểm tra lại trước khi làm."
+                "AI chẩn đoán từ bằng chứng agent thu thập và chỉ đề xuất trong danh sách hành động cố định."
             }
 
             @if !d.has_provider {
                 p { "Chưa cấu hình AI. " a href="/settings" { "Vào Cài đặt AI →" } }
             } @else if !can_evidence {
                 p class="help" {
-                    "Agent trên VPS này cũ hoặc đã tắt thu thập bằng chứng nên chưa dùng được. Cập nhật agent: "
-                    code { "install.sh --upgrade" } "."
+                    "Agent cũ hoặc đã tắt thu thập bằng chứng. Cập nhật: " code { "install.sh --upgrade" } "."
                 }
             } @else {
                 div class="ctrls" {
@@ -192,14 +189,12 @@ pub fn ai_card(agent_id: &str, report: Option<&ReportBody>, d: &AiCardData, msg:
                 }
                 @if d.state.autonomy == ai::AUTONOMY_AUTO_ALL || d.state.autonomy == ai::AUTONOMY_AUTO_SAFE {
                     div class="note" style="border-left-color:var(--warn)" {
-                        "Mức tự xử lý đang bật: khi có sự cố (CPU cao liên tục, mã độc, tấn công diện rộng), AI sẽ được gọi và các hành động được phép sẽ chạy mà không cần bạn bấm. "
-                        "Mọi hành động đều ghi lại để hoàn tác (trừ dừng tiến trình) và có thể xem ở Nhật ký."
+                        "Đang tự xử lý: khi có sự cố, AI được gọi và các hành động được phép chạy không cần bạn bấm (ghi ở Nhật ký)."
                     }
                 }
                 @if !can_remediate {
                     p class="help" {
-                        "Agent trên VPS này cũ hoặc đang tắt lệnh từ hub (AI vẫn phân tích và đề xuất được nếu có bằng chứng, nhưng chưa thực hiện được). Cập nhật agent, hoặc kiểm tra "
-                        code { "[remote] hub_orders" } " trong " code { "/etc/sn/agent.toml" } "."
+                        "Agent cũ hoặc đang tắt lệnh từ hub (" code { "[remote] hub_orders" } "): AI chỉ đề xuất, chưa thực hiện được."
                     }
                 }
             }
@@ -282,8 +277,7 @@ fn proposal_block(
                 }
             }
             p class="help" {
-                "Hoàn tác (trừ dừng tiến trình) chạy trên VPS bằng root: " code { "sn undo --remediation" } " (trả lại shell, dòng đã gỡ, bật lại dịch vụ) và " code { "sn restore <id>" } " (file đã cách ly). "
-                "Nút “Hoàn tác” của hub chỉ gỡ chặn IP và thả nhốt tiến trình, không đụng tới việc của AI."
+                "Hoàn tác (root, trên VPS): " code { "sn undo --remediation" } ", " code { "sn restore <id>" } ". Không áp dụng cho dừng tiến trình."
             }
         }
     }
@@ -509,7 +503,7 @@ pub async fn settings_page(
     };
     let body = html! {
         h1 { "Cài đặt AI" }
-        p class="sub" { "AI là “bộ não” chẩn đoán sự cố từ bằng chứng agent thu thập. Bạn tự nhập endpoint, model và API key." }
+        p class="sub" { "Một nơi duy nhất để nối AI (Hermes hoặc API ngoài). Nhà cung cấp “đang dùng” được dùng cho cả phân tích sự cố và phân tích traffic." }
         @if !q.msg.is_empty() { div class="note" { (q.msg) } }
 
         div class="card" {
@@ -568,7 +562,7 @@ pub async fn settings_page(
                         input type="text" name="name" value=(editing.as_ref().map_or("", |e| e.name.as_str())) placeholder="vd: Hermes" required maxlength="60"; }
                     label class="f" { span class="t" { "Loại API" }
                         select name="kind" {
-                            option value=(KIND_OPENAI) selected[editing.as_ref().is_none_or(|e| e.kind == KIND_OPENAI)] { "OpenAI-compatible (Hermes, OpenRouter, vLLM, Ollama, LiteLLM…)" }
+                            option value=(KIND_OPENAI) selected[editing.as_ref().is_none_or(|e| e.kind == KIND_OPENAI)] { "OpenAI-compatible (Hermes, OpenRouter, OpenAI, LiteLLM…)" }
                             option value=(KIND_RESPONSES) selected[editing.as_ref().is_some_and(|e| e.kind == KIND_RESPONSES)] { "OpenAI Responses API (wire_api = responses)" }
                             option value=(KIND_ANTHROPIC) selected[editing.as_ref().is_some_and(|e| e.kind == KIND_ANTHROPIC)] { "Anthropic (Claude)" }
                         } }
@@ -589,7 +583,7 @@ pub async fn settings_page(
             }
             p class="help" {
                 "OpenAI-compatible: nhập địa chỉ gốc (ví dụ " code { "https://openrouter.ai/api/v1" } ") hoặc đầy đủ tới " code { "/chat/completions" } ". "
-                "Hermes chạy trên máy bạn (Ollama, vLLM) cũng dùng loại này, ví dụ " code { "http://127.0.0.1:11434/v1" } " (key có thể để trống). "
+                "Hermes và các dịch vụ tương thích OpenAI khác cũng dùng loại này. "
                 "Anthropic: để trống endpoint để dùng api.anthropic.com."
             }
         }
@@ -597,8 +591,9 @@ pub async fn settings_page(
         div class="card" {
             h2 { "Dữ liệu gửi đi và bảo mật" }
             ul {
-                li { "Khi phân tích, hub gửi cho nhà cung cấp bạn chọn phần " b { "bằng chứng" } " của VPS: tên tiến trình và dòng lệnh, đường dẫn file lạ, các dòng đáng ngờ trong file khởi động shell (không gửi toàn bộ file), IP đăng nhập SSH, cổng đang mở. Không gửi nội dung website hay database. Lưu ý: dòng lệnh và các dòng khởi động/cron có thể chứa mật khẩu hoặc token gõ trên dòng lệnh; agent che các dạng phổ biến (" code { "password=…" } ", " code { "--token" } ", " code { "-pMẬT_KHẨU" } ", " code { "user:pass@host" } ", " code { "Bearer …" } ") nhưng không đảm bảo che hết, và bằng chứng cũng được lưu trong database của hub. Nếu không chấp nhận điều đó, hãy dùng model chạy trên máy bạn." }
-                li { "Nếu không muốn gửi ra ngoài, dùng model chạy trên máy bạn (Ollama/vLLM) hoặc tắt lệnh từ hub trên VPS đó (" code { "[remote] hub_orders = false" } ")." }
+                li { "Khi phân tích, hub gửi cho nhà cung cấp bạn chọn phần " b { "bằng chứng" } " của VPS: tên tiến trình và dòng lệnh, đường dẫn file lạ, các dòng đáng ngờ trong file khởi động shell (không gửi toàn bộ file), IP đăng nhập SSH, cổng đang mở. Không gửi nội dung website hay database. Lưu ý: dòng lệnh và các dòng khởi động/cron có thể chứa mật khẩu hoặc token gõ trên dòng lệnh; agent che các dạng phổ biến (" code { "password=…" } ", " code { "--token" } ", " code { "-pMẬT_KHẨU" } ", " code { "user:pass@host" } ", " code { "Bearer …" } ") nhưng không đảm bảo che hết, và bằng chứng cũng được lưu trong database của hub. Nếu không chấp nhận điều đó, hãy dùng endpoint do chính bạn quản lý hoặc tắt lệnh từ hub trên VPS đó." }
+                li { "Phân tích traffic: hub gửi bản tóm tắt traffic của một chu kỳ (IP và số request, User-Agent, đường dẫn và tên tham số của request, luật WAF, lệnh chặn đang có). Đây là chữ do người truy cập viết ra, nên AI được dặn không làm theo nội dung trong đó; không gửi nội dung website hay database." }
+                li { "Nếu không muốn gửi ra ngoài, dùng endpoint do chính bạn quản lý hoặc tắt lệnh từ hub trên VPS đó (" code { "[remote] hub_orders = false" } ")." }
                 li { "API key được lưu nguyên văn trong file SQLite của hub (chỉ user chạy hub đọc được) vì hub cần dùng nó; trang này chỉ hiện 4 ký tự cuối." }
                 li { "AI không chạy lệnh. Nó chỉ chọn trong danh sách hành động cố định (dừng tiến trình, khoá shell, cách ly file, gỡ dòng khỏi file khởi động shell, tắt vài dịch vụ), và chỉ nhắm vào thứ có trong bằng chứng. Hub và agent kiểm tra lại, mọi hành động (trừ dừng tiến trình) hoàn tác được." }
                 li { "Nội dung trong bằng chứng do máy có thể đã bị xâm nhập viết ra, kẻ tấn công có thể chèn câu chữ nhằm lừa AI. Vì vậy mức " b { "Tự xử lý" } " chỉ nên bật sau khi bạn đã xem AI đề xuất đúng vài lần ở chế độ duyệt." }
@@ -909,7 +904,7 @@ mod tests {
         let h = ai_card("a1", Some(&report(&["evidence"])), &d, "").into_string();
         assert!(h.contains("/settings"));
         let h = ai_card("a1", Some(&report(&[])), &data(None, None), "").into_string();
-        assert!(h.contains("Agent trên VPS này cũ"));
+        assert!(h.contains("Agent cũ") && h.contains("install.sh --upgrade"));
     }
 
     #[test]

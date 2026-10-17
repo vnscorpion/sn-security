@@ -778,7 +778,17 @@ pub struct Judge {
     /// `ceiling`: an open panel or FTP session, or an address the admin
     /// unbanned a little while ago.
     pub volume_exempt: bool,
+    /// Counting requests may ban an address. Off in the agent ([`RATE_BANS`]):
+    /// a count cannot tell a busy shop, an office behind one address or a
+    /// crawler from a flood, so `rate` only reports and the hub (its AI, or the
+    /// admin) decides what to block from the traffic it sees.
+    pub rate_bans: bool,
 }
+
+/// Whether the agent bans on a request count alone. It does not: only an
+/// attack that is clear from what was asked for (password guessing, probes,
+/// attack tools) bans on its own. The `rate` rule still reports the address.
+pub const RATE_BANS: bool = false;
 
 /// Evaluate the fixed patterns. A cycle covers roughly one timer interval of
 /// logs, so the plan's per-5-minute windows map onto a single cycle (longer
@@ -891,13 +901,15 @@ fn rate_hit(a: &IpAgg, j: &Judge) -> Option<PatternHit> {
     if !(over_dynamic || over_misses || over_lines || at_ceiling) {
         return None;
     }
-    let rate = |ttl_secs, ban, escalate, ttl_cap| {
+    let rate = |ttl_secs, ban: bool, escalate, ttl_cap| {
+        // A count alone only reports, unless this agent is told to ban on it.
+        let ban = ban && j.rate_bans;
         Some(PatternHit {
             reason: "rate",
-            ttl_secs,
+            ttl_secs: if ban { ttl_secs } else { 0 },
             ban,
-            escalate,
-            ttl_cap,
+            escalate: ban && escalate,
+            ttl_cap: if ban { ttl_cap } else { 0 },
         })
     };
     if (j.volume_exempt || !j.baseline_ready || a.looks_like_proxy()) && !at_ceiling {
