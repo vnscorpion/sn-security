@@ -111,13 +111,14 @@ pub struct Digest {
 }
 
 /// Can a WAF rule do anything on the VPS that sent this report? Only with
-/// ModSecurity on (or detecting) and a rules file the agent can write; a VPS
-/// without it (a DirectAdmin box with no ModSecurity) gets bans only.
+/// ModSecurity on (or detecting); a VPS without it (a DirectAdmin box with no
+/// ModSecurity) gets bans only. The agent's `rules_file` is empty until the
+/// first rule is in force, so it cannot be asked for here.
 #[must_use]
 pub fn waf_usable(r: &ReportBody) -> bool {
-    r.waf.as_ref().is_some_and(|w| {
-        matches!(w.engine.as_str(), "on" | "detection_only") && !w.rules_file.is_empty()
-    })
+    r.waf
+        .as_ref()
+        .is_some_and(|w| matches!(w.engine.as_str(), "on" | "detection_only"))
 }
 
 /// Text that came from the network, safe to quote: no control characters, cut.
@@ -948,17 +949,20 @@ mod tests {
     }
 
     #[test]
-    fn a_waf_rule_needs_modsecurity_that_is_running_and_writable() {
+    fn a_waf_rule_needs_modsecurity_that_is_running() {
         assert!(waf_usable(&report_with_waf("on", "/x/zz-sn-secure.conf")));
         assert!(waf_usable(&report_with_waf(
             "detection_only",
             "/x/zz-sn-secure.conf"
         )));
+        // ModSecurity is on but no rule has been applied yet: the agent reports
+        // no rules file, and the first rule must still be proposable.
+        assert!(waf_usable(&report_with_waf("on", "")));
         // DirectAdmin without ModSecurity, a panel that turned it off, a layout
-        // the agent cannot write into, and an agent that sent no WAF state.
+        // nobody recognised, and an agent that sent no WAF state.
         assert!(!waf_usable(&report_with_waf("missing", "")));
         assert!(!waf_usable(&report_with_waf("off", "/x/zz-sn-secure.conf")));
-        assert!(!waf_usable(&report_with_waf("on", "")));
+        assert!(!waf_usable(&report_with_waf("unknown", "")));
         assert!(!waf_usable(&report()));
     }
 
