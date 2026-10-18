@@ -214,11 +214,12 @@ jobs:
           token_on_no_command_line() {
             if sudo grep '^leak:' /run/sn-ci-enroll.log; then fail "the token was on a command line while the installer ran"; fi
           }
-          # The install command and the token `snhub add-vps` prints for a new VPS.
+          # The one-line install command `snhub add-vps` prints for a new VPS, and
+          # the token in it (in the environment of sudo, not in its arguments).
           add_vps() {
             out="$(sudo -u snhub /usr/local/bin/snhub --config /etc/snhub/snhub.toml add-vps --name "$1")"
             cmd="$(printf '%s\n' "$out" | grep -m1 '^curl ' || true)"
-            tok="$(printf '%s\n' "$out" | sed -n -e 's/^Token: *//p' -e 's/.* --token \([A-Za-z0-9_-]*\).*/\1/p' | head -n 1)"
+            tok="$(printf '%s\n' "$cmd" | sed -n 's/.*| SN_ENROLL_TOKEN=\([A-Za-z0-9_-]*\) sudo .*/\1/p')"
             [ -n "$cmd" ] && [ -n "$tok" ] || fail "no install command and token in: $out"
           }
           EOF
@@ -341,17 +342,19 @@ jobs:
           want_mode /var/lib/sn "700 root:root"
       # The command the hub gives for a new VPS is the main way in: the token is
       # shown apart from it and typed when the installer asks.
-      - name: the install command the hub prints carries no token
+      - name: the one-line install command carries the token in the environment only
         run: |
           . "$RUNNER_TEMP/check.sh"
           hub=http://127.0.0.1:8099
           add_vps ci-06
-          case "$cmd" in *--token*|*"$tok"*) fail "the install command carries the token: $cmd";; esac
-          [ "$cmd" = "curl -fsSL $hub/install.sh | sudo sh -s -- --hub $hub --name ci-06" ] || fail "unexpected install command: $cmd"
-          # Run as an admin would, typing the token when asked (as root inside a
-          # terminal, which is what the command's `sudo sh` gives).
+          # One line, the token only as `SN_ENROLL_TOKEN=` in front of sudo (the
+          # environment, which another user cannot read), never as an argument.
+          case "$cmd" in *--token*) fail "the install command passes the token as an argument: $cmd";; esac
+          [ "$cmd" = "curl -fsSL $hub/install.sh | SN_ENROLL_TOKEN=$tok sudo --preserve-env=SN_ENROLL_TOKEN sh -s -- --hub $hub --name ci-06" ] || fail "unexpected install command: $cmd"
+          # Pasted as an admin would paste it, through the shell's input: the
+          # token is in no process's arguments, not even the shell's.
           sudo rm -f /run/sn-ci-enroll.log
-          printf '%s\n' "$tok" | sudo script -qec "${cmd/| sudo sh/| sh}" /dev/null
+          printf '%s\n' "$cmd" | bash
           enrolled_has "env:$tok"
           enrolled_has "argv:--config /etc/sn/agent.toml enroll --url $hub --name ci-06"
           no_token_in_argv
