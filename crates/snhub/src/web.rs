@@ -26,35 +26,50 @@ pub(crate) fn now() -> i64 {
 
 const STYLE: &str = r#"
 :root{
- --bg:#0e1116;--card:#161b22;--card2:#1b222c;--fg:#e8ecf1;--mut:#9aa7b4;
+ --bg:#0e1116;--card:#161b22;--card2:#1b222c;--field:#0d1218;--fg:#e8ecf1;--mut:#9aa7b4;
  --line:#273039;--acc:#4ca3ff;--acc-ink:#04121f;--bad:#ff6b6b;--warn:#ffc34d;--ok:#45d19a;
- --radius:12px;
+ --radius:12px;--ctl:40px;
 }
+@media (pointer:coarse){:root{--ctl:44px}}
 *{box-sizing:border-box}
-html{-webkit-text-size-adjust:100%}
+html{-webkit-text-size-adjust:100%;scroll-behavior:smooth}
 body{margin:0;background:var(--bg);color:var(--fg);
  font:15px/1.6 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
 a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}
-header{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:18px;
- padding:12px 20px;border-bottom:1px solid var(--line);background:rgba(14,17,22,.9);
+a:focus-visible,button:focus-visible,summary:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{
+ outline:2px solid var(--acc);outline-offset:2px}
+.skip{position:absolute;left:12px;top:-60px;z-index:20;background:var(--acc);color:var(--acc-ink);
+ padding:8px 14px;border-radius:8px;font-weight:700}
+.skip:focus{top:8px;text-decoration:none}
+header{position:sticky;top:0;z-index:5;display:flex;flex-wrap:wrap;align-items:center;gap:6px 14px;
+ padding:8px 20px;border-bottom:1px solid var(--line);background:rgba(14,17,22,.92);
  backdrop-filter:blur(8px)}
-header .brand{font-weight:800;letter-spacing:.2px;margin-right:4px}
-header nav{display:flex;gap:16px;flex-wrap:wrap}
+header .brand{display:flex;align-items:center;gap:8px;font-weight:800;letter-spacing:.2px;color:var(--fg);
+ margin-right:6px;white-space:nowrap}
+header .brand:hover{text-decoration:none}
+header .logo{width:22px;height:22px;color:var(--acc);flex:none}
+header nav{display:flex;gap:2px;min-width:0}
+header nav a{display:inline-flex;align-items:center;min-height:36px;padding:0 11px;border-radius:8px;
+ color:var(--mut);white-space:nowrap;transition:background .15s,color .15s}
+header nav a:hover{background:var(--card2);color:var(--fg);text-decoration:none}
+header nav a[aria-current=page]{background:var(--card2);color:var(--fg);box-shadow:inset 0 -2px 0 var(--acc)}
 header .sp{flex:1}
 header form.ipcheck{margin:0}
-header form.ipcheck input{width:190px;padding:6px 12px;border-radius:999px}
-main{max-width:1120px;margin:0 auto;padding:22px 16px 60px}
-h1{font-size:22px;margin:0 0 4px}
-h2{font-size:14px;margin:0 0 12px;color:var(--mut);text-transform:uppercase;letter-spacing:.05em}
-.sub{color:var(--mut);margin:0 0 18px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:18px;margin-bottom:16px}
+header form.ipcheck input{width:190px;min-height:36px;padding:4px 14px;border-radius:999px}
+header .out{color:var(--mut);padding:6px 4px}
+main{max-width:1120px;margin:0 auto;padding:24px 16px 72px}
+h1{font-size:clamp(20px,2.4vw,25px);line-height:1.25;margin:0 0 6px;display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px}
+h2{font-size:13px;margin:0 0 12px;color:var(--mut);text-transform:uppercase;letter-spacing:.06em}
+.sub{color:var(--mut);margin:0 0 18px;overflow-wrap:anywhere}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:18px;margin-bottom:16px;
+ scroll-margin-top:72px}
 .help{color:var(--mut);font-size:13px;margin:6px 0 0}
 .wrap{overflow-x:auto}
-table{width:100%;border-collapse:collapse;min-width:520px}
+table{width:100%;border-collapse:collapse;min-width:520px;font-variant-numeric:tabular-nums}
 th,td{text-align:left;padding:10px 10px;border-bottom:1px solid var(--line);vertical-align:middle}
-th{color:var(--mut);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.04em}
+th{color:var(--mut);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.04em;white-space:nowrap}
 tr:last-child td{border-bottom:0}
-tbody tr:hover{background:var(--card2)}
+@media (hover:hover){tbody tr:hover{background:var(--card2)}}
 .badge{display:inline-block;padding:2px 10px;border-radius:999px;font-size:12px;font-weight:600;white-space:nowrap}
 .b-ok{background:rgba(69,209,154,.16);color:var(--ok)}
 .b-warn{background:rgba(255,195,77,.16);color:var(--warn)}
@@ -63,27 +78,74 @@ tbody tr:hover{background:var(--card2)}
 .mut{color:var(--mut)}
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:18px}
 .stat{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:14px 16px}
-.stat .n{font-size:26px;font-weight:800;line-height:1.1}
+.stat .n{font-size:28px;font-weight:800;line-height:1.1;font-variant-numeric:tabular-nums}
 .stat .l{color:var(--mut);font-size:13px;margin-top:2px}
-input,select,button,textarea{font:inherit;padding:8px 12px;border-radius:9px;border:1px solid var(--line);
- background:#0d1218;color:var(--fg)}
-input:focus,select:focus{outline:2px solid rgba(76,163,255,.4);border-color:var(--acc)}
-button{background:var(--acc);color:var(--acc-ink);border:0;cursor:pointer;font-weight:700}
+input,select,button,textarea{font:inherit;padding:8px 12px;min-height:var(--ctl);border-radius:9px;
+ border:1px solid var(--line);background:var(--field);color:var(--fg)}
+textarea{min-height:0}
+input:focus,select:focus,textarea:focus{border-color:var(--acc)}
+input[type=checkbox],input[type=radio]{min-height:0;width:18px;height:18px;padding:0;accent-color:var(--acc);
+ vertical-align:middle;cursor:pointer}
+label:has(>input[type=checkbox]){cursor:pointer}
+button{background:var(--acc);color:var(--acc-ink);border:0;cursor:pointer;font-weight:700;
+ transition:filter .15s,background .15s}
 button:hover{filter:brightness(1.07)}
+button:active{filter:brightness(.95)}
+button[disabled]{opacity:.5;cursor:not-allowed}
 button.ghost{background:transparent;border:1px solid var(--line);color:var(--fg)}
+button.ghost:hover{background:var(--card2);filter:none}
 button.bad{background:var(--bad);color:#2a0606}
 label.f{display:block}
 label.f .t{display:block;color:var(--mut);font-size:12px;margin-bottom:5px}
-.ctrls{display:flex;gap:22px;flex-wrap:wrap;align-items:flex-end}
+.ctrls{display:flex;gap:14px 22px;flex-wrap:wrap;align-items:flex-end}
 .ctrls form{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;margin:0}
 .divider{height:1px;background:var(--line);border:0;margin:16px 0}
-code{background:#0d1218;padding:2px 7px;border-radius:6px;font-size:13px;word-break:break-all}
-pre{background:#0d1218;padding:14px;border-radius:9px;overflow:auto;white-space:pre-wrap;word-break:break-all;
+code{background:var(--field);padding:2px 7px;border-radius:6px;font-size:13px;word-break:break-all}
+pre{background:var(--field);padding:14px;border-radius:9px;overflow:auto;white-space:pre-wrap;word-break:break-all;
  border:1px solid var(--line)}
 .empty{color:var(--mut);text-align:center;padding:26px 10px}
 .note{background:var(--card2);border:1px solid var(--line);border-left:3px solid var(--acc);
  border-radius:8px;padding:12px 14px;color:var(--mut);font-size:13px;margin-bottom:16px}
+details>summary{cursor:pointer;padding:8px 0;border-radius:8px}
+details.note>summary{padding:0;color:var(--fg);font-weight:600}
+details.note[open]>summary{margin-bottom:6px}
+.jump{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 18px}
+.jump a{display:inline-flex;align-items:center;min-height:36px;padding:0 14px;border-radius:999px;
+ border:1px solid var(--line);background:var(--card);color:var(--fg);font-size:13px;font-weight:600}
+.jump a:hover{background:var(--card2);border-color:var(--acc);text-decoration:none}
+.crumb{display:inline-flex;align-items:center;min-height:32px;margin:0 0 4px;color:var(--mut)}
+@media (max-width:760px){
+ header{position:static;flex-wrap:wrap;padding:10px 14px}
+ header .sp{display:none}
+ header nav{order:3;flex:1 0 100%;overflow-x:auto;margin:0 -14px;padding:0 14px;scrollbar-width:none}
+ header nav::-webkit-scrollbar{display:none}
+ header form.ipcheck{flex:1;min-width:0;margin-left:auto}
+ header form.ipcheck input{width:100%}
+ main{padding:18px 12px 56px}
+ .card{padding:14px}
+ table.stack{min-width:0}
+ table.stack thead{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+ table.stack,table.stack tbody,table.stack tr,table.stack td{display:block;width:100%}
+ table.stack tr{padding:10px 0;border-bottom:1px solid var(--line)}
+ table.stack tr:last-child{border-bottom:0}
+ table.stack td{display:flex;justify-content:space-between;align-items:center;gap:14px;border:0;padding:4px 2px;text-align:right}
+ table.stack td::before{content:attr(data-label);color:var(--mut);font-size:12px;text-transform:uppercase;
+  letter-spacing:.04em;text-align:left;flex:none}
+ table.stack td.name{display:block;text-align:left;padding-bottom:6px;font-size:16px}
+ table.stack td.name::before{content:none}
+}
+@media (prefers-reduced-motion:reduce){
+ html{scroll-behavior:auto}
+ *,*::before,*::after{transition:none!important}
+}
 "#;
+
+/// Marks the menu entry of the page being shown (the longest link that matches the
+/// path; a VPS page belongs to the overview). Without JavaScript nothing is marked.
+const NAV_MARK: &str = "(function(){var p=location.pathname;if(p.indexOf('/agent/')===0)p='/';\
+var best=null,len=-1;document.querySelectorAll('header nav a').forEach(function(a){\
+var h=a.getAttribute('href');if((h===p||(h!=='/'&&p.indexOf(h+'/')===0))&&h.length>len){best=a;len=h.length}});\
+if(best)best.setAttribute('aria-current','page')})();";
 
 pub(crate) fn shell(title: &str, body: Markup) -> Markup {
     html! {
@@ -97,9 +159,17 @@ pub(crate) fn shell(title: &str, body: Markup) -> Markup {
                 style { (maud::PreEscaped(STYLE)) }
             }
             body {
+                a class="skip" href="#main" { "Bỏ qua menu" }
                 header {
-                    span class="brand" { "🛡 SN Secure" }
-                    nav {
+                    a class="brand" href="/" {
+                        svg class="logo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                            stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" {
+                            path d="M12 2.5 4.5 5.5v5.7c0 4.7 3.1 8.6 7.5 10.3 4.4-1.7 7.5-5.6 7.5-10.3V5.5L12 2.5Z" {}
+                            path d="m8.8 12 2.4 2.4 4.2-4.6" {}
+                        }
+                        "SN Secure"
+                    }
+                    nav aria-label="Menu chính" {
                         a href="/" { "Tổng quan" }
                         a href="/add-vps" { "Thêm VPS" }
                         a href="/log" { "Nhật ký" }
@@ -109,12 +179,13 @@ pub(crate) fn shell(title: &str, body: Markup) -> Markup {
                         a href="/security" { "Bảo mật" }
                     }
                     span class="sp" {}
-                    form class="ipcheck" method="get" action="/check-ip" {
+                    form class="ipcheck" method="get" action="/check-ip" role="search" {
                         input type="text" name="ip" placeholder="Tra cứu IP..." autocomplete="off" aria-label="Tra cứu IP";
                     }
-                    a href="/logout" { "Đăng xuất" }
+                    a class="out" href="/logout" { "Đăng xuất" }
                 }
-                main { (body) }
+                main id="main" { (body) }
+                script { (maud::PreEscaped(NAV_MARK)) }
             }
         }
     }
@@ -786,14 +857,15 @@ pub async fn overview(
 
         @if !oq.msg.trim().is_empty() { div class="note" style="border-left-color:var(--ok)" { (oq.msg.trim()) } }
 
-        div class="note" {
+        details class="note" {
+            summary { "Hai chế độ bảo vệ" }
             b { "Chỉ theo dõi" } " = chỉ ghi nhận, chưa chặn ai (an toàn, nên dùng vài ngày đầu). "
             b { "Chặn tự động" } " = tự chặn IP xấu. Đổi chế độ trong trang từng VPS."
         }
 
         div class="card" {
             div class="wrap" {
-                table {
+                table class="stack" {
                     thead { tr {
                         th { "VPS" } th { "Trạng thái" } th { "Chế độ" } th { "Tải CPU" } th { "RAM" }
                         th { "Lượt truy cập" } th { "IP chặn" } th { "Cảnh báo" } th { "Bản sn" } th { "Cập nhật" }
@@ -805,19 +877,20 @@ pub async fn overview(
                         @for row in &rows {
                             @let a = &row.agent;
                             tr {
-                                td { a href={"/agent/" (a.id)} { b { (a.name) } } br; span class="mut" style="font-size:12px" { (a.id) } }
-                                td { (status_badge(a.last_seen)) }
-                                td { (mode_badge(&a.mode)) }
-                                td { (format!("{:.2}", row.load)) }
-                                td { (mem_badge(row.mem)) }
-                                td { (row.req) }
-                                td { @if row.bans > 0 { span class="badge b-bad" { (row.bans) } } @else { "0" } }
-                                td { @if row.alerts > 0 { span class="badge b-warn" { (row.alerts) } } @else { "0" } }
-                                td class="mut" {
+                                td class="name" { a href={"/agent/" (a.id)} title=(a.id) { b { (a.name) } } }
+                                td data-label="Trạng thái" { (status_badge(a.last_seen)) }
+                                td data-label="Chế độ" { (mode_badge(&a.mode)) }
+                                td data-label="Tải CPU" { (format!("{:.2}", row.load)) }
+                                td data-label="RAM" { (mem_badge(row.mem)) }
+                                td data-label="Lượt truy cập" { (row.req) }
+                                // Bans are the protection working, not a fault: neutral colour.
+                                td data-label="IP chặn" { @if row.bans > 0 { span class="badge b-mut" { (row.bans) } } @else { "0" } }
+                                td data-label="Cảnh báo" { @if row.alerts > 0 { span class="badge b-warn" { (row.alerts) } } @else { "0" } }
+                                td class="mut" data-label="Bản sn" {
                                     (a.version)
                                     @if agent_outdated(&a.version) { " " span class="badge b-warn" { "cũ" } }
                                 }
-                                td class="mut" { (rel_time(a.last_seen)) }
+                                td class="mut" data-label="Cập nhật" { (rel_time(a.last_seen)) }
                             }
                         }
                     }
@@ -1007,8 +1080,8 @@ pub async fn agent_detail(
     let shown_findings = &all_findings[fstart..fend];
 
     let body = html! {
-        p { a href="/" { "← Tổng quan" } }
-        h1 { (agent.name) " " (status_badge(agent.last_seen)) " " (mode_badge(mode.as_str())) }
+        a class="crumb" href="/" { "← Tổng quan" }
+        h1 { (agent.name) (status_badge(agent.last_seen)) (mode_badge(mode.as_str())) }
         p class="sub" {
             code { (agent.id) } " · bản sn " (agent.version) " · cập nhật " (rel_time(agent.last_seen))
             @if let Some(r) = &report {
@@ -1023,6 +1096,16 @@ pub async fn agent_detail(
                 "Agent bản " b { (agent.version) } " cũ hơn hub (" (HUB_VERSION) "). Cập nhật trên VPS (root):"
                 pre style="margin:10px 0 0" { "curl -fsSL " (hub_base(&st)) "/install.sh | sudo sh -s -- --hub " (hub_base(&st)) " --upgrade" }
             }
+        }
+
+        // The page is long: one link per main card.
+        nav class="jump" aria-label="Các mục trên trang" {
+            a href="#ctl" { "Điều khiển" }
+            a href="#traffic" { "AI traffic" }
+            a href="#ai" { "AI sự cố" }
+            a href="#bans" { "IP bị chặn" }
+            @if report.is_some() { a href="#scan" { "Quét mã độc" } }
+            a href="#waf" { "WAF" }
         }
 
         div class="card" id="ctl" {
