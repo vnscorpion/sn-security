@@ -89,13 +89,51 @@ const SCAN_FILES_MAX: usize = 400;
 const SCAN_BYTES_MAX: u64 = 16 << 20;
 /// Site settings read for the notes.
 const SITES_MAX: usize = 5000;
-/// OPanel (OpenLiteSpeed) keeps ModSecurity here; see `waf_conf` for how our
-/// file is reached.
-const OPANEL_WAF_DIR: &str = "/usr/local/lsws/conf/opanel/waf";
-const OPANEL_BASE: &str = "opanel-base.conf";
-const OPANEL_CUSTOM: &str = "opanel-custom.conf";
-const OPANEL_VHOSTS: &str = "/usr/local/lsws/conf/opanel/vhosts/*/vhost.conf";
-const OLS_CONF: &str = "/usr/local/lsws/conf/httpd_config.conf";
+/// A hosting panel that gives every site its own ModSecurity rules file, which
+/// includes two shared ones: `base` (the engine) and `custom` (rules for every
+/// site, written by the panel). See `waf_conf` for how our file is reached.
+struct Panel {
+    /// "OPanel" / "bPanel", for the admin.
+    label: &'static str,
+    /// The web server the panel drives.
+    server: &'static str,
+    /// Where the shared rules files and the per-site `sites/` directory are.
+    dir: &'static str,
+    base: &'static str,
+    custom: &'static str,
+    /// Virtual host files, to find the sites that do not run ModSecurity.
+    vhosts: &'static str,
+    /// The line the panel puts at the start of a site's ModSecurity block.
+    vhost_marker: &'static str,
+    /// Server configuration whose `modsecurity on|off` switches the module.
+    module_conf: Option<&'static str>,
+}
+
+/// OPanel (OpenLiteSpeed).
+const OPANEL: Panel = Panel {
+    label: "OPanel",
+    server: "openlitespeed",
+    dir: "/usr/local/lsws/conf/opanel/waf",
+    base: "opanel-base.conf",
+    custom: "opanel-custom.conf",
+    vhosts: "/usr/local/lsws/conf/opanel/vhosts/*/vhost.conf",
+    vhost_marker: "# OPANEL WAF BEGIN",
+    module_conf: Some("/usr/local/lsws/conf/httpd_config.conf"),
+};
+
+/// bPanel (nginx with libmodsecurity).
+const BPANEL: Panel = Panel {
+    label: "bPanel",
+    server: "nginx",
+    dir: "/etc/nginx/modsec",
+    base: "bpanel-base.conf",
+    custom: "bpanel-custom.conf",
+    vhosts: "/etc/nginx/conf.d/*.conf",
+    vhost_marker: "# BPANEL WAF BEGIN",
+    module_conf: None,
+};
+
+const PANELS: [&Panel; 2] = [&OPANEL, &BPANEL];
 
 /// Where ModSecurity lives on this VPS and how to drive the web server.
 #[derive(Debug, Clone, Default)]
@@ -393,8 +431,11 @@ pub fn detect() -> Layout {
         out.why_none = "không nhận ra máy chủ web".into();
         return out;
     }
-    if server == "openlitespeed" && Path::new(OPANEL_WAF_DIR).join(OPANEL_BASE).is_file() {
-        return detect_opanel(out);
+    if let Some(panel) = PANELS
+        .iter()
+        .find(|p| p.server == server && Path::new(p.dir).join(p.base).is_file())
+    {
+        return detect_panel(out, panel);
     }
     let directadmin = !opts.is_empty();
     if directadmin && opts.get("modsecurity").is_none_or(|v| v != "yes") {
@@ -457,44 +498,51 @@ pub fn detect() -> Layout {
     out
 }
 
-/// OPanel on OpenLiteSpeed: the engine from its own files, our file next to
-/// them, and `opanel-custom.conf` (included by every site's rules) as the hook.
-fn detect_opanel(mut out: Layout) -> Layout {
-    let dir = Path::new(OPANEL_WAF_DIR);
+/// A panel with per-site rules: the engine from its own files, our file next to
+/// them, and the shared `custom` file (included by every site's rules) as the
+/// hook.
+fn detect_panel(mut out: Layout, panel: &Panel) -> Layout {
+    let dir = Path::new(panel.dir);
     let read = |p: &Path| fs::read_to_string(p).unwrap_or_default();
     let (taken, mut engines) = scan_rule_dir(dir);
     let (taken_sites, engines_sites) = scan_rule_dir(&dir.join("sites"));
     out.taken = taken.union(&taken_sites).copied().collect();
     engines.extend(engines_sites);
-    out.engine = waf_conf::opanel_engine(
-        &read(&dir.join(OPANEL_BASE)),
-        &read(Path::new(OLS_CONF)),
-        &engines,
-    )
-    .into();
-    let custom = dir.join(OPANEL_CUSTOM);
+    let module = panel
+        .module_conf
+        .and_then(|c| waf_conf::scan_conf(&read(Path::new(c))).module);
+    out.engine = waf_conf::panel_engine(&read(&dir.join(panel.base)), module, &engines).into();
+    let custom = dir.join(panel.custom);
     let custom_ok = fs::symlink_metadata(&custom)
         .is_ok_and(|m| m.is_file() && m.uid() == 0 && m.mode() & 0o022 == 0);
     if !safe_dir(dir) {
-        out.why_none = format!("{OPANEL_WAF_DIR} không phải thư mục do root sở hữu");
+        out.why_none = format!("{} không phải thư mục do root sở hữu", panel.dir);
     } else if !custom_ok {
-        out.why_none = format!("thiếu {OPANEL_CUSTOM} do root sở hữu trong {OPANEL_WAF_DIR}");
+        out.why_none = format!("thiếu {} do root sở hữu trong {}", panel.custom, panel.dir);
     } else {
         out.live = Some(dir.join(FILE_NAME));
         out.hook = Some(custom);
     }
     let mut vhosts = Vec::new();
-    if let Ok(paths) = glob::glob(OPANEL_VHOSTS) {
+    if let Ok(paths) = glob::glob(panel.vhosts) {
         for p in paths.filter_map(Result::ok).take(SITES_MAX) {
-            let name = p
-                .parent()
-                .and_then(Path::file_name)
+            let file = p
+                .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
+            // One directory per site (`<site>/vhost.conf`), or `<site>.conf`.
+            let name = if file == "vhost.conf" {
+                p.parent()
+                    .and_then(Path::file_name)
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            } else {
+                file.trim_end_matches(".conf").to_string()
+            };
             vhosts.push((name, read(&p)));
         }
     }
-    let without = waf_conf::sites_without_waf(&vhosts);
+    let without = waf_conf::sites_without_waf(&vhosts, panel.vhost_marker);
     if !without.is_empty() {
         let mut list = without
             .iter()
@@ -506,8 +554,9 @@ fn detect_opanel(mut out: Layout) -> Layout {
             list.push_str(", …");
         }
         out.notes.push(format!(
-            "{} tên miền chưa bật WAF trong OPanel, luật không chạy ở đó: {list}",
-            without.len()
+            "{} tên miền chưa bật WAF trong {}, luật không chạy ở đó: {list}",
+            without.len(),
+            panel.label
         ));
     }
     out

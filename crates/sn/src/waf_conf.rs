@@ -267,24 +267,24 @@ pub fn hook_in_place(text: &str, live: &str) -> bool {
     with_hook(text, live) == text
 }
 
-/// The ModSecurity state of an OPanel server from `opanel-base.conf`, the
-/// server configuration (`modsecurity on|off` for the module), and the
-/// `SecRuleEngine` values found in the other rule files.
+/// The ModSecurity state of a panel server from its base rules file, the module
+/// switch, and the `SecRuleEngine` values found in the other rule files.
 #[must_use]
-pub fn opanel_engine(base: &str, httpd: &str, others: &[String]) -> &'static str {
+pub fn panel_engine(base: &str, module: Option<bool>, others: &[String]) -> &'static str {
     let mut engines: Vec<String> = scan_conf(base).engine.into_iter().collect();
     engines.extend(others.iter().cloned());
-    engine_state(scan_conf(httpd).module, &engines, None, true)
+    engine_state(module, &engines, None, true)
 }
 
-/// Sites (by directory name) whose virtual host has no `# OPANEL WAF` block:
-/// ModSecurity does not run there, so no rule of ours does. `(name, text)`.
+/// Sites whose virtual host lacks the panel's WAF block (`marker`, such as
+/// `# OPANEL WAF BEGIN`): ModSecurity does not run there, so no rule of ours
+/// does. `(name, text)`.
 #[must_use]
-pub fn sites_without_waf(vhosts: &[(String, String)]) -> Vec<String> {
+pub fn sites_without_waf(vhosts: &[(String, String)], marker: &str) -> Vec<String> {
     vhosts
         .iter()
         // The panel's own virtual hosts have no dot in their name.
-        .filter(|(name, text)| name.contains('.') && !text.contains("# OPANEL WAF BEGIN"))
+        .filter(|(name, text)| name.contains('.') && !text.contains(marker))
         .map(|(name, _)| name.clone())
         .collect()
 }
@@ -631,6 +631,11 @@ SecRule ARGS "@rx w" "ctl:ruleRemoveById:60013,id:1234"
         assert!(!clean.contains(HOOK_BEGIN) && clean.contains("claudebot"));
     }
 
+    /// OPanel's module switch is in `httpd_config.conf`.
+    fn opanel_engine(base: &str, httpd: &str, others: &[String]) -> &'static str {
+        panel_engine(base, scan_conf(httpd).module, others)
+    }
+
     #[test]
     fn opanel_with_the_module_and_the_engine_on_is_on() {
         // opanel-base.conf and the OPANEL managed ModSecurity block of
@@ -661,6 +666,51 @@ SecRule ARGS "@rx w" "ctl:ruleRemoveById:60013,id:1234"
             ("old.example".to_string(), without.clone()),
             ("opanel_tools".to_string(), without),
         ];
-        assert_eq!(sites_without_waf(&v), vec!["old.example".to_string()]);
+        assert_eq!(
+            sites_without_waf(&v, "# OPANEL WAF BEGIN"),
+            vec!["old.example".to_string()]
+        );
+    }
+
+    // ---- bPanel (nginx) ----------------------------------------------------
+
+    // As bPanel writes it (a VPS on nginx, 2026-10).
+    const BPANEL_CUSTOM: &str = "# bpanel-mcp: added by admin on 2026-09-24 - Block WordPress install probe\nSecRule REQUEST_URI \"@contains /wp-admin/install.php\" \"id:1090000,phase:1,deny,status:403,log,msg:'BPanel MCP: blocked'\"\n";
+
+    #[test]
+    fn bpanel_with_its_base_file_on_is_on_without_a_module_switch() {
+        // bpanel-base.conf as found on the VPS the hub called "not installed".
+        let base = "SecRuleEngine On\nSecRequestBodyAccess Off\n";
+        assert_eq!(panel_engine(base, None, &[]), "on");
+        assert_eq!(
+            panel_engine(base, None, &["detectiononly".to_string()]),
+            "detection_only"
+        );
+        assert_eq!(panel_engine("", None, &[]), "off");
+    }
+
+    #[test]
+    fn the_hook_goes_at_the_end_of_bpanel_custom_and_comes_out_clean() {
+        let live = "/etc/nginx/modsec/zz-sn-secure.conf";
+        let hooked = with_hook(BPANEL_CUSTOM, live);
+        assert!(hooked.starts_with(BPANEL_CUSTOM));
+        assert!(hooked.ends_with(&format!("{HOOK_BEGIN}\nInclude {live}\n{HOOK_END}\n")));
+        assert!(hook_in_place(&hooked, live));
+        assert_eq!(without_hook(&hooked), BPANEL_CUSTOM);
+    }
+
+    #[test]
+    fn nginx_sites_are_named_by_file_and_the_panels_own_files_are_skipped() {
+        let with = "server {\n    # BPANEL WAF BEGIN\n    modsecurity on;\n    modsecurity_rules_file /etc/nginx/modsec/sites/a.com.conf;\n    # BPANEL WAF END\n}\n".to_string();
+        let without = "server {\n}\n".to_string();
+        let v = vec![
+            ("a.com".to_string(), with),
+            ("tos.example.vn".to_string(), without.clone()),
+            ("00-bpanel-tools".to_string(), without),
+        ];
+        assert_eq!(
+            sites_without_waf(&v, "# BPANEL WAF BEGIN"),
+            vec!["tos.example.vn".to_string()]
+        );
     }
 }

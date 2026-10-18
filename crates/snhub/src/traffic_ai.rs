@@ -78,7 +78,9 @@ address, a search-engine crawler, a CDN or a monitoring service all make many re
 propose blocking only because an address made many requests. Look at what is asked for: login \
 guessing, probing for secret files, attack tools, one expensive URL shape hammered, a user agent \
 no browser sends, one user agent or request shape spread over many addresses.\n\
-3. Prefer a WAF rule (it blocks the pattern, not the people behind an address) to an IP ban. Ban \
+3. Prefer a WAF rule (it blocks the pattern, not the people behind an address) to an IP ban, but \
+only when waf_available is true: when it is false this server has no working ModSecurity, so \
+propose no waf_rule at all, only ban_ip. Ban \
 an address only when what it asked for is a clear attack, and then for 5 to 60 minutes. Never \
 ban Googlebot, Bingbot or other search crawlers, Cloudflare or other CDN or proxy addresses, \
 private addresses, or an address you are not sure about.\n\
@@ -104,6 +106,18 @@ An empty actions list is a good answer."
 pub struct Digest {
     pub prompt: String,
     pub known: HashSet<String>,
+    /// Whether a WAF rule can run on this VPS (see [`waf_usable`]).
+    pub waf_ok: bool,
+}
+
+/// Can a WAF rule do anything on the VPS that sent this report? Only with
+/// ModSecurity on (or detecting) and a rules file the agent can write; a VPS
+/// without it (a DirectAdmin box with no ModSecurity) gets bans only.
+#[must_use]
+pub fn waf_usable(r: &ReportBody) -> bool {
+    r.waf.as_ref().is_some_and(|w| {
+        matches!(w.engine.as_str(), "on" | "detection_only") && !w.rules_file.is_empty()
+    })
 }
 
 /// Text that came from the network, safe to quote: no control characters, cut.
@@ -196,8 +210,10 @@ pub fn digest(host: &str, r: &ReportBody, rules: &[WafRule]) -> Digest {
         .take(10)
         .map(|a| format!("{}: {}", clean(&a.kind, 40), clean(&a.message, 160)))
         .collect();
+    let waf_ok = waf_usable(r);
     let json = json!({
         "server": clean(host, 80),
+        "waf_available": waf_ok,
         "cycle": {
             "requests": r.cycle.requests,
             "dynamic_requests": r.cycle.dynamic_requests,
@@ -218,6 +234,7 @@ pub fn digest(host: &str, r: &ReportBody, rules: &[WafRule]) -> Digest {
              <<<TRAFFIC\n{json}\nTRAFFIC>>>\n"
         ),
         known,
+        waf_ok,
     }
 }
 
@@ -294,7 +311,12 @@ fn item(a: &Value, known: &HashSet<String>, have: &[WafRule]) -> Result<TrafficI
 ///
 /// # Errors
 /// When the reply holds no JSON object.
-pub fn parse(text: &str, known: &HashSet<String>, have: &[WafRule]) -> Result<Parsed, String> {
+pub fn parse(
+    text: &str,
+    known: &HashSet<String>,
+    have: &[WafRule],
+    waf_ok: bool,
+) -> Result<Parsed, String> {
     let json = ai::extract_json(text).ok_or_else(|| "không thấy JSON".to_string())?;
     let v: Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
     let mut out = Parsed {
@@ -310,6 +332,9 @@ pub fn parse(text: &str, known: &HashSet<String>, have: &[WafRule]) -> Result<Pa
         .take(30)
     {
         match item(a, known, have) {
+            Ok(it) if !waf_ok && matches!(it.action, TrafficAction::WafRule { .. }) => out
+                .rejected
+                .push("VPS này chưa có ModSecurity chạy được: không thêm luật WAF".into()),
             Ok(it) => {
                 let (count, max) = match it.action {
                     TrafficAction::WafRule { .. } => (&mut rules, MAX_RULES),
@@ -383,6 +408,10 @@ pub fn apply_item(db: &Db, agent_id: &str, it: &TrafficItem, who: &str, at: i64)
     match &it.action {
         TrafficAction::WafRule { kind, value } => {
             let kind = WafKind::parse(kind).ok_or_else(|| anyhow!("loại luật không hợp lệ"))?;
+            // A proposal made before the VPS lost (or never had) ModSecurity.
+            if !db.latest_report(agent_id)?.is_some_and(|r| waf_usable(&r)) {
+                bail!("VPS này chưa có ModSecurity chạy được: không thêm luật WAF");
+            }
             let note = format!("AI: {}", it.reason);
             match db.add_waf_rule(kind, value, agent_id, &note, who, at)? {
                 crate::db_waf::AddOutcome::Added(id) => {
@@ -508,7 +537,7 @@ pub fn run(st: &Arc<AppState>, agent_id: &str) {
         Ok(t) => t,
         Err(e) => return fail(&provider.name, format!("Gọi AI thất bại: {e:#}")),
     };
-    let parsed = match parse(&text, &d.known, &rules) {
+    let parsed = match parse(&text, &d.known, &rules, d.waf_ok) {
         Ok(p) => p,
         Err(e) => {
             let head: String = text.chars().take(200).collect();
@@ -710,7 +739,7 @@ mod tests {
  {"type":"waf_rule","kind":"ua_token","value":"examplebot","reason":"bot scrape"},
  {"type":"ban_ip","ip":"203.0.113.7","ttl_secs":600,"reason":"dò file"}]}
 ```"#;
-        let p = parse(text, &known(), &[]).unwrap();
+        let p = parse(text, &known(), &[], true).unwrap();
         assert_eq!(p.items.len(), 2, "{:?}", p.rejected);
         assert_eq!(
             p.items[0].action,
@@ -740,7 +769,7 @@ mod tests {
  {"type":"ban_ip","ip":"172.70.12.34","ttl_secs":600,"reason":"cloudflare"},
  {"type":"ban_ip","ip":"1.2.3.4 }; flush ruleset","ttl_secs":600,"reason":"inject"},
  {"type":"ban_ip","ip":"0.0.0.0/0","ttl_secs":600,"reason":"everyone"}]}"#;
-        let p = parse(text, &known(), &[]).unwrap();
+        let p = parse(text, &known(), &[], true).unwrap();
         assert!(p.items.is_empty(), "{:?}", p.items);
         assert_eq!(p.rejected.len(), 5, "{:?}", p.rejected);
     }
@@ -752,7 +781,7 @@ mod tests {
                 r#"{{"actions":[{{"type":"ban_ip","ip":"203.0.113.7","ttl_secs":{ttl},"reason":"r"}}]}}"#
             )
         };
-        let ttl = |t: &str| match &parse(&mk(t), &known(), &[]).unwrap().items[0].action {
+        let ttl = |t: &str| match &parse(&mk(t), &known(), &[], true).unwrap().items[0].action {
             TrafficAction::BanIp { ttl_secs, .. } => *ttl_secs,
             other => panic!("{other:?}"),
         };
@@ -761,7 +790,7 @@ mod tests {
         assert_eq!(ttl("900"), 900);
         // Nothing said: the shortest long ban, never forever.
         let none = r#"{"actions":[{"type":"ban_ip","ip":"203.0.113.7","reason":"r"}]}"#;
-        match &parse(none, &known(), &[]).unwrap().items[0].action {
+        match &parse(none, &known(), &[], true).unwrap().items[0].action {
             TrafficAction::BanIp { ttl_secs, .. } => assert_eq!(*ttl_secs, MAX_BAN_SECS),
             other => panic!("{other:?}"),
         }
@@ -778,7 +807,7 @@ mod tests {
  {"type":"waf_rule","kind":"nope","value":"x","reason":"kind"},
  {"type":"run_shell","cmd":"id","reason":"x"},
  {"type":"waf_rule","kind":"path","value":"/.env","reason":"ok"}]}"#;
-        let p = parse(text, &known(), &have).unwrap();
+        let p = parse(text, &known(), &have, true).unwrap();
         assert_eq!(p.items.len(), 1, "{:?} {:?}", p.items, p.rejected);
         assert_eq!(
             p.items[0].action,
@@ -800,26 +829,32 @@ mod tests {
             })
             .collect();
         let text = format!(r#"{{"actions":[{}]}}"#, rules.join(","));
-        let p = parse(&text, &known(), &[]).unwrap();
+        let p = parse(&text, &known(), &[], true).unwrap();
         assert_eq!(p.items.len(), MAX_RULES);
         assert_eq!(p.rejected.len(), 3);
         let twice = r#"{"actions":[
  {"type":"waf_rule","kind":"path","value":"/.env","reason":"a"},
  {"type":"waf_rule","kind":"path","value":"/.env","reason":"b"}]}"#;
-        let p = parse(twice, &known(), &[]).unwrap();
+        let p = parse(twice, &known(), &[], true).unwrap();
         assert_eq!((p.items.len(), p.rejected.len()), (1, 1));
     }
 
     #[test]
     fn nothing_to_do_and_garbage() {
-        let p = parse(r#"{"summary":"Bình thường.","actions":[]}"#, &known(), &[]).unwrap();
+        let p = parse(
+            r#"{"summary":"Bình thường.","actions":[]}"#,
+            &known(),
+            &[],
+            true,
+        )
+        .unwrap();
         assert!(p.items.is_empty() && p.rejected.is_empty());
         assert!(p.summary.contains("Bình thường"));
-        assert!(parse("tôi không chắc", &known(), &[]).is_err());
-        assert!(parse("{ not json }", &known(), &[]).is_err());
+        assert!(parse("tôi không chắc", &known(), &[], true).is_err());
+        assert!(parse("{ not json }", &known(), &[], true).is_err());
         // No actions key at all is an empty answer, not an error.
         assert!(
-            parse(r#"{"summary":"x"}"#, &known(), &[])
+            parse(r#"{"summary":"x"}"#, &known(), &[], true)
                 .unwrap()
                 .items
                 .is_empty()
@@ -886,11 +921,91 @@ mod tests {
         assert!(worth_analysing(&busy()), "a flagged pattern");
     }
 
+    /// A report whose agent found ModSecurity in this state.
+    fn report_with_waf(engine: &str, rules_file: &str) -> ReportBody {
+        let mut r = report();
+        r.waf = Some(snsec_common::schema::WafStatus {
+            server: "nginx".into(),
+            engine: engine.into(),
+            rules_file: rules_file.into(),
+            ..Default::default()
+        });
+        r
+    }
+
+    fn store_report(db: &Db, id: &str, seq: u64, r: &ReportBody) {
+        let json = serde_json::to_string(r).unwrap();
+        db.record_report(id, seq, 150, r, &json).unwrap();
+    }
+
+    /// A VPS whose agent reports a working ModSecurity.
     fn db_with_agent() -> (tempfile::TempDir, Db, String) {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("t.db")).unwrap();
         let id = db.enroll_agent("web-01", "pk", 100).unwrap();
+        store_report(&db, &id, 1, &report_with_waf("on", "/x/zz-sn-secure.conf"));
         (dir, db, id)
+    }
+
+    #[test]
+    fn a_waf_rule_needs_modsecurity_that_is_running_and_writable() {
+        assert!(waf_usable(&report_with_waf("on", "/x/zz-sn-secure.conf")));
+        assert!(waf_usable(&report_with_waf(
+            "detection_only",
+            "/x/zz-sn-secure.conf"
+        )));
+        // DirectAdmin without ModSecurity, a panel that turned it off, a layout
+        // the agent cannot write into, and an agent that sent no WAF state.
+        assert!(!waf_usable(&report_with_waf("missing", "")));
+        assert!(!waf_usable(&report_with_waf("off", "/x/zz-sn-secure.conf")));
+        assert!(!waf_usable(&report_with_waf("on", "")));
+        assert!(!waf_usable(&report()));
+    }
+
+    #[test]
+    fn a_vps_without_modsecurity_is_told_so_and_gets_no_waf_rule() {
+        let d = digest("web-01", &busy(), &[]);
+        assert!(!d.waf_ok);
+        assert!(d.prompt.contains("\"waf_available\":false"));
+        let mut r = busy();
+        r.waf = report_with_waf("on", "/x/zz-sn-secure.conf").waf;
+        let d = digest("web-01", &r, &[]);
+        assert!(d.waf_ok && d.prompt.contains("\"waf_available\":true"));
+
+        let text = r#"{"summary":"s","actions":[
+ {"type":"waf_rule","kind":"path","value":"/.env","reason":"probe"},
+ {"type":"ban_ip","ip":"203.0.113.7","ttl_secs":600,"reason":"attack"}]}"#;
+        let p = parse(text, &known(), &[], false).unwrap();
+        assert_eq!(p.items.len(), 1, "{:?}", p.items);
+        assert!(matches!(p.items[0].action, TrafficAction::BanIp { .. }));
+        assert_eq!(p.rejected.len(), 1);
+        assert_eq!(parse(text, &known(), &[], true).unwrap().items.len(), 2);
+    }
+
+    #[test]
+    fn an_old_proposal_cannot_add_a_waf_rule_once_modsecurity_is_gone() {
+        let (_d, db, id) = db_with_agent();
+        store_report(&db, &id, 2, &report_with_waf("missing", ""));
+        let row = proposal(
+            &db,
+            &id,
+            vec![rule_item("/.env"), ban_item("203.0.113.7", 600)],
+        );
+        let lines = apply(&db, &row, &[0, 1], "admin", 300);
+        assert!(lines[0].starts_with("Lỗi"), "{lines:?}");
+        assert!(lines[1].starts_with("Đã chặn"), "{lines:?}");
+        assert!(
+            db.waf_rules_for(&id)
+                .unwrap()
+                .iter()
+                .all(|w| w.value != "/.env")
+        );
+        // The ban went through; the rule stays proposed.
+        let row = db.get_traffic(row.id).unwrap().unwrap();
+        assert_eq!(
+            (row.status.as_str(), row.applied.clone()),
+            ("proposed", vec![1])
+        );
     }
 
     fn proposal(db: &Db, id: &str, items: Vec<TrafficItem>) -> TrafficRow {

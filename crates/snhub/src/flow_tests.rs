@@ -987,7 +987,39 @@ fn traffic_items() -> Vec<crate::traffic_ai::TrafficItem> {
 }
 
 fn stored_traffic(h: &Hub, id: &str) -> i64 {
+    use snsec_common::schema::{CycleStats, HostInfo, ReportBody, WafStatus};
     let items = traffic_items();
+    // The VPS runs ModSecurity: without it a stored rule proposal is refused.
+    let rep = ReportBody {
+        agent_version: "0.10.3".into(),
+        host: HostInfo::default(),
+        cycle: CycleStats::default(),
+        bans: vec![],
+        would_ban: vec![],
+        alerts: vec![],
+        triage: None,
+        findings: vec![],
+        applied_desired: Default::default(),
+        capabilities: vec![],
+        active_bans: vec![],
+        active_bans_total: 0,
+        hunt: None,
+        clamav: None,
+        evidence: None,
+        remediation: None,
+        waf: Some(WafStatus {
+            server: "nginx".into(),
+            engine: "on".into(),
+            rules_file: "/etc/nginx/modsec/zz-sn-secure.conf".into(),
+            ..Default::default()
+        }),
+    };
+    let text = serde_json::to_string(&rep).unwrap();
+    h.st.db
+        .lock()
+        .unwrap()
+        .record_report(id, 900, now(), &rep, &text)
+        .unwrap();
     h.st.db
         .lock()
         .unwrap()
