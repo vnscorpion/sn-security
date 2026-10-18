@@ -26,47 +26,50 @@ pub(crate) fn now() -> i64 {
 
 const STYLE: &str = r#"
 :root{
- --bg:#0e1116;--card:#161b22;--card2:#1b222c;--field:#0d1218;--fg:#e8ecf1;--mut:#9aa7b4;
+ --bg:#0e1116;--side:#0b0e13;--card:#161b22;--card2:#1b222c;--field:#0d1218;--fg:#e8ecf1;--mut:#9aa7b4;
  --line:#273039;--acc:#4ca3ff;--acc-ink:#04121f;--bad:#ff6b6b;--warn:#ffc34d;--ok:#45d19a;
- --radius:12px;--ctl:40px;
+ --radius:12px;--ctl:40px;--sidew:236px;
 }
 @media (pointer:coarse){:root{--ctl:44px}}
 *{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%;scroll-behavior:smooth}
-body{margin:0;background:var(--bg);color:var(--fg);
- font:15px/1.6 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+body{margin:0;background:var(--bg);color:var(--fg);min-height:100vh;
+ font:15px/1.6 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+ display:grid;grid-template-columns:var(--sidew) minmax(0,1fr);align-items:start}
 a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}
 a:focus-visible,button:focus-visible,summary:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{
  outline:2px solid var(--acc);outline-offset:2px}
 .skip{position:absolute;left:12px;top:-60px;z-index:20;background:var(--acc);color:var(--acc-ink);
  padding:8px 14px;border-radius:8px;font-weight:700}
 .skip:focus{top:8px;text-decoration:none}
-header{position:sticky;top:0;z-index:5;display:flex;flex-wrap:wrap;align-items:center;gap:6px 14px;
- padding:8px 20px;border-bottom:1px solid var(--line);background:rgba(14,17,22,.92);
- backdrop-filter:blur(8px)}
-header .brand{display:flex;align-items:center;gap:8px;font-weight:800;letter-spacing:.2px;color:var(--fg);
- margin-right:6px;white-space:nowrap}
+/* The menu is a column on the left; under 900px it becomes a bar on top. */
+header{position:sticky;top:0;height:100vh;z-index:5;display:flex;flex-direction:column;gap:16px;
+ padding:18px 12px 14px;border-right:1px solid var(--line);background:var(--side);overflow-y:auto}
+header .brand{display:flex;align-items:center;gap:10px;font-weight:800;font-size:17px;letter-spacing:.2px;
+ color:var(--fg);padding:2px 10px;white-space:nowrap}
 header .brand:hover{text-decoration:none}
-header .logo{width:22px;height:22px;color:var(--acc);flex:none}
-header nav{display:flex;gap:2px;min-width:0}
-header nav a{display:inline-flex;align-items:center;min-height:36px;padding:0 11px;border-radius:8px;
+header .logo{width:26px;height:26px;color:var(--acc);flex:none}
+header nav{display:flex;flex-direction:column;gap:2px}
+header nav a,header .out{display:flex;align-items:center;gap:11px;min-height:40px;padding:0 12px;border-radius:9px;
  color:var(--mut);white-space:nowrap;transition:background .15s,color .15s}
-header nav a:hover{background:var(--card2);color:var(--fg);text-decoration:none}
-header nav a[aria-current=page]{background:var(--card2);color:var(--fg);box-shadow:inset 0 -2px 0 var(--acc)}
-header .sp{flex:1}
+header nav a:hover,header .out:hover{background:var(--card2);color:var(--fg);text-decoration:none}
+header nav a[aria-current=page]{background:rgba(76,163,255,.14);color:#fff;box-shadow:inset 3px 0 0 var(--acc)}
+header .ico{width:18px;height:18px;flex:none;stroke:currentColor;fill:none;stroke-width:1.9;
+ stroke-linecap:round;stroke-linejoin:round}
+header .out{margin-top:auto}
 header form.ipcheck{margin:0}
-header form.ipcheck input{width:190px;min-height:36px;padding:4px 14px;border-radius:999px}
-header .out{color:var(--mut);padding:6px 4px}
-main{max-width:1120px;margin:0 auto;padding:24px 16px 72px}
-h1{font-size:clamp(20px,2.4vw,25px);line-height:1.25;margin:0 0 6px;display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px}
+header form.ipcheck input{width:100%;min-height:38px;padding:4px 14px;border-radius:999px}
+main{width:100%;max-width:1760px;margin:0 auto;padding:28px 36px 80px;min-width:0}
+h1{font-size:clamp(21px,2.2vw,27px);line-height:1.25;margin:0 0 6px;display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px}
 h2{font-size:13px;margin:0 0 12px;color:var(--mut);text-transform:uppercase;letter-spacing:.06em}
-.sub{color:var(--mut);margin:0 0 18px;overflow-wrap:anywhere}
-.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:18px;margin-bottom:16px;
- scroll-margin-top:72px}
-.help{color:var(--mut);font-size:13px;margin:6px 0 0}
+.sub{color:var(--mut);margin:0 0 20px;overflow-wrap:anywhere;max-width:110ch}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px;margin-bottom:16px;
+ scroll-margin-top:84px}
+.help{color:var(--mut);font-size:13px;margin:6px 0 0;max-width:100ch}
+.card ul,.card ol{max-width:104ch}
 .wrap{overflow-x:auto}
 table{width:100%;border-collapse:collapse;min-width:520px;font-variant-numeric:tabular-nums}
-th,td{text-align:left;padding:10px 10px;border-bottom:1px solid var(--line);vertical-align:middle}
+th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:middle}
 th{color:var(--mut);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.04em;white-space:nowrap}
 tr:last-child td{border-bottom:0}
 @media (hover:hover){tbody tr:hover{background:var(--card2)}}
@@ -76,8 +79,8 @@ tr:last-child td{border-bottom:0}
 .b-bad{background:rgba(255,107,107,.16);color:var(--bad)}
 .b-mut{background:rgba(154,167,180,.16);color:var(--mut)}
 .mut{color:var(--mut)}
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:18px}
-.stat{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:14px 16px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-bottom:18px}
+.stat{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:14px 18px}
 .stat .n{font-size:28px;font-weight:800;line-height:1.1;font-variant-numeric:tabular-nums}
 .stat .l{color:var(--mut);font-size:13px;margin-top:2px}
 input,select,button,textarea{font:inherit;padding:8px 12px;min-height:var(--ctl);border-radius:9px;
@@ -95,10 +98,17 @@ button[disabled]{opacity:.5;cursor:not-allowed}
 button.ghost{background:transparent;border:1px solid var(--line);color:var(--fg)}
 button.ghost:hover{background:var(--card2);filter:none}
 button.bad{background:var(--bad);color:#2a0606}
+@media (pointer:fine){td button{min-height:34px;padding:3px 13px;font-size:14px}}
 label.f{display:block}
 label.f .t{display:block;color:var(--mut);font-size:12px;margin-bottom:5px}
 .ctrls{display:flex;gap:14px 22px;flex-wrap:wrap;align-items:flex-end}
 .ctrls form{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;margin:0}
+/* A row of labelled fields lines up as a grid; the wide ones (flex:1 inline) take two columns. */
+.ctrls:has(>label.f){display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px 18px;align-items:end}
+.ctrls:has(>label.f)>label.f input,.ctrls:has(>label.f)>label.f select{width:100%}
+.ctrls:has(>label.f)>label.f[style*="flex:1"]{grid-column:span 2}
+form+.ctrls:has(>label.f),.ctrls:has(>label.f)+.ctrls:has(>label.f){margin-top:14px}
+@media (max-width:700px){.ctrls:has(>label.f)>label.f[style*="flex:1"]{grid-column:auto}}
 .divider{height:1px;background:var(--line);border:0;margin:16px 0}
 code{background:var(--field);padding:2px 7px;border-radius:6px;font-size:13px;word-break:break-all}
 pre{background:var(--field);padding:14px;border-radius:9px;overflow:auto;white-space:pre-wrap;word-break:break-all;
@@ -109,29 +119,55 @@ pre{background:var(--field);padding:14px;border-radius:9px;overflow:auto;white-s
 details>summary{cursor:pointer;padding:8px 0;border-radius:8px}
 details.note>summary{padding:0;color:var(--fg);font-weight:600}
 details.note[open]>summary{margin-bottom:6px}
-.jump{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 18px}
-.jump a{display:inline-flex;align-items:center;min-height:36px;padding:0 14px;border-radius:999px;
+.jump{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 16px;padding:10px 0;position:sticky;top:0;z-index:4;
+ background:linear-gradient(var(--bg) 78%,rgba(14,17,22,0))}
+.jump a{display:inline-flex;align-items:center;min-height:34px;padding:0 14px;border-radius:999px;
  border:1px solid var(--line);background:var(--card);color:var(--fg);font-size:13px;font-weight:600}
 .jump a:hover{background:var(--card2);border-color:var(--acc);text-decoration:none}
 .crumb{display:inline-flex;align-items:center;min-height:32px;margin:0 0 4px;color:var(--mut)}
-@media (max-width:760px){
- header{position:static;flex-wrap:wrap;padding:10px 14px}
- header .sp{display:none}
- header nav{order:3;flex:1 0 100%;overflow-x:auto;margin:0 -14px;padding:0 14px;scrollbar-width:none}
+/* Wide screens: two columns where the content is made of cards. */
+@media (min-width:1800px){
+ .split{display:grid;grid-template-columns:minmax(0,1fr) 340px;gap:16px;align-items:start}
+ .split>.card{margin-bottom:0}
+ .split>.card:last-child{position:sticky;top:20px}
+ .split>.card:last-child .ctrls{flex-direction:column;align-items:stretch}
+ .split>.card:last-child button{width:100%}
+}
+@media (min-width:1500px){
+ .pair{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px;align-items:start}
+ .pair>.card{margin-bottom:0}
+}
+@media (min-width:1440px){
+ .cols{display:grid;grid-template-columns:minmax(0,1.08fr) minmax(0,1fr);gap:0 16px;align-items:start}
+}
+.col{min-width:0}
+@media (max-width:1100px){
+ body{display:block}
+ header{position:static;height:auto;flex-direction:row;flex-wrap:wrap;align-items:center;gap:6px 12px;
+  padding:10px 14px;border-right:0;border-bottom:1px solid var(--line);overflow:visible}
+ header .brand{padding:2px 4px}
+ header nav{order:3;flex:1 0 100%;flex-direction:row;overflow-x:auto;margin:0 -14px;padding:0 14px;scrollbar-width:none}
  header nav::-webkit-scrollbar{display:none}
+ header nav a{padding:0 11px;min-height:38px}
  header form.ipcheck{flex:1;min-width:0;margin-left:auto}
- header form.ipcheck input{width:100%}
+ header .out{margin:0}
+ header .out span{display:none}
  main{padding:18px 12px 56px}
- .card{padding:14px}
+ .card{padding:14px;scroll-margin-top:16px}
+ .jump{position:static;background:none;padding:0}
+}
+/* Squeezed between the menu and the screen edge: drop the two least useful columns. */
+@media (min-width:761px) and (max-width:1359px){.opt{display:none}}
+@media (max-width:760px){
  table.stack{min-width:0}
  table.stack thead{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
- table.stack,table.stack tbody,table.stack tr,table.stack td{display:block;width:100%}
- table.stack tr{padding:10px 0;border-bottom:1px solid var(--line)}
+ table.stack,table.stack tbody{display:block;width:100%}
+ table.stack tr{display:grid;grid-template-columns:1fr 1fr;gap:2px 14px;padding:12px 0;border-bottom:1px solid var(--line)}
  table.stack tr:last-child{border-bottom:0}
- table.stack td{display:flex;justify-content:space-between;align-items:center;gap:14px;border:0;padding:4px 2px;text-align:right}
- table.stack td::before{content:attr(data-label);color:var(--mut);font-size:12px;text-transform:uppercase;
-  letter-spacing:.04em;text-align:left;flex:none}
- table.stack td.name{display:block;text-align:left;padding-bottom:6px;font-size:16px}
+ table.stack td{display:block;border:0;padding:4px 2px;text-align:left}
+ table.stack td::before{content:attr(data-label);display:block;color:var(--mut);font-size:11px;
+  text-transform:uppercase;letter-spacing:.04em;margin-bottom:2px}
+ table.stack td.name{grid-column:1/-1;padding-bottom:6px;font-size:16px}
  table.stack td.name::before{content:none}
 }
 @media (prefers-reduced-motion:reduce){
@@ -146,6 +182,51 @@ const NAV_MARK: &str = "(function(){var p=location.pathname;if(p.indexOf('/agent
 var best=null,len=-1;document.querySelectorAll('header nav a').forEach(function(a){\
 var h=a.getAttribute('href');if((h===p||(h!=='/'&&p.indexOf(h+'/')===0))&&h.length>len){best=a;len=h.length}});\
 if(best)best.setAttribute('aria-current','page')})();";
+
+/// Menu entries: address, label, icon (24x24 outline path).
+const MENU: [(&str, &str, &str); 7] = [
+    (
+        "/",
+        "Tổng quan",
+        "M3 3h7v9H3zM14 3h7v5h-7zM14 12h7v9h-7zM3 16h7v5H3z",
+    ),
+    (
+        "/add-vps",
+        "Thêm VPS",
+        "M12 8v8M8 12h8M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z",
+    ),
+    (
+        "/log",
+        "Nhật ký",
+        "M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01",
+    ),
+    (
+        "/settings",
+        "Cài đặt AI",
+        "M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9zM19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8z",
+    ),
+    (
+        "/waf",
+        "WAF",
+        "M12 2.5 4.5 5.5v5.7c0 4.7 3.1 8.6 7.5 10.3 4.4-1.7 7.5-5.6 7.5-10.3V5.5zM8.8 12l2.4 2.4 4.2-4.6",
+    ),
+    (
+        "/settings/hermes",
+        "Hermes",
+        "M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7",
+    ),
+    (
+        "/security",
+        "Bảo mật",
+        "M5 11h14v10H5zM8 11V7a4 4 0 0 1 8 0v4",
+    ),
+];
+
+fn icon(d: &str) -> Markup {
+    html! {
+        svg class="ico" viewBox="0 0 24 24" aria-hidden="true" { path d=(d) {} }
+    }
+}
 
 pub(crate) fn shell(title: &str, body: Markup) -> Markup {
     html! {
@@ -169,20 +250,15 @@ pub(crate) fn shell(title: &str, body: Markup) -> Markup {
                         }
                         "SN Secure"
                     }
-                    nav aria-label="Menu chính" {
-                        a href="/" { "Tổng quan" }
-                        a href="/add-vps" { "Thêm VPS" }
-                        a href="/log" { "Nhật ký" }
-                        a href="/settings" { "Cài đặt AI" }
-                        a href="/waf" { "WAF" }
-                        a href="/settings/hermes" { "Hermes" }
-                        a href="/security" { "Bảo mật" }
-                    }
-                    span class="sp" {}
                     form class="ipcheck" method="get" action="/check-ip" role="search" {
                         input type="text" name="ip" placeholder="Tra cứu IP..." autocomplete="off" aria-label="Tra cứu IP";
                     }
-                    a class="out" href="/logout" { "Đăng xuất" }
+                    nav aria-label="Menu chính" {
+                        @for (href, label, d) in MENU {
+                            a href=(href) { (icon(d)) span { (label) } }
+                        }
+                    }
+                    a class="out" href="/logout" { (icon("M9 21H5V3h4M16 17l5-5-5-5M21 12H9")) span { "Đăng xuất" } }
                 }
                 main id="main" { (body) }
                 script { (maud::PreEscaped(NAV_MARK)) }
@@ -863,12 +939,13 @@ pub async fn overview(
             b { "Chặn tự động" } " = tự chặn IP xấu. Đổi chế độ trong trang từng VPS."
         }
 
+        div class="split" {
         div class="card" {
             div class="wrap" {
                 table class="stack" {
                     thead { tr {
-                        th { "VPS" } th { "Trạng thái" } th { "Chế độ" } th { "Tải CPU" } th { "RAM" }
-                        th { "Lượt truy cập" } th { "IP chặn" } th { "Cảnh báo" } th { "Bản sn" } th { "Cập nhật" }
+                        th { "VPS" } th { "Trạng thái" } th { "Chế độ" } th class="opt" { "Tải CPU" } th { "RAM" }
+                        th { "Lượt truy cập" } th { "IP chặn" } th { "Cảnh báo" } th class="opt" { "Bản sn" } th { "Cập nhật" }
                     }}
                     tbody {
                         @if rows.is_empty() {
@@ -880,13 +957,13 @@ pub async fn overview(
                                 td class="name" { a href={"/agent/" (a.id)} title=(a.id) { b { (a.name) } } }
                                 td data-label="Trạng thái" { (status_badge(a.last_seen)) }
                                 td data-label="Chế độ" { (mode_badge(&a.mode)) }
-                                td data-label="Tải CPU" { (format!("{:.2}", row.load)) }
+                                td class="opt" data-label="Tải CPU" { (format!("{:.2}", row.load)) }
                                 td data-label="RAM" { (mem_badge(row.mem)) }
                                 td data-label="Lượt truy cập" { (row.req) }
                                 // Bans are the protection working, not a fault: neutral colour.
                                 td data-label="IP chặn" { @if row.bans > 0 { span class="badge b-mut" { (row.bans) } } @else { "0" } }
                                 td data-label="Cảnh báo" { @if row.alerts > 0 { span class="badge b-warn" { (row.alerts) } } @else { "0" } }
-                                td class="mut" data-label="Bản sn" {
+                                td class="mut opt" data-label="Bản sn" {
                                     (a.version)
                                     @if agent_outdated(&a.version) { " " span class="badge b-warn" { "cũ" } }
                                 }
@@ -916,6 +993,7 @@ pub async fn overview(
                     }
                 }
             }
+        }
         }
     };
     Html(shell("Tổng quan", body).into_string()).into_response()
@@ -1108,6 +1186,48 @@ pub async fn agent_detail(
             a href="#waf" { "WAF" }
         }
 
+        @if let Some(r) = &report {
+            div class="stats" {
+                div class="stat" { div class="n" { (r.cycle.requests) } div class="l" { "Lượt truy cập / lần quét" } }
+                div class="stat" { div class="n" { (format!("{:.2}", r.cycle.load1)) } div class="l" { "Tải CPU (load 1 phút)" } }
+                div class="stat" { div class="n" { (format!("{:.0}%", r.cycle.cpu_busy_pct)) } div class="l" { "CPU đang dùng" } }
+                // Always shown, so a missing figure is explained instead of silently absent.
+                @if r.cycle.mem_total_mb > 0 {
+                    div class="stat" {
+                        div class="n" style=(if r.cycle.mem_used_pct >= 90.0 {"color:var(--bad)"} else if r.cycle.mem_used_pct >= 75.0 {"color:var(--warn)"} else {""}) {
+                            (format!("{:.0}%", r.cycle.mem_used_pct))
+                        }
+                        div class="l" { "RAM đang dùng (tổng " (r.cycle.mem_total_mb) " MB)" }
+                    }
+                    div class="stat" {
+                        div class="n" { (format!("{:.0}%", r.cycle.swap_used_pct)) }
+                        div class="l" { "Swap đang dùng" }
+                    }
+                } @else {
+                    div class="stat" {
+                        div class="n mut" { "—" }
+                        div class="l" { "RAM: chưa có số liệu — agent trên VPS này cần cập nhật" }
+                    }
+                }
+                // Older agents do not send this, so 0 would be a false alarm for them.
+                @if !agent_outdated(&agent.version) {
+                    div class="stat" {
+                        div class="n" style=(if r.cycle.log_files == 0 {"color:var(--bad)"} else {""}) { (r.cycle.log_files) }
+                        div class="l" { "File log đang theo dõi" }
+                    }
+                }
+            }
+
+            @if r.cycle.watch_blind {
+                div class="note" style="border-left-color:var(--warn)" {
+                    "Agent không đọc được log web server (chi tiết ở Cảnh báo). Chạy " code { "sn env" } " trên VPS để kiểm tra."
+                }
+            }
+        }
+
+        // Two columns on a wide screen: what to do on the left, what the VPS shows on the right.
+        div class="cols" {
+        div class="col" {
         div class="card" id="ctl" {
             h2 { "Điều khiển" }
             @if aq.at == "ctl" && !aq.msg.trim().is_empty() {
@@ -1243,44 +1363,9 @@ pub async fn agent_detail(
             }
         }
 
+        }
+        div class="col" {
         @if let Some(r) = &report {
-            div class="stats" {
-                div class="stat" { div class="n" { (r.cycle.requests) } div class="l" { "Lượt truy cập / lần quét" } }
-                div class="stat" { div class="n" { (format!("{:.2}", r.cycle.load1)) } div class="l" { "Tải CPU (load 1 phút)" } }
-                div class="stat" { div class="n" { (format!("{:.0}%", r.cycle.cpu_busy_pct)) } div class="l" { "CPU đang dùng" } }
-                // Always shown, so a missing figure is explained instead of silently absent.
-                @if r.cycle.mem_total_mb > 0 {
-                    div class="stat" {
-                        div class="n" style=(if r.cycle.mem_used_pct >= 90.0 {"color:var(--bad)"} else if r.cycle.mem_used_pct >= 75.0 {"color:var(--warn)"} else {""}) {
-                            (format!("{:.0}%", r.cycle.mem_used_pct))
-                        }
-                        div class="l" { "RAM đang dùng (tổng " (r.cycle.mem_total_mb) " MB)" }
-                    }
-                    div class="stat" {
-                        div class="n" { (format!("{:.0}%", r.cycle.swap_used_pct)) }
-                        div class="l" { "Swap đang dùng" }
-                    }
-                } @else {
-                    div class="stat" {
-                        div class="n mut" { "—" }
-                        div class="l" { "RAM: chưa có số liệu — agent trên VPS này cần cập nhật" }
-                    }
-                }
-                // Older agents do not send this, so 0 would be a false alarm for them.
-                @if !agent_outdated(&agent.version) {
-                    div class="stat" {
-                        div class="n" style=(if r.cycle.log_files == 0 {"color:var(--bad)"} else {""}) { (r.cycle.log_files) }
-                        div class="l" { "File log đang theo dõi" }
-                    }
-                }
-            }
-
-            @if r.cycle.watch_blind {
-                div class="note" style="border-left-color:var(--warn)" {
-                    "Agent không đọc được log web server (chi tiết ở Cảnh báo). Chạy " code { "sn env" } " trên VPS để kiểm tra."
-                }
-            }
-
             @if !r.alerts.is_empty() {
                 div class="card" {
                     h2 { "Cảnh báo" }
@@ -1378,6 +1463,12 @@ pub async fn agent_detail(
                 }
             }
 
+        }
+        }
+        }
+
+        // Full width: the findings and the WAF rules have long paths and many columns.
+        @if let Some(r) = &report {
             // Always shown: "scanned, nothing found" must look different from "never scanned".
             div class="card" id="scan" {
                 h2 { "Quét mã độc" }

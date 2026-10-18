@@ -553,6 +553,7 @@ pub async fn settings_page(
             }
         }
 
+        div class="pair" {
         div class="card" id="form" {
             h2 { (if editing.is_some() { "Sửa nhà cung cấp" } else { "Thêm nhà cung cấp" }) }
             form method="post" action="/settings/provider" {
@@ -598,6 +599,7 @@ pub async fn settings_page(
                 li { "AI không chạy lệnh. Nó chỉ chọn trong danh sách hành động cố định (dừng tiến trình, khoá shell, cách ly file, gỡ dòng khỏi file khởi động shell, tắt vài dịch vụ), và chỉ nhắm vào thứ có trong bằng chứng. Hub và agent kiểm tra lại, mọi hành động (trừ dừng tiến trình) hoàn tác được." }
                 li { "Nội dung trong bằng chứng do máy có thể đã bị xâm nhập viết ra, kẻ tấn công có thể chèn câu chữ nhằm lừa AI. Vì vậy mức " b { "Tự xử lý" } " chỉ nên bật sau khi bạn đã xem AI đề xuất đúng vài lần ở chế độ duyệt." }
             }
+        }
         }
     };
     Html(shell("Cài đặt AI", body).into_string()).into_response()

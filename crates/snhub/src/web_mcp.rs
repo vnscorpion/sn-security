@@ -98,6 +98,7 @@ fn render(st: &AppState, msg: &str, fresh: Option<(&str, &str, &str)>) -> Respon
                 } }
             }
         }
+        div class="pair" {
         div class="card" {
             h2 { "Tạo token" }
             form method="post" action="/settings/hermes/token" {
@@ -128,6 +129,7 @@ fn render(st: &AppState, msg: &str, fresh: Option<(&str, &str, &str)>) -> Respon
         div class="card" {
             h2 { "Cấu hình Hermes" }
             (config_snippet(&url, None))
+        }
         }
     };
     Html(shell("Hermes", body).into_string()).into_response()
