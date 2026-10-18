@@ -141,7 +141,7 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<Vec<Finding>> 
             let Some(bytes) = bytes else {
                 continue;
             };
-            let score = if is_php {
+            let mut score = if is_php {
                 heuristic::score_php(&bytes, is_upload, false)
             } else if is_config {
                 heuristic::score_config(&name, &bytes)
@@ -153,6 +153,10 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<Vec<Finding>> 
             } else {
                 continue;
             };
+            // PHPUnit and its phar run commands by design.
+            if is_php && is_dev_tool(path, &ext) {
+                heuristic::cap_without_strong_rule(&mut score);
+            }
 
             scanned += 1;
             // ClamAV gets the PHP the heuristic opened, and any picture or
@@ -181,7 +185,10 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<Vec<Finding>> 
                     _ => clam_skipped += 1,
                 }
             }
-            if score.verdict == Verdict::Clean {
+            // A file that merely names an encoder (a comment, a pattern) is no
+            // finding: there is nothing to do about it, and a list full of them
+            // hides what matters.
+            if matches!(score.verdict, Verdict::Clean | Verdict::EncodedCommercial) {
                 continue;
             }
             let mut hasher = Sha256::new();
@@ -348,6 +355,12 @@ pub fn store_remaining(state: &State, remaining: &[Finding]) {
     }
 }
 
+/// Test tooling that runs commands by design: PHPUnit under `vendor`, and any
+/// phar (PHPUnit is shipped as one).
+fn is_dev_tool(path: &Path, ext: &str) -> bool {
+    ext == "phar" || path.to_string_lossy().contains("/vendor/phpunit/")
+}
+
 fn is_upload_path(path: &Path) -> bool {
     let s = path.to_string_lossy();
     s.contains("/uploads/") || s.contains("/wp-content/uploads") || s.contains("/cache/")
@@ -507,6 +520,83 @@ mod tests {
         let p = dir.join(rel);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, bytes).unwrap();
+    }
+
+    #[test]
+    fn test_tooling_is_reported_but_not_called_malicious_and_encoder_mentions_are_no_finding() {
+        // Weak signs that add up to "malicious": a command call, an argument from
+        // `$_SERVER`, a write to disk.
+        let weak = [
+            "<?php $s = $_",
+            "SERVER['argv']; $p = proc_open($this->cmd($s), $spec, $pipes); file_put_",
+            "contents($_",
+            "SERVER['x'], 'y');",
+        ]
+        .concat();
+        // A strong sign: the request body run as code (CVE-2017-9841's file).
+        let strong = [
+            "<?php ev",
+            "al('?>' . file_get_contents('php://",
+            "input'));",
+        ]
+        .concat();
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        write(
+            p,
+            "a/vendor/phpunit/phpunit/src/Util/PHP/DefaultPhpProcess.php",
+            weak.as_bytes(),
+        );
+        write(
+            p,
+            "a/vendor/mercadopago/dx-php/phpunit.phar",
+            weak.as_bytes(),
+        );
+        write(
+            p,
+            "a/vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php",
+            strong.as_bytes(),
+        );
+        write(p, "b/app/weak.php", weak.as_bytes());
+        write(
+            p,
+            "c/wp-content/plugins/x/Loader.php",
+            b"<?php // works with the ionCube loader too\nfunction f() { return 1; }\n",
+        );
+        let state_dir = tempfile::tempdir().unwrap();
+        let state = State::at(state_dir.path().to_path_buf());
+
+        let findings = run(&default_cfg(), &state, &opts(p)).unwrap();
+
+        let verdict_of = |suffix: &str| {
+            findings
+                .iter()
+                .find(|f| f.path.ends_with(suffix))
+                .map(|f| f.verdict.clone())
+        };
+        // Reported, never "malicious": `sn clean` leaves them alone.
+        assert_eq!(
+            verdict_of("DefaultPhpProcess.php").as_deref(),
+            Some("suspicious")
+        );
+        assert_eq!(verdict_of("phpunit.phar").as_deref(), Some("suspicious"));
+        let phar = findings
+            .iter()
+            .find(|f| f.path.ends_with("phpunit.phar"))
+            .unwrap();
+        assert!(phar.rules.iter().any(|r| r == "known-dev-tool") && phar.score == 99);
+        // The same weak signs anywhere else stay "malicious"; a strong sign stays
+        // "malicious" even in PHPUnit's folder.
+        assert_eq!(verdict_of("weak.php").as_deref(), Some("malicious"));
+        assert_eq!(verdict_of("eval-stdin.php").as_deref(), Some("malicious"));
+        // A file that only names an encoder is not a finding.
+        assert!(verdict_of("Loader.php").is_none(), "{findings:?}");
+        // The summary counts follow.
+        let summary: HuntSummary =
+            serde_json::from_slice(&std::fs::read(state.dir.join("hunt-latest.json")).unwrap())
+                .unwrap();
+        assert_eq!((summary.malicious, summary.suspicious), (2, 2));
+        assert_eq!(summary.scorer, heuristic::SCORER_VERSION);
     }
 
     #[test]

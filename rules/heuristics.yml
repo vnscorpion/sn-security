@@ -34,6 +34,12 @@ rules:
   - name: tainted-to-sink
     weight: 70             # suspicious on its own, never auto-quarantined
     when: a tainted variable is in the arguments of one of those calls
+  - name: decoded-to-sink
+    weight: 100            # malicious on its own
+    when: the tainted variable was decoded on the way (base64_decode, hex2bin, gzinflate, str_rot13, strrev), also through other wrappers
+  - name: tainted-command-capture
+    weight: 100            # malicious on its own
+    when: a tainted variable is run by a command call whose arguments fold the errors into the output (2>&1), as a web shell does to show them on the page
   - name: decode-into-eval
     weight: 60             # 80 when two or more decoders chain
     when: base64_decode/gzinflate/gzuncompress/str_rot13/strrev/hex2bin/... inside a bare eval/assert
@@ -110,7 +116,19 @@ removed:
 
 notes:
   - Commercial encoders (ionCube, SourceGuardian, Zend) are classified
-    `encoded-commercial` and are not scored on entropy/base64.
+    `encoded-commercial` and are not scored on entropy/base64. `sn hunt` does
+    not list them as findings: a file that only names an encoder is nothing to act on.
+  - input-as-function needs what follows the `(` to look like arguments
+    (`$`, a quote, a number, a call), so a docblock saying
+    `$_SERVER['HTTP_HOST'] (if any)` is not a call.
+  - args_window ends at the call's closing bracket (brackets inside quotes do
+    not count) or at `;`.
+  - Test tooling (a file under /vendor/phpunit/, any .phar) is not "malicious"
+    on weak rules alone: without one of source-to-sink, input-as-function,
+    decode-into-eval, preg_replace-e, decoded-to-sink, tainted-command-capture
+    it is capped at 99 (suspicious) and gets the rule `known-dev-tool`.
+  - SCORER_VERSION (3) is written into every scan result; an agent drops a
+    result of an older version.
   - Known gaps: function names built by concatenation ($f = 'ev'.'al'; $f($x)),
     non-PHP injections (JavaScript, database), no WordPress core/plugin checksum
     comparison yet, detection rate never measured on a real malware corpus.
