@@ -1496,3 +1496,108 @@ fn shell_words_are_quoted_only_when_needed() {
 
 #[path = "flow_tests_mcp.rs"]
 mod mcp_flow;
+
+fn a_passkey() -> crate::webauthn::Credential {
+    crate::webauthn::Credential {
+        id: "cHAx".into(),
+        x: [1; 32],
+        y: [2; 32],
+        sign_count: 0,
+    }
+}
+
+/// Sign in with the password and return the cookie of the pending second step.
+async fn pending_second_step(h: &Hub) -> String {
+    let r = h.post("/login", "", &pw_form()).await;
+    assert_eq!(r.location(), "/login/2fa", "{}", r.body);
+    format!("snhub_2fa={}", r.set_cookie("snhub_2fa").unwrap())
+}
+
+const AUTO_PASSKEY: &str = "setTimeout(function(){usePasskey(true)}";
+
+#[tokio::test]
+async fn the_second_step_asks_for_the_passkey_by_itself() {
+    let h = hub();
+    h.st.db
+        .lock()
+        .unwrap()
+        .add_passkey(&a_passkey(), "Laptop", now())
+        .unwrap();
+    let pending = pending_second_step(&h).await;
+    let page = h.get("/login/2fa", &pending).await;
+    assert_eq!(page.status, StatusCode::OK);
+    // The prompt starts by itself, and the button is there to try again.
+    assert!(page.body.contains(AUTO_PASSKEY), "{}", page.body);
+    assert!(page.body.contains("Dùng passkey"));
+    assert!(page.body.contains("Xác nhận bằng passkey"));
+    // The sign-in steps carry no admin menu: nothing to click before there is a session.
+    assert!(!page.body.contains("/add-vps") && !page.body.contains("Đăng xuất"));
+    assert!(page.body.contains("bare-brand"));
+    let login = h.get("/login", "").await;
+    assert!(!login.body.contains("/add-vps") && login.body.contains("bare-brand"));
+    // No authenticator app: no code form to show, only the recovery code.
+    assert!(!page.body.contains("one-time-code"));
+    assert!(page.body.contains("Mất thiết bị?"));
+    // After a wrong recovery code the person chose another way: no new prompt.
+    let page = h.get("/login/2fa?err=recovery", &pending).await;
+    assert!(!page.body.contains(AUTO_PASSKEY));
+    assert!(page.body.contains("Dùng passkey"), "the button stays");
+}
+
+#[tokio::test]
+async fn with_both_the_passkey_comes_first_and_the_app_code_is_folded_away() {
+    let h = hub();
+    let cookie = h.sign_in().await;
+    enrol_totp(&h, &cookie).await;
+    h.st.db
+        .lock()
+        .unwrap()
+        .add_passkey(&a_passkey(), "Laptop", now())
+        .unwrap();
+    let pending = pending_second_step(&h).await;
+    let page = h.get("/login/2fa", &pending).await;
+    assert!(page.body.contains(AUTO_PASSKEY));
+    // The code form is still there, inside a closed fold, and not focused.
+    let at = page.body.find("Dùng mã từ ứng dụng").expect("fold");
+    assert!(page.body[..at].contains("<details"), "{}", page.body);
+    assert!(page.body.contains("one-time-code"));
+    assert!(!page.body.contains("autofocus"));
+    let tag_start = page.body[..at].rfind("<details").unwrap();
+    assert!(
+        !page.body[tag_start..at].contains(" open"),
+        "closed: {}",
+        &page.body[tag_start..at]
+    );
+    // After a wrong app code the fold is open, the field focused, no new prompt.
+    let page = h.get("/login/2fa?err=code", &pending).await;
+    assert!(!page.body.contains(AUTO_PASSKEY));
+    let tag_start = page
+        .body
+        .find("Dùng mã từ ứng dụng")
+        .and_then(|at| page.body[..at].rfind("<details"))
+        .unwrap();
+    let tag_end = page.body[tag_start..].find('>').unwrap() + tag_start;
+    assert!(
+        page.body[tag_start..tag_end].contains(" open"),
+        "open: {}",
+        &page.body[tag_start..tag_end]
+    );
+    assert!(page.body.contains("autofocus"));
+    assert!(page.body.contains("Mã không đúng"));
+}
+
+#[tokio::test]
+async fn without_a_passkey_the_second_step_is_as_before() {
+    let h = hub();
+    let cookie = h.sign_in().await;
+    enrol_totp(&h, &cookie).await;
+    let pending = pending_second_step(&h).await;
+    let page = h.get("/login/2fa", &pending).await;
+    assert!(!page.body.contains("usePasskey"));
+    assert!(page.body.contains("one-time-code"));
+    assert!(page.body.contains("autofocus"), "the code field is focused");
+    assert!(
+        !page.body.contains("Dùng mã từ ứng dụng"),
+        "no fold without a passkey"
+    );
+}

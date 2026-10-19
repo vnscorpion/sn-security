@@ -59,6 +59,10 @@ header .ico{width:18px;height:18px;flex:none;stroke:currentColor;fill:none;strok
 header .out{margin-top:auto}
 header form.ipcheck{margin:0}
 header form.ipcheck input{width:100%;min-height:38px;padding:4px 14px;border-radius:999px}
+body.bare{display:block}
+body.bare .bare-brand{display:flex;align-items:center;justify-content:center;gap:10px;font-weight:800;font-size:19px;padding:7vh 0 0}
+body.bare .logo{width:28px;height:28px;color:var(--acc)}
+body.bare main{max-width:520px;padding-top:12px}
 main{width:100%;max-width:1760px;margin:0 auto;padding:28px 36px 80px;min-width:0}
 h1{font-size:clamp(21px,2.2vw,27px);line-height:1.25;margin:0 0 6px;display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px}
 h2{font-size:13px;margin:0 0 12px;color:var(--mut);text-transform:uppercase;letter-spacing:.06em}
@@ -229,6 +233,16 @@ fn icon(d: &str) -> Markup {
 }
 
 pub(crate) fn shell(title: &str, body: Markup) -> Markup {
+    page(title, body, false)
+}
+
+/// A page without the menu, for the steps of signing in (there is no session yet,
+/// so a menu of admin pages would only lead back to the password form).
+pub(crate) fn shell_bare(title: &str, body: Markup) -> Markup {
+    page(title, body, true)
+}
+
+fn page(title: &str, body: Markup, bare: bool) -> Markup {
     html! {
         (DOCTYPE)
         html lang="vi" {
@@ -239,30 +253,46 @@ pub(crate) fn shell(title: &str, body: Markup) -> Markup {
                 title { "SN Secure — " (title) }
                 style { (maud::PreEscaped(STYLE)) }
             }
-            body {
-                a class="skip" href="#main" { "Bỏ qua menu" }
-                header {
-                    a class="brand" href="/" {
-                        svg class="logo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-                            stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" {
-                            path d="M12 2.5 4.5 5.5v5.7c0 4.7 3.1 8.6 7.5 10.3 4.4-1.7 7.5-5.6 7.5-10.3V5.5L12 2.5Z" {}
-                            path d="m8.8 12 2.4 2.4 4.2-4.6" {}
-                        }
+            body class=[bare.then_some("bare")] {
+                @if bare {
+                    div class="bare-brand" {
+                        (logo())
                         "SN Secure"
                     }
-                    form class="ipcheck" method="get" action="/check-ip" role="search" {
-                        input type="text" name="ip" placeholder="Tra cứu IP..." autocomplete="off" aria-label="Tra cứu IP";
-                    }
-                    nav aria-label="Menu chính" {
-                        @for (href, label, d) in MENU {
-                            a href=(href) { (icon(d)) span { (label) } }
+                } @else {
+                    a class="skip" href="#main" { "Bỏ qua menu" }
+                    header {
+                        a class="brand" href="/" {
+                            (logo())
+                            "SN Secure"
                         }
+                        form class="ipcheck" method="get" action="/check-ip" role="search" {
+                            input type="text" name="ip" placeholder="Tra cứu IP..." autocomplete="off" aria-label="Tra cứu IP";
+                        }
+                        nav aria-label="Menu chính" {
+                            @for (href, label, d) in MENU {
+                                a href=(href) { (icon(d)) span { (label) } }
+                            }
+                        }
+                        a class="out" href="/logout" { (icon("M9 21H5V3h4M16 17l5-5-5-5M21 12H9")) span { "Đăng xuất" } }
                     }
-                    a class="out" href="/logout" { (icon("M9 21H5V3h4M16 17l5-5-5-5M21 12H9")) span { "Đăng xuất" } }
                 }
                 main id="main" { (body) }
-                script { (maud::PreEscaped(NAV_MARK)) }
+                @if !bare {
+                    script { (maud::PreEscaped(NAV_MARK)) }
+                }
             }
+        }
+    }
+}
+
+/// The shield mark of the brand.
+fn logo() -> Markup {
+    html! {
+        svg class="logo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" {
+            path d="M12 2.5 4.5 5.5v5.7c0 4.7 3.1 8.6 7.5 10.3 4.4-1.7 7.5-5.6 7.5-10.3V5.5L12 2.5Z" {}
+            path d="m8.8 12 2.4 2.4 4.2-4.6" {}
         }
     }
 }

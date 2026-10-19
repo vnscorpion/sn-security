@@ -28,7 +28,7 @@ use crate::AppState;
 use crate::auth::{self, PENDING_COOKIE};
 use crate::db_auth::{hash_recovery, new_recovery_codes};
 use crate::totp;
-use crate::web::{now, rel_time, shell, urlenc};
+use crate::web::{now, rel_time, shell, shell_bare, urlenc};
 use crate::webauthn;
 
 // ---------------------------------------------------------------------------
@@ -317,9 +317,9 @@ fn jerr(status: StatusCode, msg: &str) -> Response {
 
 fn login_card(title: &str, inner: Markup) -> Html<String> {
     Html(
-        shell(
+        shell_bare(
             title,
-            html! { div class="card" style="max-width:420px;margin:8vh auto" { (inner) } },
+            html! { div class="card" style="max-width:420px;margin:14px auto" { (inner) } },
         )
         .into_string(),
     )
@@ -630,7 +630,7 @@ pub async fn logout(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Resp
 const B64_JS: &str = "const b64d=s=>{s=s.replace(/-/g,'+').replace(/_/g,'/');while(s.length%4)s+='=';return Uint8Array.from(atob(s),c=>c.charCodeAt(0))};\
 const b64e=b=>{let s='';new Uint8Array(b).forEach(x=>s+=String.fromCharCode(x));return btoa(s).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'')};";
 
-const LOGIN_PASSKEY_JS: &str = "async function usePasskey(){const out=document.getElementById('pk-msg');out.textContent='';try{\
+const LOGIN_PASSKEY_JS: &str = "async function usePasskey(auto){const out=document.getElementById('pk-msg');out.textContent='';try{\
 const r=await fetch('/login/passkey/options',{method:'POST',credentials:'same-origin'});const o=await r.json();\
 if(!o.challenge){out.textContent=o.error||'Lỗi';return}\
 const pk={challenge:b64d(o.challenge),rpId:o.rpId,timeout:o.timeout,userVerification:o.userVerification,allowCredentials:o.allowCredentials.map(c=>({type:c.type,id:b64d(c.id)}))};\
@@ -638,7 +638,11 @@ const cred=await navigator.credentials.get({publicKey:pk});\
 const res=await fetch('/login/passkey/verify',{method:'POST',credentials:'same-origin',headers:{'content-type':'application/json'},\
 body:JSON.stringify({id:cred.id,authenticatorData:b64e(cred.response.authenticatorData),clientDataJSON:b64e(cred.response.clientDataJSON),signature:b64e(cred.response.signature)})});\
 const j=await res.json();if(j.ok){location.href='/'}else{out.textContent=j.error||'Không xác thực được'}\
-}catch(e){out.textContent='Passkey bị huỷ hoặc không dùng được: '+(e&&e.message?e.message:e)}}";
+}catch(e){out.textContent=auto?'Chưa xác nhận được passkey. Bấm “Dùng passkey” để thử lại, hoặc dùng cách khác bên dưới.':'Passkey bị huỷ hoặc không dùng được: '+(e&&e.message?e.message:e)}}";
+
+/// Runs the passkey prompt as soon as the second-step page has loaded. The short
+/// delay lets the page paint first, so the person sees why the browser asks.
+const LOGIN_PASSKEY_AUTO_JS: &str = "setTimeout(function(){usePasskey(true)},250);";
 
 #[derive(Deserialize, Default)]
 pub struct Login2faQuery {
@@ -669,11 +673,28 @@ pub async fn login_2fa_page(
         })
         .unwrap_or((false, false));
     let passkey_ok = has_passkey && rp(&st).is_some();
+    // With a passkey the page asks for it by itself; after a wrong code or
+    // recovery code (`err`) the person has chosen another way, so it stays quiet.
+    let auto_passkey = passkey_ok && q.err.is_empty();
+    let totp_form = html! {
+        form method="post" action="/login/2fa" {
+            input type="hidden" name="kind" value="totp";
+            label class="f" {
+                span class="t" { "Mã 6 số từ ứng dụng (Google Authenticator, Authy…)" }
+                input type="text" name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="8" pattern="[0-9 ]*" style="width:100%;font-size:20px;letter-spacing:4px" autofocus[!passkey_ok || !q.err.is_empty()];
+            }
+            p { button type="submit" { "Xác nhận" } }
+        }
+    };
     login_card(
         "Xác thực hai bước",
         html! {
             h1 { "Xác thực hai bước" }
-            p class="sub" { "Mật khẩu đúng. Xác nhận thêm để vào hub." }
+            @if passkey_ok {
+                p class="sub" { "Mật khẩu đúng. Xác nhận bằng passkey: vân tay, khuôn mặt hoặc khoá bảo mật." }
+            } @else {
+                p class="sub" { "Mật khẩu đúng. Xác nhận thêm để vào hub." }
+            }
             @match q.err.as_str() {
                 "code" => { p style="color:var(--bad)" { "Mã không đúng hoặc đã dùng. Thử mã mới." } }
                 "recovery" => { p style="color:var(--bad)" { "Mã khôi phục không đúng hoặc đã dùng." } }
@@ -686,17 +707,18 @@ pub async fn login_2fa_page(
                 }
             }
             @if passkey_ok {
-                p { button type="button" onclick="usePasskey()" { "🔑 Dùng passkey" } }
+                p { button type="button" onclick="usePasskey()" { "Dùng passkey" } }
                 p id="pk-msg" style="color:var(--bad);font-size:13px;margin:0" {}
             }
             @if has_totp {
-                form method="post" action="/login/2fa" {
-                    input type="hidden" name="kind" value="totp";
-                    label class="f" {
-                        span class="t" { "Mã 6 số từ ứng dụng (Google Authenticator, Authy…)" }
-                        input type="text" name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="8" pattern="[0-9 ]*" style="width:100%;font-size:20px;letter-spacing:4px" autofocus;
+                @if passkey_ok {
+                    // The passkey comes first; the app code is one click away.
+                    details style="margin-top:14px" open[!q.err.is_empty()] {
+                        summary { "Dùng mã từ ứng dụng" }
+                        (totp_form)
                     }
-                    p { button type="submit" { "Xác nhận" } }
+                } @else {
+                    (totp_form)
                 }
             }
             details style="margin-top:14px" {
@@ -712,7 +734,7 @@ pub async fn login_2fa_page(
             }
             p { a href="/login" { "← Đăng nhập lại" } }
             @if passkey_ok {
-                script { (PreEscaped(format!("{B64_JS}{LOGIN_PASSKEY_JS}"))) }
+                script { (PreEscaped(format!("{B64_JS}{LOGIN_PASSKEY_JS}{}", if auto_passkey { LOGIN_PASSKEY_AUTO_JS } else { "" }))) }
             }
         },
     )
