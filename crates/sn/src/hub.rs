@@ -46,6 +46,8 @@ fn capabilities(cfg: &Config) -> Vec<String> {
         caps.push("unban_all".into());
         // Puts the hub's ModSecurity rules into the web server (`DesiredBody::waf`).
         caps.push("waf".into());
+        // Stops a runaway PHP worker (`Action::KillWebWorker`).
+        caps.push(snsec_common::schema::CAP_KILL_WEB_WORKER.into());
     }
     caps
 }

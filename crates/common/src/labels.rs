@@ -12,6 +12,8 @@ pub enum Label {
     DdosL7,
     Bruteforce,
     DiskFull,
+    /// The server is overloaded and the work is PHP web workers (not malware).
+    WebOverload,
     Mixed,
     Unknown,
 }
@@ -25,6 +27,7 @@ impl Label {
             Label::DdosL7 => "ddos-l7",
             Label::Bruteforce => "bruteforce",
             Label::DiskFull => "disk-full",
+            Label::WebOverload => "web-overload",
             Label::Mixed => "mixed",
             Label::Unknown => "unknown",
         }

@@ -177,9 +177,93 @@ pub fn describe(busy: f64, streak: u32, groups: &[CpuGroup]) -> String {
     s
 }
 
+/// The load that counts as overload: this many times the number of cores, and at
+/// least [`LOAD_ALERT_MIN`].
+pub const LOAD_ALERT_FACTOR: f64 = 2.0;
+pub const LOAD_ALERT_MIN: f64 = 6.0;
+
+/// A load well above the number of cores means work is queueing, even when the
+/// CPU is not saturated: a few runaway PHP workers, or a disk that cannot keep up
+/// (one VPS reported a load of 48 with the CPU at 18%, which `cpu_high` never
+/// saw). `groups` names who uses the CPU, when anyone stands out.
+#[must_use]
+pub fn load_alert(
+    load1: f64,
+    cores: usize,
+    busy: f64,
+    groups: &[CpuGroup],
+) -> Option<snsec_common::schema::Alert> {
+    let cores = cores.max(1) as f64;
+    if load1 < (LOAD_ALERT_FACTOR * cores).max(LOAD_ALERT_MIN) {
+        return None;
+    }
+    let mut message =
+        format!("load {load1:.1} on {cores:.0} core(s), CPU busy {busy:.0}%: work is queueing");
+    if groups.is_empty() {
+        message.push_str("; no single program stands out (a slow disk or many short tasks?)");
+    } else {
+        message.push_str("; busiest: ");
+        let parts: Vec<String> = groups
+            .iter()
+            .take(3)
+            .map(|g| {
+                format!(
+                    "{} (user {}, {} proc) {:.0}%",
+                    g.comm, g.user, g.procs, g.cpu_pct
+                )
+            })
+            .collect();
+        message.push_str(&parts.join(", "));
+    }
+    Some(snsec_common::schema::Alert {
+        kind: "load_high".into(),
+        message,
+        severity: if load1 >= 4.0 * cores {
+            "urgent"
+        } else {
+            "warn"
+        }
+        .into(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_load_far_above_the_cores_is_an_alert_even_with_an_idle_cpu() {
+        // A load of 48 with the CPU at 18%, as one VPS reported (its core count is not
+        // known here: 8 cores make it urgent, 24 a warning).
+        let g = vec![CpuGroup {
+            comm: "lsphp".into(),
+            user: "inoxkinh".into(),
+            procs: 1,
+            cpu_pct: 4.0,
+        }];
+        let a = load_alert(48.0, 8, 18.0, &g).expect("alert");
+        assert_eq!(
+            (a.kind.as_str(), a.severity.as_str()),
+            ("load_high", "urgent")
+        );
+        assert!(
+            a.message.contains("lsphp") && a.message.contains("inoxkinh"),
+            "{}",
+            a.message
+        );
+        // Twice the cores is a warning; below that, or a small box, is not.
+        assert_eq!(load_alert(50.0, 24, 18.0, &[]).unwrap().severity, "warn");
+        assert!(load_alert(30.0, 24, 18.0, &[]).is_none());
+        assert!(
+            load_alert(5.0, 2, 90.0, &[]).is_none(),
+            "a 2-core box needs 6"
+        );
+        assert!(load_alert(6.5, 2, 90.0, &[]).is_some());
+        assert!(
+            load_alert(0.3, 0, 0.0, &[]).is_none(),
+            "no cores read counts as one"
+        );
+    }
 
     fn p(pid: i32, comm: &str, jiffies: u64) -> Proc {
         Proc {

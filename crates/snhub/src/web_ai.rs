@@ -93,6 +93,22 @@ fn action_vi(a: &Action, ev: Option<&Evidence>) -> Markup {
                 " (kể cả bản tự khởi động lại, không cần đúng pid)"
             }
         }
+        Action::KillWebWorker { pid, starttime } => {
+            let p = ev.and_then(|e| {
+                e.processes
+                    .iter()
+                    .find(|p| p.pid == *pid && p.starttime == *starttime)
+            });
+            html! {
+                "Dừng worker PHP " b { (pid) }
+                @if let Some(p) = p {
+                    " (" code { (p.comm) } ", tài khoản " b { (p.user) } ", " (format!("{:.0}%", p.cpu_pct)) " CPU"
+                    @if !p.cmdline.is_empty() { ", " code { (p.cmdline) } }
+                    ")"
+                }
+                " — chỉ mất request worker đó đang chạy, web server tự bật worker mới"
+            }
+        }
         Action::LockUserShell { user } => {
             html! { "Khoá shell đăng nhập của tài khoản " b { (user) } " (đổi sang nologin)" }
         }

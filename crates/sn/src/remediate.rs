@@ -144,6 +144,7 @@ fn apply(state: &State, action: &Action, ev: &Evidence) -> Result<String> {
     match action {
         Action::KillProcess { pid, starttime } => kill_process(*pid, *starttime),
         Action::KillMatching { user, exe } => kill_matching(user, exe),
+        Action::KillWebWorker { pid, starttime } => kill_web_worker(*pid, *starttime),
         Action::LockUserShell { user } => lock_user_shell(state, user),
         Action::QuarantineFile { path } => {
             // The owner the evidence recorded: a file that has since been replaced
@@ -241,6 +242,127 @@ fn kill_process(pid: i32, starttime: u64) -> Result<String> {
     };
     kill(Pid::from_raw(pid), Signal::SIGKILL).with_context(|| format!("kill {pid}"))?;
     Ok(format!("đã dừng pid {pid} ({}, {exe}): {sign}", st.comm))
+}
+
+/// How long a PHP worker's CPU is measured before it is stopped.
+const WORKER_SAMPLE_MS: u64 = 3000;
+/// How long a stopped worker gets to exit on SIGTERM before SIGKILL.
+const WORKER_TERM_WAIT_MS: u64 = 3000;
+
+/// Why a PHP worker must not be stopped right now, if so. Pure: the live
+/// readings come in as arguments (`pct` is its CPU over the sample, as a percent
+/// of one core; `uid` is its owner, `None` when unreadable).
+fn web_worker_refusal(
+    comm: &str,
+    cmdline: &str,
+    uid: Option<u32>,
+    load1: f64,
+    cores: usize,
+    pct: f64,
+) -> Option<String> {
+    if !ai::is_web_worker(comm, cmdline) {
+        return Some(format!(
+            "{comm} không phải worker PHP của web server (hoặc là tiến trình chính)"
+        ));
+    }
+    if uid.is_none_or(|u| u == 0) {
+        return Some("tiến trình của root hoặc không đọc được chủ sở hữu".into());
+    }
+    // The server must be overloaded now, not only when the evidence was taken.
+    if load1 < ai::OVERLOAD_MIN_LOAD || load1 < cores as f64 {
+        return Some(format!(
+            "tải hiện tại {load1:.1} trên {cores} nhân: máy không quá tải"
+        ));
+    }
+    // And the worker must still be burning a CPU.
+    if pct < ai::RUNAWAY_CPU_PCT {
+        return Some(format!(
+            "chỉ dùng {pct:.0}% CPU trong {} giây vừa đo",
+            WORKER_SAMPLE_MS / 1000
+        ));
+    }
+    None
+}
+
+/// Stop one runaway PHP worker: SIGTERM, then SIGKILL if it ignores that. The web
+/// server starts a fresh worker for the next request, so only the request this one
+/// was running is lost. Everything is read from the live system: the evidence
+/// only says which worker to look at.
+fn kill_web_worker(pid: i32, starttime: u64) -> Result<String> {
+    let Some(st) = proc::read_stat(pid) else {
+        bail!("tiến trình {pid} đã thoát");
+    };
+    if st.starttime != starttime {
+        bail!("pid {pid} nay là một tiến trình khác (đã bị dùng lại)");
+    }
+    let (exe, _deleted) = proc::exe(pid);
+    if let Some(why) = protected_pid(pid) {
+        bail!("không dừng pid {pid} ({}): {why}", st.comm);
+    }
+    let cmd = proc::cmdline(pid).join(" ");
+    let uid = proc::uid(pid);
+    // Everything but the CPU first: no wait for a process that can be refused now.
+    if let Some(why) = web_worker_refusal(
+        &st.comm,
+        &cmd,
+        uid,
+        proc::loadavg1(),
+        proc::num_cpus(),
+        f64::MAX,
+    ) {
+        bail!("không dừng pid {pid} ({}): {why}", st.comm);
+    }
+    let before = st.utime + st.stime;
+    std::thread::sleep(std::time::Duration::from_millis(WORKER_SAMPLE_MS));
+    let Some(after) = proc::read_stat(pid).filter(|s| s.starttime == starttime) else {
+        bail!("worker {pid} đã tự thoát trong lúc đo");
+    };
+    let ticks = proc::clock_ticks().max(1) as f64;
+    let pct = 100.0 * ((after.utime + after.stime).saturating_sub(before)) as f64
+        / ticks
+        / (WORKER_SAMPLE_MS as f64 / 1000.0);
+    if let Some(why) =
+        web_worker_refusal(&st.comm, &cmd, uid, proc::loadavg1(), proc::num_cpus(), pct)
+    {
+        bail!("không dừng pid {pid} ({}): {why}", st.comm);
+    }
+    let user = uid.map(proc::username).unwrap_or_default();
+    terminate(pid, starttime, WORKER_TERM_WAIT_MS)?;
+    let shown = util::ellipsize(&crate::evidence_parse::redact(&cmd), 120);
+    Ok(format!(
+        "đã dừng worker PHP pid {pid} ({}, tài khoản {user}, {pct:.0}% CPU, {exe}): {shown}; web server sẽ tự bật worker mới",
+        st.comm
+    ))
+}
+
+/// Is this exact process (pid and start time) still running, not a zombie?
+fn alive(pid: i32, starttime: u64) -> bool {
+    proc::read_stat(pid).is_some_and(|s| s.starttime == starttime && s.state != 'Z')
+}
+
+/// SIGTERM, then SIGKILL if the process is still there after `wait_ms`.
+fn terminate(pid: i32, starttime: u64, wait_ms: u64) -> Result<()> {
+    kill(Pid::from_raw(pid), Signal::SIGTERM).with_context(|| format!("kill -TERM {pid}"))?;
+    let mut waited = 0;
+    while waited < wait_ms && alive(pid, starttime) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        waited += 100;
+    }
+    if alive(pid, starttime) {
+        kill(Pid::from_raw(pid), Signal::SIGKILL).with_context(|| format!("kill -KILL {pid}"))?;
+    }
+    Ok(())
+}
+
+/// pid 1 and the agent itself are never stopped.
+fn protected_pid(pid: i32) -> Option<&'static str> {
+    if pid <= 1 {
+        Some("init")
+    } else if pid == std::process::id() as i32 {
+        Some("chính agent")
+    } else {
+        None
+    }
 }
 
 /// Most processes one `kill_matching` will stop.
@@ -518,6 +640,132 @@ fn disable_service(state: &State, unit: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_php_worker_is_stopped_only_when_it_is_one_busy_and_the_server_is_overloaded() {
+        let r =
+            |comm, cmd, uid, load, cores, pct| web_worker_refusal(comm, cmd, uid, load, cores, pct);
+        // The reported case: an lsphp of an account at 100% with the load at 47.
+        assert_eq!(
+            r(
+                "lsphp",
+                "lsphp:domains/x.vn/wp-cron.php",
+                Some(1001),
+                47.0,
+                24,
+                100.0
+            ),
+            None
+        );
+        assert_eq!(
+            r("php-fpm", "php-fpm: pool www", Some(33), 8.0, 4, 90.0),
+            None
+        );
+        // Not a PHP worker, or the php-fpm master.
+        assert!(
+            r("rsync", "", Some(1001), 47.0, 24, 100.0)
+                .unwrap()
+                .contains("không phải worker")
+        );
+        assert!(
+            r(
+                "php-fpm",
+                "php-fpm: master process (/etc/php-fpm.conf)",
+                Some(0),
+                47.0,
+                24,
+                100.0
+            )
+            .unwrap()
+            .contains("không phải worker")
+        );
+        // Root's, or an owner that cannot be read.
+        assert!(
+            r("lsphp", "", Some(0), 47.0, 24, 100.0)
+                .unwrap()
+                .contains("root")
+        );
+        assert!(
+            r("lsphp", "", None, 47.0, 24, 100.0)
+                .unwrap()
+                .contains("root")
+        );
+        // The load is not above the cores any more, or below the floor.
+        assert!(
+            r("lsphp", "", Some(1001), 10.0, 24, 100.0)
+                .unwrap()
+                .contains("không quá tải")
+        );
+        assert!(
+            r("lsphp", "", Some(1001), 3.0, 2, 100.0)
+                .unwrap()
+                .contains("không quá tải")
+        );
+        // The worker went quiet while the order waited.
+        assert!(
+            r("lsphp", "", Some(1001), 47.0, 24, 10.0)
+                .unwrap()
+                .contains("chỉ dùng 10%")
+        );
+    }
+
+    #[test]
+    fn terminate_stops_a_process_that_exits_on_term_and_one_that_ignores_it() {
+        let wait = |c: &mut std::process::Child| c.wait().unwrap();
+        // Exits on SIGTERM.
+        let mut a = Command::new("sleep").arg("30").spawn().unwrap();
+        let pa = a.id() as i32;
+        let sa = proc::read_stat(pa).unwrap().starttime;
+        terminate(pa, sa, 3000).unwrap();
+        wait(&mut a);
+        // Ignores SIGTERM: needs the SIGKILL after the wait.
+        let mut b = Command::new("sh")
+            .args(["-c", "trap '' TERM; while true; do sleep 1; done"])
+            .spawn()
+            .unwrap();
+        let pb = b.id() as i32;
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let sb = proc::read_stat(pb).unwrap().starttime;
+        let t = std::time::Instant::now();
+        terminate(pb, sb, 600).unwrap();
+        let status = wait(&mut b);
+        assert!(!status.success());
+        assert!(
+            t.elapsed() >= std::time::Duration::from_millis(600),
+            "it waited first"
+        );
+        // A reused pid (another start time) is never signalled.
+        let mut c = Command::new("sleep").arg("30").spawn().unwrap();
+        let pc = c.id() as i32;
+        assert!(
+            !alive(pc, sa),
+            "different start time is a different process"
+        );
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+
+    #[test]
+    fn a_process_that_is_not_a_php_worker_is_never_stopped_by_the_worker_action() {
+        // The test's own process and a plain child: neither is a web worker.
+        let me = std::process::id() as i32;
+        let st = proc::read_stat(me).unwrap();
+        assert!(kill_web_worker(me, st.starttime).is_err());
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id() as i32;
+        let start = proc::read_stat(pid).unwrap().starttime;
+        let e = kill_web_worker(pid, start).unwrap_err().to_string();
+        assert!(e.contains("không phải worker"), "{e}");
+        // A wrong start time means a different process (pid reuse).
+        let e = kill_web_worker(pid, start + 1).unwrap_err().to_string();
+        assert!(
+            e.contains("tiến trình khác") || e.contains("không phải worker"),
+            "{e}"
+        );
+        assert!(proc::read_stat(pid).is_some(), "the child is untouched");
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 
     #[test]
     fn job_ids_are_plain() {

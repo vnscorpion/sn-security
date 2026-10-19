@@ -201,12 +201,17 @@ pub fn can(r: &ReportBody, capability: &str) -> bool {
 /// Does this report describe something worth an automatic analysis?
 #[must_use]
 pub fn looks_like_incident(r: &ReportBody) -> bool {
-    r.alerts
-        .iter()
-        .any(|a| matches!(a.kind.as_str(), "cpu_high" | "malware_found" | "ban_cap"))
-        || r.triage
-            .as_ref()
-            .is_some_and(|t| matches!(t.label.as_str(), "miner" | "php-bot" | "mixed"))
+    r.alerts.iter().any(|a| {
+        matches!(
+            a.kind.as_str(),
+            "cpu_high" | "load_high" | "malware_found" | "ban_cap"
+        )
+    }) || r.triage.as_ref().is_some_and(|t| {
+        matches!(
+            t.label.as_str(),
+            "miner" | "php-bot" | "mixed" | "web-overload"
+        )
+    })
 }
 
 fn pending_now(s: &AiState, at: i64) -> bool {
@@ -360,7 +365,15 @@ pub fn run(st: &Arc<AppState>, agent_id: &str) {
         Err(e) => return fail(&provider.name, format!("Gọi AI thất bại: {e:#}")),
     };
     let plan = match ai::parse_plan(&text, &ev) {
-        Ok(p) => p,
+        Ok(mut p) => {
+            // An agent that predates an action cannot parse a job that holds it.
+            let caps = report
+                .as_ref()
+                .map(|r| r.capabilities.clone())
+                .unwrap_or_default();
+            ai::drop_unsupported(&mut p, &caps);
+            p
+        }
         Err(e) => {
             let head: String = text.chars().take(200).collect();
             return fail(
@@ -554,6 +567,9 @@ mod tests {
     fn what_counts_as_an_incident() {
         assert!(looks_like_incident(&report(&[], &["cpu_high"], None)));
         assert!(looks_like_incident(&report(&[], &["malware_found"], None)));
+        // Overload that the CPU percentage never showed, and its triage label.
+        assert!(looks_like_incident(&report(&[], &["load_high"], None)));
+        assert!(looks_like_incident(&report(&[], &[], Some("web-overload"))));
         assert!(looks_like_incident(&report(&[], &[], Some("miner"))));
         assert!(!looks_like_incident(&report(
             &[],

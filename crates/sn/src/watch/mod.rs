@@ -370,6 +370,14 @@ pub fn run(cfg: &Config, state: &State, opts: &Options) -> Result<()> {
         state.update_meta(|m| m.cpu_streak = cpu_now.streak)?;
     }
     let cpu_high = cpu_now.alert.is_some();
+    // Load can be far above the cores with the CPU far from saturated (a disk
+    // that cannot keep up, or a few runaway workers): `cpu_high` never sees that.
+    alerts.extend(cpu::load_alert(
+        crate::sys::proc::loadavg1(),
+        crate::sys::proc::num_cpus(),
+        cpu_now.busy,
+        &cpu_now.groups,
+    ));
     alerts.extend(cpu_now.alert);
 
     // Distributed bots: one User-Agent or request shape from many addresses.

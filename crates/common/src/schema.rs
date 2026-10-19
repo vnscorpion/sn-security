@@ -738,7 +738,18 @@ pub enum Action {
     },
     /// `systemctl disable --now` a unit from a short allow-list (undoable).
     DisableService { unit: String },
+    /// Stop one PHP web worker (lsphp, a php-fpm worker, php-cgi) that is using a
+    /// CPU while the server is overloaded: SIGTERM, then SIGKILL. The web server
+    /// starts a new worker for the next request, so only the request that worker
+    /// was running is lost. Never a master process, never root's. Needs the
+    /// capability [`CAP_KILL_WEB_WORKER`].
+    KillWebWorker { pid: i32, starttime: u64 },
 }
+
+/// Capability of an agent that understands [`Action::KillWebWorker`]. An older
+/// agent cannot parse a job that holds it, so the hub only offers it where this
+/// is listed.
+pub const CAP_KILL_WEB_WORKER: &str = "kill_web_worker";
 
 /// What happened to each action of a remediation job.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

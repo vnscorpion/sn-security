@@ -79,6 +79,22 @@ const PROTECTED_COMM: &[&str] = &[
 ];
 const TEMP_PREFIXES: &[&str] = &["/dev/shm/", "/tmp/", "/var/tmp/"];
 
+/// A runaway PHP worker uses at least this much of one core when sampled.
+pub const RUNAWAY_CPU_PCT: f64 = 60.0;
+/// A web worker is only stopped while the server's 1-minute load is at least this
+/// high (the agent also wants it above the number of cores).
+pub const OVERLOAD_MIN_LOAD: f64 = 4.0;
+
+/// Is this a PHP *worker* of a web server (what [`Action::KillWebWorker`] may
+/// stop)? `lsphp` (LiteSpeed), a `php-fpm` pool worker or `php-cgi`; not the
+/// `php-fpm` master, which serves every site of the pool.
+#[must_use]
+pub fn is_web_worker(comm: &str, cmdline: &str) -> bool {
+    let named =
+        comm.starts_with("lsphp") || comm.starts_with("php-fpm") || comm.starts_with("php-cgi");
+    named && !cmdline.contains("master process")
+}
+
 /// How an operator wants the AI's proposals handled for one VPS.
 pub const AUTONOMY_OFF: &str = "off";
 pub const AUTONOMY_APPROVE: &str = "approve";
@@ -154,10 +170,20 @@ respawns, because by the time the order runs the old pid is usually gone)\n\
    {\"type\":\"quarantine_file\",\"path\":\"/abs/path\"}\n\
    {\"type\":\"remove_shell_line\",\"path\":\"/abs/path\",\"line_no\":N,\"sha256\":\"hex\"}\n\
    {\"type\":\"disable_service\",\"unit\":\"name.service\"}\n\
+   {\"type\":\"kill_web_worker\",\"pid\":N,\"starttime\":N}  (stops ONE PHP worker: lsphp, a \
+php-fpm pool worker or php-cgi, that uses 60% or more of a CPU while the server load is high. \
+The web server starts a fresh worker, so only the request that worker was running is lost. Use \
+it for a runaway site script or plugin, never for malware: that is kill_process.)\n\
 3. Prefer reversible actions. Quarantine instead of delete. Never touch web workers \
-(php-fpm, lsphp, nginx, httpd), databases, sshd or the agent itself. Do not propose anything \
-you are not reasonably sure about; an empty action list is a good answer when the evidence \
-is unclear.\n\
+(php-fpm, lsphp, nginx, httpd) with any action but kill_web_worker, nor databases, sshd or \
+the agent itself. Do not propose anything you are not reasonably sure about; an empty action \
+list is a good answer when the evidence is unclear.\n\
+3b. When the load is high and the busiest processes are PHP workers, this is probably an \
+overloaded site, not an attack. Say in the diagnosis which account and which script it is \
+(the command line of an lsphp worker often names the script, for example wp-cron.php), and \
+what its owner should look at (a plugin, a cron job, a bot hammering a heavy page). If the \
+load is high but the processes use little CPU, the machine may be waiting on its disk: say \
+that instead of blaming PHP.\n\
 4. Reply with ONE JSON object and nothing else:\n\
    {\"diagnosis\":\"2-6 sentences in Vietnamese: what happened and why\",\
 \"actions\":[{\"type\":\"...\",...,\"reason\":\"one sentence in Vietnamese\"}]}"
@@ -284,6 +310,25 @@ fn shorten_fields(ev: &mut Evidence) {
         shorten(&mut u.home, l);
         shorten(&mut u.shell, l);
     }
+}
+
+/// Take out of `plan` the proposals an agent with these `capabilities` cannot
+/// carry out (it predates the action): an older agent cannot even parse a job that
+/// holds one.
+pub fn drop_unsupported(plan: &mut Plan, capabilities: &[String]) {
+    let has = |c: &str| capabilities.iter().any(|x| x == c);
+    let mut kept = Vec::with_capacity(plan.proposed.len());
+    for p in plan.proposed.drain(..) {
+        if matches!(p.action, Action::KillWebWorker { .. })
+            && !has(crate::schema::CAP_KILL_WEB_WORKER)
+        {
+            plan.rejected
+                .push("kill_web_worker: agent trên VPS này chưa hỗ trợ, cần cập nhật agent".into());
+        } else {
+            kept.push(p);
+        }
+    }
+    plan.proposed = kept;
 }
 
 /// Read a model's reply into a [`Plan`], keeping only the actions that pass
@@ -590,6 +635,44 @@ pub fn ground(a: &Action, ev: &Evidence) -> Result<&'static str, String> {
             }
             Ok("high")
         }
+        Action::KillWebWorker { pid, starttime } => {
+            let Some(p) = ev
+                .processes
+                .iter()
+                .find(|p| p.pid == *pid && p.starttime == *starttime)
+            else {
+                return Err(format!("kill_web_worker {pid}: không có trong bằng chứng"));
+            };
+            if !is_web_worker(&p.comm, &p.cmdline) {
+                return Err(format!(
+                    "kill_web_worker {pid}: {} không phải worker PHP của web server",
+                    p.comm
+                ));
+            }
+            // A worker runs as the site's account; root's or an unreadable owner
+            // is not one.
+            if p.user == "root" || p.user == "?" || p.user.is_empty() {
+                return Err(format!(
+                    "kill_web_worker {pid}: tiến trình của {} không phải của một website",
+                    cut(&p.user, 20)
+                ));
+            }
+            if p.cpu_pct < RUNAWAY_CPU_PCT {
+                return Err(format!(
+                    "kill_web_worker {pid}: chỉ dùng {:.0}% CPU, chưa đủ để coi là chạy quá tải",
+                    p.cpu_pct
+                ));
+            }
+            if ev.load1 < OVERLOAD_MIN_LOAD {
+                return Err(format!(
+                    "kill_web_worker {pid}: tải máy chủ {:.1}, chưa quá tải",
+                    ev.load1
+                ));
+            }
+            // Cannot be undone, but loses only a request: still "high", so it
+            // runs on its own only where the operator chose `auto_all`.
+            Ok("high")
+        }
         Action::LockUserShell { user } => {
             let Some(u) = ev.shell_users.iter().find(|u| u.name == *user) else {
                 return Err(format!(
@@ -888,6 +971,75 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.contains("không đủ dấu hiệu"), "{e}");
+    }
+
+    #[test]
+    fn a_runaway_php_worker_is_stopped_only_under_load_and_never_the_master() {
+        let kill = |pid, starttime| Action::KillWebWorker { pid, starttime };
+        let mut ev = evidence();
+        // A php-fpm worker of an account, at 100% CPU, with the load at 12.
+        assert_eq!(ground(&kill(100, 5), &ev), Ok("high"));
+        // The pid has to be in the evidence with that start time.
+        assert!(ground(&kill(100, 6), &ev).unwrap_err().contains("không có"));
+        // An lsphp worker whose title names the script, as LiteSpeed sets it.
+        ev.processes.push(EvProc {
+            pid: 300,
+            starttime: 7,
+            user: "inoxkinh".into(),
+            comm: "lsphp".into(),
+            exe: "/usr/local/php82/bin/lsphp".into(),
+            cmdline: "lsphp:domains/example.vn/private_html/wp-cron.php".into(),
+            cpu_pct: 100.0,
+            ..EvProc::default()
+        });
+        assert_eq!(ground(&kill(300, 7), &ev), Ok("high"));
+        // Not busy enough to call it runaway.
+        ev.processes[3].cpu_pct = 30.0;
+        assert!(ground(&kill(300, 7), &ev).unwrap_err().contains("chưa đủ"));
+        ev.processes[3].cpu_pct = 100.0;
+        // The machine is not overloaded.
+        ev.load1 = 1.0;
+        assert!(
+            ground(&kill(300, 7), &ev)
+                .unwrap_err()
+                .contains("chưa quá tải")
+        );
+        ev.load1 = 12.0;
+        // The php-fpm master serves every site of the pool.
+        ev.processes[1].cmdline = "php-fpm: master process (/etc/php-fpm.conf)".into();
+        assert!(
+            ground(&kill(100, 5), &ev)
+                .unwrap_err()
+                .contains("worker PHP")
+        );
+        // A program that is not a PHP worker, and a root-owned process.
+        assert!(
+            ground(&kill(200, 6), &ev)
+                .unwrap_err()
+                .contains("worker PHP")
+        );
+        ev.processes[3].user = "root".into();
+        assert!(
+            ground(&kill(300, 7), &ev)
+                .unwrap_err()
+                .contains("không phải của một website")
+        );
+    }
+
+    #[test]
+    fn a_web_worker_kill_is_dropped_for_an_agent_that_predates_it() {
+        let ev = evidence();
+        let reply = r#"{"diagnosis":"d","actions":[{"type":"kill_web_worker","pid":100,"starttime":5,"reason":"runaway"}]}"#;
+        let mut p = parse_plan(reply, &ev).unwrap();
+        assert_eq!(p.proposed.len(), 1);
+        drop_unsupported(&mut p, &["evidence".to_string(), "remediate".to_string()]);
+        assert!(p.proposed.is_empty());
+        assert!(p.rejected.iter().any(|r| r.contains("kill_web_worker")));
+        let mut p = parse_plan(reply, &ev).unwrap();
+        drop_unsupported(&mut p, &[crate::schema::CAP_KILL_WEB_WORKER.to_string()]);
+        assert_eq!(p.proposed.len(), 1);
+        // The model is told about the action and the limits.
+        assert!(system_prompt().contains("kill_web_worker"));
     }
 
     #[test]

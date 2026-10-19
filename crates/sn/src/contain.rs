@@ -121,6 +121,7 @@ fn parse_label(s: &str) -> Label {
         "ddos-l7" => Label::DdosL7,
         "bruteforce" => Label::Bruteforce,
         "disk-full" => Label::DiskFull,
+        "web-overload" => Label::WebOverload,
         "mixed" => Label::Mixed,
         _ => Label::Unknown,
     }

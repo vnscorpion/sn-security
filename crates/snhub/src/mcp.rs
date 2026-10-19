@@ -1260,7 +1260,15 @@ fn submit_plan(
     }
     // Exactly the built-in AI's path: parse and ground against the evidence.
     let text = json!({ "diagnosis": diagnosis, "actions": actions }).to_string();
-    let plan = ai::parse_plan(&text, &ev)?;
+    let mut plan = ai::parse_plan(&text, &ev)?;
+    // An agent that predates an action cannot parse a job that holds it.
+    let caps = db
+        .latest_report(&a.id)
+        .ok()
+        .flatten()
+        .map(|r| r.capabilities)
+        .unwrap_or_default();
+    ai::drop_unsupported(&mut plan, &caps);
     let id = db
         .create_proposal(
             at,

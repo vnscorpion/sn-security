@@ -360,6 +360,7 @@ fn label_vi(l: &str) -> &'static str {
         "ddos-l7" => "Tấn công web (L7)",
         "bruteforce" => "Dò mật khẩu",
         "disk-full" => "Đầy ổ đĩa",
+        "web-overload" => "Quá tải do PHP (website)",
         "mixed" => "Nhiều dấu hiệu",
         _ => "Chưa rõ",
     }
@@ -398,6 +399,9 @@ fn alert_kind_vi(k: &str) -> &str {
         "log_format" => "Đọc được log nhưng sai định dạng",
         "mem_high" => "RAM gần đầy",
         "cpu_high" => "CPU cao liên tục",
+        "load_high" => {
+            "Tải máy chủ rất cao (việc đang xếp hàng, dù CPU chưa kín): xem tiến trình đang chạy nhiều và ổ đĩa"
+        }
         "bot_ua" => "Nhiều IP khác nhau cùng dùng một User-Agent (nghi bot phân tán)",
         "bot_shape" => "Nhiều IP khác nhau cùng gửi một kiểu request (nghi bot phân tán)",
         "malware_found" => "Phát hiện file mã độc",

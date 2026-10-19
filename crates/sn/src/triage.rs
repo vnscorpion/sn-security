@@ -99,7 +99,14 @@ pub fn run(state: &State, print: bool) -> Result<TriageSummary> {
 
     let persistence = scan_persistence();
     let (disk_pct, inode_pct) = disk_usage("/");
-    let label = decide_label(&suspects, &conns, disk_pct, inode_pct);
+    let label = decide_label(
+        &suspects,
+        &conns,
+        disk_pct,
+        inode_pct,
+        proc::loadavg1(),
+        proc::num_cpus(),
+    );
 
     let summary = TriageSummary {
         label: label.as_str().to_string(),
@@ -164,11 +171,17 @@ fn score_process(
 ) -> (u32, Option<Label>) {
     let mut score = 0u32;
     let mut miner = false;
+    // The LiteSpeed server's own processes: `openlitespeed` calls itself
+    // `litespeed` and keeps its working directory in /tmp/lshttpd. Scored as
+    // suspects they outranked the PHP workers that were actually burning the CPU.
+    let lsws = is_lsws(exe, deleted);
 
     if deleted {
         score += 40;
     }
-    if proc::is_suspicious_path(exe) || (!cwd.is_empty() && proc::is_suspicious_path(cwd)) {
+    if !lsws
+        && (proc::is_suspicious_path(exe) || (!cwd.is_empty() && proc::is_suspicious_path(cwd)))
+    {
         score += 40;
     }
     // A non-web process executing from a webroot is a strong backdoor signal.
@@ -177,6 +190,7 @@ fn score_process(
     }
     // comm vs exe basename mismatch (name spoofing).
     if let Some(base) = exe.rsplit('/').next()
+        && !lsws
         && !base.is_empty()
         && !st.comm.is_empty()
         && !base.starts_with(&st.comm)
@@ -219,6 +233,11 @@ fn score_process(
     (score, hint)
 }
 
+/// An executable of the LiteSpeed install (root's directory, not deleted).
+fn is_lsws(exe: &str, deleted: bool) -> bool {
+    !deleted && exe.starts_with("/usr/local/lsws/")
+}
+
 fn is_web_worker(comm: &str, exe: &str) -> bool {
     const NAMES: &[&str] = &["php-fpm", "lsphp", "httpd", "apache2", "php"];
     NAMES.iter().any(|n| comm.contains(n) || exe.contains(n))
@@ -229,8 +248,24 @@ fn decide_label(
     conns: &[netstat::Conn],
     disk_pct: u8,
     inode_pct: u8,
+    load1: f64,
+    cores: usize,
 ) -> Label {
     let mut labels: Vec<Label> = suspects.iter().filter_map(|s| s.label_hint).collect();
+
+    // Overloaded, and what burns CPU is PHP workers: a site that misbehaves (a
+    // runaway script, wp-cron, a bot on a heavy page), not malware.
+    let overloaded = load1
+        >= (crate::watch::cpu::LOAD_ALERT_FACTOR * cores.max(1) as f64)
+            .max(crate::watch::cpu::LOAD_ALERT_MIN);
+    if overloaded
+        && suspects.iter().any(|s| {
+            snsec_common::ai::is_web_worker(&s.info.comm, "")
+                && s.info.cpu_pct >= snsec_common::ai::RUNAWAY_CPU_PCT
+        })
+    {
+        labels.push(Label::WebOverload);
+    }
 
     if disk_pct >= 98 || inode_pct >= 98 {
         labels.push(Label::DiskFull);
@@ -650,5 +685,52 @@ mod tests {
         assert_eq!((s, hint), (plain + 40, Some(Label::Miner)));
         assert!(to_bad_port("[2001:db8::1]:3333") && to_bad_port("1.2.3.4:14444"));
         assert!(!to_bad_port("1.2.3.4:443") && !to_bad_port("junk"));
+    }
+
+    #[test]
+    fn litespeed_itself_is_no_suspect_and_a_php_worker_under_load_is_the_cause() {
+        let st = |comm: &str| proc::ProcStat {
+            pid: 10,
+            comm: comm.into(),
+            state: 'S',
+            ppid: 1,
+            utime: 0,
+            stime: 0,
+            starttime: 1,
+        };
+        // openlitespeed: comm `litespeed`, exe .../openlitespeed, cwd in /tmp/lshttpd.
+        let lsws = "/usr/local/lsws/bin/openlitespeed";
+        assert_eq!(
+            score_process(&st("litespeed"), lsws, false, "/tmp/lshttpd", &[], 0.0, &[]).0,
+            0
+        );
+        // The same names from a temp directory are still odd.
+        let fake = "/tmp/x/openlitespeed";
+        assert!(score_process(&st("litespeed"), fake, false, "/tmp/x", &[], 0.0, &[]).0 >= 60);
+
+        let worker = |cpu_pct: f64| Suspect {
+            info: ProcInfo {
+                pid: 1,
+                starttime: 1,
+                comm: "lsphp".into(),
+                exe: "/usr/local/php82/bin/lsphp".into(),
+                cwd: "/home/a".into(),
+                user: "a".into(),
+                cpu_pct,
+                out_conns: vec![],
+                deleted_exe: false,
+                score: 15,
+            },
+            label_hint: None,
+        };
+        let label = |cpu, load, cores| decide_label(&[worker(cpu)], &[], 40, 10, load, cores);
+        // The reported case: load 47 with one worker at 100% (on 8 cores).
+        assert_eq!(label(100.0, 47.0, 8), Label::WebOverload);
+        assert_eq!(label(100.0, 5.0, 24), Label::Unknown, "not overloaded");
+        assert_eq!(
+            label(20.0, 47.0, 24),
+            Label::Unknown,
+            "no worker burns a core"
+        );
     }
 }

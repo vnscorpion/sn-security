@@ -61,7 +61,9 @@ const LITESPEED: &[&str] = &[
     "/var/log/openlitespeed/*access*.log", // OPanel: <domain>.access.log per website
     "/usr/local/lsws/logs/*access*.log",   // server-level / default vhost
     "/usr/local/apache/domlogs/*",         // cPanel + LiteSpeed
-    "/home/*/logs/*access*log",            // CyberPanel (see TENANT_AREA)
+    "/var/log/httpd/domains/*.log", // DirectAdmin + (Open)LiteSpeed: one VPS had no log found
+    "/var/log/httpd/*access*log",   // the same directory, files named *access*
+    "/home/*/logs/*access*log",     // CyberPanel (see TENANT_AREA)
 ];
 
 /// Directories the sites' owners control. Anyone with a site can create a file
@@ -477,6 +479,30 @@ mod tests {
                 .iter()
                 .any(|t| t.ends_with("/var/log/nginx/domains/*.log"))
         );
+    }
+
+    #[test]
+    fn directadmin_with_litespeed_logs_in_the_apache_place() {
+        // A DirectAdmin VPS on LiteSpeed reported "no access log found": its
+        // domain logs are DirectAdmin's own, the same place as under Apache.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        touch(dir.path(), "var/log/httpd/domains/example.vn.log");
+        touch(dir.path(), "var/log/httpd/domains/example.vn.error.log");
+        let d = discover(Listener::LiteSpeed, root, &[]);
+        assert_eq!(globs(&d), [format!("{root}/var/log/httpd/domains/*.log")]);
+        let files = crate::watch::expand_glob(&d.found[0].glob);
+        assert_eq!(files.len(), 1, "the error log is not read: {files:?}");
+
+        // The same directory with the log named after "access" instead.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        touch(dir.path(), "var/log/httpd/example.vn.access_log");
+        touch(dir.path(), "var/log/httpd/example.vn.error_log");
+        let d = discover(Listener::LiteSpeed, root, &[]);
+        assert_eq!(globs(&d), [format!("{root}/var/log/httpd/*access*log")]);
+        let files = crate::watch::expand_glob(&d.found[0].glob);
+        assert_eq!(files.len(), 1, "{files:?}");
     }
 
     #[test]
