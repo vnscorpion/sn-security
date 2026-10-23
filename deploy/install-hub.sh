@@ -50,7 +50,9 @@ echo ">> SN Secure hub installer (arch=$ARCH, mode=$([ "$LOCAL" = 1 ] && echo lo
 
 if command -v apt-get >/dev/null 2>&1; then
   apt-get update -qq || true
-  apt-get install -y -qq curl ca-certificates coreutils >/dev/null 2>&1 || true
+  # --no-upgrade: only what is missing. A server that already runs other things must not
+  # have curl, ca-certificates or coreutils replaced as a side effect of installing a hub.
+  apt-get install -y -qq --no-upgrade curl ca-certificates coreutils >/dev/null 2>&1 || true
 fi
 
 TMP="$(mktemp -d)"

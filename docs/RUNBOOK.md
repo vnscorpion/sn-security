@@ -143,7 +143,7 @@ Nguyên tắc: **giữ nguyên tên miền** (`public_url`), hub key và cơ s�
    ```
    Từ lúc này VPS không gọi được hub: chúng tự thử lại, báo cáo nằm trong hàng đợi của agent. Làm tiếp các bước 4 đến 6 liền tay; nếu phải quay lại, `systemctl start snhub` trên máy cũ.
 4. Chép file sang máy mới (`scp`).
-5. **Máy mới:** `sudo bash restore-hub.sh snhub-final.tar.gz.enc --caddy`. Script kiểm tra mật khẩu, checksum, `integrity_check` và phiên bản (từ chối nếu snhub trên máy mới **cũ hơn** bản backup), cất file của bản cài mới vào `/var/lib/snhub.before-restore-<giờ>` (không xoá gì), đặt đúng chủ sở hữu và quyền, rồi khởi động và chờ `/healthz`.
+5. **Máy mới:** `sudo bash restore-hub.sh snhub-final.tar.gz.enc --caddy` (máy chỉ chạy hub), hoặc `--caddy-add` nếu Caddy ở đó còn phục vụ site khác: chỉ thêm khối của hub (và chứng chỉ của nó), không đụng phần còn lại; `--caddy` sẽ **từ chối** khi thấy site khác, trước khi sửa bất cứ thứ gì. Script kiểm tra mật khẩu, checksum, `integrity_check` và phiên bản (từ chối nếu snhub trên máy mới **cũ hơn** bản backup), cất file của bản cài mới vào `/var/lib/snhub.before-restore-<giờ>` (không xoá gì), đặt đúng chủ sở hữu và quyền, rồi khởi động và chờ `/healthz`.
 6. **Trỏ DNS** sang địa chỉ máy mới. Nếu đã chép chứng chỉ (`--with-certs`) thì HTTPS chạy ngay; nếu không, Caddy xin chứng chỉ mới ngay khi DNS trỏ tới, trong vài chục giây các lệnh gọi của VPS sẽ lỗi rồi tự hết.
 7. **Kiểm tra:** đăng nhập bằng mật khẩu và passkey cũ; trang Tổng quan phải thấy mọi VPS báo cáo lại trong ~5 phút; Hermes vẫn dùng token cũ.
 8. Trên máy cũ: `sudo systemctl disable snhub` để hub không tự bật lại khi khởi động. Giữ máy cũ và file backup thêm 1–2 ngày rồi mới huỷ.
