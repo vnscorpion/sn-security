@@ -100,12 +100,62 @@ sn --version && sn watch   # self-check một chu kỳ
 ```
 Làm theo đợt (canary trước). Self-update do hub điều khiển là v1.1.
 
-## Khôi phục hub
+## Sao lưu và khôi phục hub
 
-1. `systemctl stop snhub`
-2. Khôi phục `/var/lib/snhub/snhub.sqlite` (+ `hub.key`) từ backup.
-3. Nếu `seq` desired bị lùi do restore, agent sẽ từ chối desired cũ hơn — cần tăng `epoch` bằng thông điệp ký **root** (tính năng epoch-reset: v1.1; tạm thời bump version trên hub cho tới khi vượt mốc cũ).
-4. `systemctl start snhub`. Backup SQLite hằng ngày và **test restore ít nhất một lần**.
+Hai script: `deploy/backup-hub.sh` và `deploy/restore-hub.sh`. Backup là **một file mã hoá** (AES-256, khoá từ mật khẩu bạn đặt) chứa đúng những gì làm nên con master này:
+
+| Trong file | Vì sao cần |
+|---|---|
+| `snhub.toml` | địa chỉ công khai, hash mật khẩu admin, `root_pubkey`, bật/tắt 2FA |
+| `hub.key` | khoá mà **mọi VPS tin**; mất nó thì phải enroll lại từng VPS |
+| `snhub.sqlite` | danh sách VPS, báo cáo, lệnh đã ký (`seq`/`epoch`), nhà cung cấp AI **và API key**, token Hermes, passkey, bí mật ứng dụng xác thực, mã khôi phục, luật WAF, nhật ký |
+| `Caddyfile`, drop-in của `snhub.service` | cấu hình proxy và hardening (thêm chứng chỉ Caddy nếu dùng `--with-certs`) |
+
+**Không** nằm trong file, có chủ đích: khoá **root offline** (`snhub init` in ra một lần: cất nơi bạn đang cất) và binary `snhub` cùng thư mục `public/` (cài lại bằng `install-hub.sh`/`update-hub.sh`).
+
+File có `hub.key` và API key của AI, nên **đừng bỏ `--plain`** (không mã hoá) trừ khi bạn chỉ chép trong một ổ đã mã hoá. Mật khẩu không lưu ở đâu: mất mật khẩu là mất file.
+
+### Sao lưu hằng ngày
+
+```sh
+# một lần, để thử (hỏi mật khẩu hai lần):
+sudo bash backup-hub.sh
+# hằng ngày bằng cron (giữ 14 file gần nhất trong /var/backups/snhub):
+echo '17 3 * * * root SNHUB_BACKUP_PASSPHRASE="$(cat /root/.snhub-backup-pass)" bash /root/backup-hub.sh --keep 14' | sudo tee /etc/cron.d/snhub-backup
+```
+
+Tải file về chỗ khác (`scp`): backup chỉ nằm trên chính con master thì không cứu được khi máy mất. Backup trực tuyến không dừng hub (SQLite sao chép nguyên vẹn khi hub đang ghi); script tự kiểm tra bản sao bằng `PRAGMA integrity_check` và không lưu gì nếu bản sao hỏng.
+
+### Chuyển master sang máy chủ mới
+
+Nguyên tắc: **giữ nguyên tên miền** (`public_url`), hub key và cơ sở dữ liệu. Khi đó 7 hay 70 VPS không phải sửa gì: chúng vẫn gọi cùng địa chỉ, cùng tin cùng một khoá, và passkey vẫn dùng được vì gắn với tên miền.
+
+1. **Trước 1 ngày:** hạ TTL của bản ghi DNS xuống 5 phút. Ghi lại bản hub đang chạy: `snhub --version` (cài đúng bản đó, hoặc mới hơn, trên máy mới).
+2. **Máy mới:** cài hub như thường, đúng commit:
+   ```sh
+   curl -fsSL https://raw.githubusercontent.com/vnscorpion/sn-security/COMMIT/deploy/install-hub.sh \
+     | sudo bash -s -- --repo-raw https://raw.githubusercontent.com/vnscorpion/sn-security/COMMIT --public-url https://TÊN-MIỀN-HUB
+   ```
+   Lệnh này tạo hub key, mật khẩu và khoá root **mới**: bỏ qua chúng, bước 5 sẽ thay bằng của master cũ. Chưa trỏ DNS vội.
+3. **Master cũ, bản backup cuối:** dừng hub để lấy đúng một thời điểm và **để nó nằm yên**, nhờ vậy hub cũ không ký thêm lệnh nào mà bản backup không có (lệnh mới hơn sẽ làm `seq` bị lùi trên hub mới):
+   ```sh
+   sudo bash backup-hub.sh --quiesce --leave-stopped --with-certs --out /root/snhub-final.tar.gz.enc
+   ```
+   Từ lúc này VPS không gọi được hub: chúng tự thử lại, báo cáo nằm trong hàng đợi của agent. Làm tiếp các bước 4 đến 6 liền tay; nếu phải quay lại, `systemctl start snhub` trên máy cũ.
+4. Chép file sang máy mới (`scp`).
+5. **Máy mới:** `sudo bash restore-hub.sh snhub-final.tar.gz.enc --caddy`. Script kiểm tra mật khẩu, checksum, `integrity_check` và phiên bản (từ chối nếu snhub trên máy mới **cũ hơn** bản backup), cất file của bản cài mới vào `/var/lib/snhub.before-restore-<giờ>` (không xoá gì), đặt đúng chủ sở hữu và quyền, rồi khởi động và chờ `/healthz`.
+6. **Trỏ DNS** sang địa chỉ máy mới. Nếu đã chép chứng chỉ (`--with-certs`) thì HTTPS chạy ngay; nếu không, Caddy xin chứng chỉ mới ngay khi DNS trỏ tới, trong vài chục giây các lệnh gọi của VPS sẽ lỗi rồi tự hết.
+7. **Kiểm tra:** đăng nhập bằng mật khẩu và passkey cũ; trang Tổng quan phải thấy mọi VPS báo cáo lại trong ~5 phút; Hermes vẫn dùng token cũ.
+8. Trên máy cũ: `sudo systemctl disable snhub` để hub không tự bật lại khi khởi động. Giữ máy cũ và file backup thêm 1–2 ngày rồi mới huỷ.
+
+Cần lưu ý:
+- **Đổi tên miền** thì khác: mỗi VPS phải sửa `url` trong `/etc/sn/agent.toml` và hub phải ký lại. Tránh bằng cách giữ tên cũ.
+- Nếu máy cũ có danh sách IP cho phép (trong Caddyfile, firewall của VPS hay IP cố định của Hermes), thêm IP máy mới trước khi trỏ DNS.
+- Quay lui trong 1–2 ngày đầu: trỏ DNS về máy cũ và `systemctl enable --now snhub` ở đó. Dữ liệu hub mới đã ghi thêm (báo cáo, lệnh) sẽ mất, và `seq` của hub cũ có thể thấp hơn những gì agent đã nhận: xem mục "Khôi phục trên cùng máy" bên dưới.
+
+### Khôi phục trên cùng máy (sự cố)
+
+`sudo bash restore-hub.sh BACKUP --caddy` trên hub đã cài; hoặc thủ công: `systemctl stop snhub`, đặt lại `snhub.sqlite` và `hub.key` (`hub.key`: root:snhub 0640; DB: snhub 0600), `systemctl start snhub`. Nếu `seq` desired bị lùi do phục hồi một bản backup cũ, agent sẽ từ chối desired cũ hơn — cần tăng `epoch` bằng thông điệp ký **root** (tính năng epoch-reset: v1.1; tạm thời bump version trên hub cho tới khi vượt mốc cũ). Vì vậy bản backup cuối trước khi chuyển máy dùng `--quiesce`, và **test restore ít nhất một lần** (`deploy/tests/hub-backup-restore.sh` chạy cả vòng sao lưu và khôi phục trên một cây thư mục giả).
 
 ## Gỡ agent
 
