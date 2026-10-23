@@ -25,7 +25,26 @@ mkserver() { # mkserver ROOT VERSION
 mkdata() { # mkdata ROOT  (the "live" master)
   local r="$1"
   head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$r/var/lib/snhub/hub.key"
-  printf 'hub.example.test {\n  reverse_proxy 127.0.0.1:8099\n}\n' > "$r/etc/caddy/Caddyfile"
+  cat > "$r/etc/caddy/Caddyfile" <<'CF'
+:80 {
+	respond "stock"
+}
+hub.example.test {
+	encode zstd gzip
+	handle /v1/* {
+		reverse_proxy 127.0.0.1:8099 {
+			header_up X-Real-IP {remote_host}
+		}
+	}
+	header {
+		-Server
+	}
+}
+other.example.test {
+	respond "not the hub"
+}
+CF
+  for h in hub.example.test other.example.test; do d="$r/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/$h"; mkdir -p "$d"; echo "cert of $h" > "$d/$h.crt"; done
   printf '[Service]\nUMask=0077\n' > "$r/etc/systemd/system/snhub.service.d/10-hardening.conf"
   python3 - "$r/var/lib/snhub/snhub.sqlite" <<'PY'
 import sqlite3, sys
@@ -86,7 +105,8 @@ ok "no passphrase, no backup"
 NEW="$W/new"; mkserver "$NEW" 0.10.8
 printf 'fresh-install-key' > "$NEW/var/lib/snhub/hub.key"
 python3 -c "import sqlite3,sys;c=sqlite3.connect(sys.argv[1]);c.execute('create table agents (id text, name text)');c.commit()" "$NEW/var/lib/snhub/snhub.sqlite"
-printf 'hub.new.test { }\n' > "$NEW/etc/caddy/Caddyfile"
+printf ':80 {\n\trespond "fresh"\n}\n' > "$W/fresh.Caddyfile"
+cp "$W/fresh.Caddyfile" "$NEW/etc/caddy/Caddyfile"
 
 # The wrong passphrase.
 ( SNHUB_BACKUP_PASSPHRASE="not the right one at all" SNHUB_ROOT="$NEW" bash "$HERE/restore-hub.sh" "$BK/one.tar.gz.enc" >/dev/null 2>&1 ) && fail "restored with a wrong passphrase"
@@ -116,7 +136,7 @@ cmp "$OLD/etc/systemd/system/snhub.service.d/10-hardening.conf" "$NEW/etc/system
 [ "$(stat -c %a "$NEW/var/lib/snhub/hub.key")" = "640" ] || fail "hub key mode"
 SAVED="$(ls -d "$NEW"/var/lib/snhub.before-restore-* | head -n 1)"
 [ "$(cat "$SAVED/hub.key")" = "fresh-install-key" ] || fail "the fresh install's key was not kept"
-[ "$(cat "$NEW/etc/caddy/Caddyfile.before-restore")" = "hub.new.test { }" ] || fail "the old Caddyfile was not kept"
+cmp "$W/fresh.Caddyfile" "$NEW/etc/caddy/Caddyfile.before-restore" || fail "the old Caddyfile was not kept"
 grep -q "hub.example.test" "$W/restore.log" || fail "the closing notes do not name the hub address"
 ok "restore: key, config, Caddyfile, drop-in, database (4 VPS, AI key) in place; the old files kept"
 
@@ -127,4 +147,59 @@ for f in q.tar.gz.enc plain.tar.gz; do
   [ "$(count "$N2/var/lib/snhub/snhub.sqlite")" = "4" ] || fail "$f lost rows"
 done
 ok "the quiesced and the plain backup restore as well"
+
+# ---- a server whose Caddy serves other sites too ---------------------------------
+SNHUB_ROOT="$OLD" bash "$HERE/backup-hub.sh" --out "$BK/certs.tar.gz.enc" --with-certs >/dev/null || fail "backup with certificates"
+shared() { # shared ROOT : a server with a Caddyfile of other people's sites
+  mkserver "$1" 0.10.8
+  cat > "$1/etc/caddy/Caddyfile" <<'CF'
+:80 {
+	respond "stock"
+}
+router.example.test {
+	reverse_proxy 127.0.0.1:20128
+}
+chat.example.test {
+	reverse_proxy localhost:18080 {
+		header_up Upgrade {http.request.header.Upgrade}
+	}
+}
+CF
+  printf 'fresh-install-key' > "$1/var/lib/snhub/hub.key"
+}
+SH="$W/shared"; shared "$SH"; cp "$SH/etc/caddy/Caddyfile" "$W/shared.Caddyfile"
+
+# --caddy would replace the file and take the other sites down: refused, and nothing at all is changed.
+( SNHUB_ROOT="$SH" bash "$HERE/restore-hub.sh" "$BK/certs.tar.gz.enc" --caddy >"$W/refuse.log" 2>&1 ) && fail "--caddy overwrote a Caddyfile that serves other sites"
+grep -q "router.example.test" "$W/refuse.log" || fail "the refusal does not name the sites it would take down: $(cat "$W/refuse.log")"
+cmp "$W/shared.Caddyfile" "$SH/etc/caddy/Caddyfile" || fail "a refused --caddy changed the Caddyfile"
+[ "$(cat "$SH/var/lib/snhub/hub.key")" = "fresh-install-key" ] || fail "a refused --caddy changed the hub's files"
+( SNHUB_ROOT="$SH" bash "$HERE/restore-hub.sh" "$BK/certs.tar.gz.enc" --caddy --caddy-add >/dev/null 2>&1 ) && fail "--caddy with --caddy-add was accepted"
+ok "--caddy refuses a Caddyfile that serves other sites, before touching anything"
+
+# Without either flag the Caddyfile is not touched.
+SNHUB_ROOT="$SH" bash "$HERE/restore-hub.sh" "$BK/certs.tar.gz.enc" >/dev/null 2>&1 || fail "restore without a Caddy flag"
+cmp "$W/shared.Caddyfile" "$SH/etc/caddy/Caddyfile" || fail "a restore without a Caddy flag changed the Caddyfile"
+
+# --caddy-add: the other sites stay, the hub's block (and only its) is added once, with its certificate.
+SNHUB_ROOT="$SH" bash "$HERE/restore-hub.sh" "$BK/certs.tar.gz.enc" --caddy-add >"$W/add.log" 2>&1 || { cat "$W/add.log"; fail "--caddy-add"; }
+C="$SH/etc/caddy/Caddyfile"
+grep -q '^router.example.test {' "$C" && grep -q '^chat.example.test {' "$C" || fail "--caddy-add lost a site that was there"
+[ "$(grep -c '^hub.example.test {' "$C")" = 1 ] || fail "the hub's block is not there exactly once"
+grep -q 'header_up X-Real-IP {remote_host}' "$C" || fail "the hub's block is cut short (nested blocks)"
+grep -q 'other.example.test' "$C" && fail "--caddy-add also copied another site of the master's Caddyfile"
+cmp "$W/shared.Caddyfile" "$C.before-restore" || fail "the Caddyfile as it was is not kept"
+CERTS="$SH/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory"
+[ -f "$CERTS/hub.example.test/hub.example.test.crt" ] || fail "the hub's certificate was not restored"
+[ ! -e "$CERTS/other.example.test" ] || fail "another site's certificate was restored"
+# Again: nothing is added twice.
+SNHUB_ROOT="$SH" bash "$HERE/restore-hub.sh" "$BK/certs.tar.gz.enc" --caddy-add >/dev/null 2>&1 || fail "--caddy-add the second time"
+[ "$(grep -c '^hub.example.test {' "$C")" = 1 ] || fail "--caddy-add added the block twice"
+ok "--caddy-add: the other sites stay, the hub's block and certificate come once"
+
+# A server with no Caddyfile yet gets one with just the hub's block.
+SN="$W/nocaddy"; mkserver "$SN" 0.10.8; rm -f "$SN/etc/caddy/Caddyfile"
+SNHUB_ROOT="$SN" bash "$HERE/restore-hub.sh" "$BK/one.tar.gz.enc" --caddy-add >/dev/null 2>&1 || fail "--caddy-add without a Caddyfile"
+grep -q '^hub.example.test {' "$SN/etc/caddy/Caddyfile" || fail "no Caddyfile with the hub's block"
+ok "--caddy-add on a server with no Caddyfile"
 echo "all good"

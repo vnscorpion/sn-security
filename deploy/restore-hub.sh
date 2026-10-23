@@ -18,8 +18,13 @@
 # Options:
 #   --pass-file FILE    read the passphrase from the first line of FILE
 #                       (or set SNHUB_BACKUP_PASSPHRASE)
-#   --caddy             also put the backup's Caddyfile in place (and certificates, if saved)
-#                       and reload Caddy; the old Caddyfile is kept as Caddyfile.before-restore
+#   --caddy             for a server that runs only this hub: put the backup's whole Caddyfile in
+#                       place (and the certificates, if saved) and reload Caddy; the old
+#                       Caddyfile is kept as Caddyfile.before-restore. REFUSED when the Caddyfile
+#                       here serves other sites: it would take them down (use --caddy-add)
+#   --caddy-add         for a server whose Caddy serves other things too: add only the hub's own
+#                       site block from the backup (and its certificate), check it with
+#                       `caddy validate` and reload; the rest of the Caddyfile is untouched
 #   --ignore-version    restore even though this snhub is OLDER than the backup's (the
 #                       database may then not open: update the hub first instead)
 set -euo pipefail
@@ -28,6 +33,8 @@ umask 077
 BACKUP=""
 PASS_FILE=""
 CADDY=0
+CADDY_ADD=0
+CADDY_FAILED=0
 IGNORE_VERSION=0
 # For the tests only: every path is under this folder; nothing is started, stopped or chowned.
 ROOT="${SNHUB_ROOT:-}"
@@ -40,13 +47,15 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --pass-file) PASS_FILE="$2"; shift 2;;
     --caddy) CADDY=1; shift;;
+    --caddy-add) CADDY_ADD=1; shift;;
     --ignore-version) IGNORE_VERSION=1; shift;;
     -h|--help) awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; exit 0;;
     -*) die "unknown option: $1 (see --help)";;
     *) [ -z "$BACKUP" ] || die "one backup file only"; BACKUP="$1"; shift;;
   esac
 done
-[ -n "$BACKUP" ] || die "usage: restore-hub.sh BACKUP-FILE [--caddy] [--pass-file FILE]"
+[ -n "$BACKUP" ] || die "usage: restore-hub.sh BACKUP-FILE [--caddy | --caddy-add] [--pass-file FILE]"
+[ "$CADDY" -eq 0 ] || [ "$CADDY_ADD" -eq 0 ] || die "--caddy and --caddy-add exclude each other"
 [ -f "$BACKUP" ] || die "no such file: $BACKUP"
 [ -n "$ROOT" ] || [ "$(id -u)" -eq 0 ] || die "run as root (sudo)"
 SNHUB="$(p /usr/local/bin/snhub)"
@@ -76,6 +85,33 @@ else
 fi
 [ -f "$TMP/MANIFEST" ] && [ -f "$TMP/files.sha256" ] || die "this is not a backup of snhub (no MANIFEST)"
 mf() { sed -n "s/^$1=//p" "$TMP/MANIFEST" | head -n 1; }
+
+# The site addresses a Caddyfile serves: the lines at the left margin that open a block
+# (`example.org {`, `:80 {`). A nested block that was not indented counts too, which only
+# makes the check stricter.
+sites_of() {
+  awk '/^[^[:space:]#}][^{]*\{[[:space:]]*$/ { sub(/[[:space:]]*\{[[:space:]]*$/, ""); print }' "$1" | LC_ALL=C sort -u
+}
+# One site's whole block, from its address line to the brace that closes it (braces
+# are counted per line, so `{remote_host}` and the like cancel out).
+site_block() { # site_block FILE HOST
+  awk -v host="$2" '
+    BEGIN { gsub(/[.]/, "[.]", host) }
+    function braces(s,   o, c, t) { t = s; o = gsub(/\{/, "", t); t = s; c = gsub(/\}/, "", t); return o - c }
+    !inside && $0 ~ ("^" host "[[:space:]]*\\{") { inside = 1 }
+    inside { print; depth += braces($0); if (depth <= 0) exit }
+  ' "$1"
+}
+caddy_reload() {
+  if [ -z "$ROOT" ] && systemctl is-active --quiet caddy; then systemctl reload caddy; fi
+}
+check_caddyfile() { # check_caddyfile FILE BACKUP-COPY  (puts the copy back on failure)
+  if command -v caddy >/dev/null 2>&1 && ! caddy validate --config "$1" --adapter caddyfile >/dev/null 2>&1; then
+    if [ -f "$2" ]; then cp -p "$2" "$1"; fi
+    return 1
+  fi
+}
+
 [ "$(mf format)" = "snhub-backup-1" ] || die "unknown backup format: $(mf format)"
 ( cd "$TMP/files" && sha256sum -c --quiet "$TMP/files.sha256" ) || die "a file in the backup does not match its checksum: the backup is damaged"
 
@@ -97,6 +133,23 @@ if [ -n "$have" ] && [ -n "$want" ] && [ "$want" != "unknown" ] && [ "$IGNORE_VE
   if [ "$newest" != "$have" ]; then
     die "this snhub is $have, older than the backup's $want. Update the hub first (update-hub.sh from the same commit), or use --ignore-version"
   fi
+fi
+
+# ---- Caddy: decide before anything is touched ---------------------------------
+CF="$(p /etc/caddy/Caddyfile)"
+BK_CF="$TMP/files/etc/caddy/Caddyfile"
+HOST="$(mf public_url | sed -E 's#^[a-z]+://##; s#[/:].*$##')"
+BLOCK=""
+if [ "$CADDY_ADD" -eq 1 ]; then
+  [ -n "$HOST" ] || die "the backup does not say which address the hub answers on (public_url)"
+  [ -f "$BK_CF" ] || die "the backup holds no Caddyfile to take the hub's block from"
+  BLOCK="$(site_block "$BK_CF" "$HOST")"
+  [ -n "$BLOCK" ] || die "no block for $HOST in the backup's Caddyfile: add the hub's site to $CF by hand"
+fi
+if [ "$CADDY" -eq 1 ] && [ -f "$CF" ] && [ -f "$BK_CF" ]; then
+  # Replacing the file is only for a server that runs nothing else behind Caddy.
+  OTHERS="$(LC_ALL=C comm -23 <(sites_of "$CF") <(sites_of "$BK_CF") | tr '\n' ' ')"
+  [ -z "$OTHERS" ] || die "the Caddyfile here also serves: $OTHERS. --caddy would take those sites down. Use --caddy-add: it adds only the hub's block. Nothing was changed."
 fi
 
 # ---- put it in place --------------------------------------------------------
@@ -135,28 +188,56 @@ for d in "$TMP/files/etc/systemd/system/snhub.service.d"/*.conf; do
 done
 if [ -z "$ROOT" ]; then systemctl daemon-reload; fi
 
+if [ "$CADDY_ADD" -eq 1 ]; then
+  mkdir -p "$(dirname "$CF")"; [ -f "$CF" ] || : > "$CF"
+  if sites_of "$CF" | grep -qxF "$HOST"; then
+    say "Caddy already serves $HOST: its block is left as it is"
+  else
+    cp -p "$CF" "$CF.before-restore"
+    printf '\n%s\n' "$BLOCK" >> "$CF"
+    if check_caddyfile "$CF" "$CF.before-restore"; then
+      say "the block for $HOST added to $CF (the file as it was: $CF.before-restore)"
+    else
+      # The hub itself is restored and starts below; only the front door is not set up.
+      CADDY_FAILED=1
+      echo "!! Caddy does not accept the Caddyfile with the hub's block: the old one is back. Add the block by hand." >&2
+    fi
+  fi
+  if [ "$CADDY_FAILED" -eq 0 ]; then
+    # The certificate of that name only, so HTTPS works before DNS points here.
+    for c in "$TMP"/files/caddy-data/certificates/*/"$HOST"; do
+      [ -d "$c" ] || continue
+      dest="$(p /var/lib/caddy/.local/share/caddy/certificates)/$(basename "$(dirname "$c")")"
+      mkdir -p "$dest"; cp -a "$c" "$dest/"
+      if [ -z "$ROOT" ]; then chown -R caddy:caddy "$dest/$HOST" 2>/dev/null || true; fi
+      say "certificate of $HOST restored"
+    done
+    caddy_reload
+  fi
+fi
+
 if [ "$CADDY" -eq 1 ]; then
-  CF="$(p /etc/caddy/Caddyfile)"
-  if [ -f "$TMP/files/etc/caddy/Caddyfile" ]; then
+  if [ -f "$BK_CF" ]; then
     mkdir -p "$(dirname "$CF")"
     [ -f "$CF" ] && cp -p "$CF" "$CF.before-restore"
     install -m 0644 "$TMP/files/etc/caddy/Caddyfile" "$CF"
-    if command -v caddy >/dev/null 2>&1 && ! caddy validate --config "$CF" --adapter caddyfile >/dev/null 2>&1; then
-      [ -f "$CF.before-restore" ] && cp -p "$CF.before-restore" "$CF"
-      die "the backup's Caddyfile does not validate on this Caddy: the old one is back. Fix it by hand."
+    if check_caddyfile "$CF" "$CF.before-restore"; then
+      say "Caddyfile restored (the old one: $CF.before-restore)"
+    else
+      CADDY_FAILED=1
+      echo "!! the backup's Caddyfile does not validate on this Caddy: the old one is back. Fix it by hand." >&2
     fi
-    say "Caddyfile restored (the old one: $CF.before-restore)"
   else
     echo "?? the backup holds no Caddyfile" >&2
   fi
-  if [ -d "$TMP/files/caddy-data" ]; then
+  if [ "$CADDY_FAILED" -eq 0 ] && [ -d "$TMP/files/caddy-data" ]; then
     CD="$(p /var/lib/caddy/.local/share/caddy)"
     mkdir -p "$CD"
     cp -a "$TMP/files/caddy-data/." "$CD/"
     if [ -z "$ROOT" ]; then chown -R caddy:caddy /var/lib/caddy/.local 2>/dev/null || true; fi
     say "certificates restored"
   fi
-  if [ -z "$ROOT" ] && systemctl is-active --quiet caddy; then systemctl reload caddy; fi
+  if [ "$CADDY_FAILED" -eq 0 ]; then caddy_reload; fi
 fi
 
 # ---- start and check --------------------------------------------------------
@@ -182,3 +263,7 @@ Next, when this is a new server:
   3. Check "Tổng quan": every VPS should show a report within ~5 minutes.
   4. Switch the old server off only when they all have. Keep this backup until then.
 EOF
+if [ "$CADDY_FAILED" -ne 0 ]; then
+  echo "!! The hub is restored and running, but Caddy was not set up (see above): the name will not answer over HTTPS until it is." >&2
+  exit 1
+fi
